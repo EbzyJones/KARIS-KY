@@ -1,5 +1,5 @@
 #![cfg_attr(not(test), no_std)]
-//! LiquiFact Escrow Contract
+//! karis-ky Escrow Contract
 //!
 //! Holds investor funds for an invoice until settlement.
 //! - SME receives stablecoin when funding target is met ([`LiquifactEscrow::withdraw`])
@@ -171,7 +171,7 @@ pub const INSTANCE_TTL_MIN_EXTENSION_LEDGERS: u32 = 60 * 60; // Approx. 1h at 1 
 /// Extending persistent allowlist TTL reduces the risk of silent allowlist disablement.
 pub const PERSISTENT_TTL_MIN_EXTENSION_LEDGERS: u32 = 60 * 60; // Approx. 1h at 1 ledger/sec.
 
-/// Stable typed errors emitted by LiquiFact escrow entrypoints.
+/// Stable typed errors emitted by karis-ky escrow entrypoints.
 ///
 /// Codes are append-only: never reuse or renumber a variant. Client SDKs should branch on the
 /// numeric code rather than legacy panic strings. See `docs/escrow-error-messages.md`.

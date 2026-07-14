@@ -1,7 +1,7 @@
 # Escrow Dependency Policy (`soroban-sdk` and host compatibility)
 
 This policy defines how maintainers track, evaluate, and roll out Soroban dependency updates for
-`liquifact_escrow`.
+`karis-ky_escrow`.
 
 ## 1) Version pin strategy
 
@@ -64,9 +64,9 @@ When a high-severity advisory or breakage is announced:
 3. Apply minimal dependency bump and lockfile update.
 4. Run mandatory checks:
    - `cargo fmt --all -- --check`
-   - `cargo clippy -p liquifact_escrow -- -D warnings`
-   - `cargo test -p liquifact_escrow`
-   - `cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only -p liquifact_escrow`
+   - `cargo clippy -p karis-ky_escrow -- -D warnings`
+   - `cargo test -p karis-ky_escrow`
+   - `cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only -p karis-ky_escrow`
 5. Perform merge dry-run against `upstream/main`.
 6. Open PR with:
    - advisory reference

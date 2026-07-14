@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document summarizes the implementation of the gold standard integration test for the LiquiFact escrow contract, demonstrating the complete happy path lifecycle: **open → overfund → snapshot → settle → claim**.
+This document summarizes the implementation of the gold standard integration test for the karis-ky escrow contract, demonstrating the complete happy path lifecycle: **open → overfund → snapshot → settle → claim**.
 
 ## Test Implementation Status
 

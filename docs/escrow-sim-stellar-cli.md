@@ -143,7 +143,7 @@ cargo build --target wasm32v1-none --release
 The compiled artifact is at:
 
 ```
-target/wasm32v1-none/release/liquifact_escrow.wasm
+target/wasm32v1-none/release/karis-ky_escrow.wasm
 ```
 
 Optionally lint before deploying:
@@ -158,7 +158,7 @@ cargo clippy -p escrow -- -D warnings
 
 ```bash
 CONTRACT_ID=$(stellar contract deploy \
-  --wasm target/wasm32v1-none/release/liquifact_escrow.wasm \
+  --wasm target/wasm32v1-none/release/karis-ky_escrow.wasm \
   --source admin \
   --network local)
 

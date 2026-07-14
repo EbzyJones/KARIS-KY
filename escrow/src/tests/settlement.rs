@@ -1,4 +1,4 @@
-//! Settlement and withdrawal tests for the LiquiFact escrow contract.
+//! Settlement and withdrawal tests for the karis-ky escrow contract.
 //!
 //! Covers the full `withdraw` surface (happy path, wrong-status guards, legal-hold
 //! block, idempotency, event emission, and terminal status assertion) as well as

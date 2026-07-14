@@ -1,4 +1,4 @@
-# LiquiFact Operator Runbook: Redeploy vs. On-Chain Upgrade
+# karis-ky Operator Runbook: Redeploy vs. On-Chain Upgrade
 
 > **Scope:** Stellar / Soroban only. This runbook does not apply to EVM or
 > Solidity deployments. CLI examples use the `stellar` CLI; verify flag syntax
@@ -180,33 +180,33 @@ Complete all items before promoting to Mainnet.
 rustup target add wasm32v1-none
 
 # 2. Build release WASM
-cargo build --target wasm32v1-none --release -p liquifact_escrow
+cargo build --target wasm32v1-none --release -p karis-ky_escrow
 
 # 3. Format check
 cargo fmt --all -- --check
 
 # 4. Lint (zero warnings)
-cargo clippy -p liquifact_escrow -- -D warnings
+cargo clippy -p karis-ky_escrow -- -D warnings
 
 # 5. Full test suite
-cargo test -p liquifact_escrow
+cargo test -p karis-ky_escrow
 
 # 6. Coverage gate (≥ 95% lines)
 cargo llvm-cov \
   --features testutils \
   --fail-under-lines 95 \
   --summary-only \
-  -p liquifact_escrow
+  -p karis-ky_escrow
 
 # 7. Confirm WASM artifact exists
-ls target/wasm32v1-none/release/liquifact_escrow.wasm
+ls target/wasm32v1-none/release/karis-ky_escrow.wasm
 ```
 
 ### Contract security checklist
 
 - [ ] `admin` is a multisig or governed contract (not an EOA alone).
 - [ ] `funding_token` is a standard SEP-41 token (no fee-on-transfer).
-- [ ] `treasury` address is controlled by LiquiFact governance.
+- [ ] `treasury` address is controlled by karis-ky governance.
 - [ ] `invoice_id` matches off-chain invoice slug (ASCII alphanumeric + `_`,
       max 32 chars).
 - [ ] `maturity` is set in ledger timestamp seconds (not wall-clock oracle).
@@ -227,7 +227,7 @@ export LIQUIFACT_ADMIN_ADDRESS=G...
 
 # Upload WASM
 stellar contract upload \
-  --wasm target/wasm32v1-none/release/liquifact_escrow.wasm \
+  --wasm target/wasm32v1-none/release/karis-ky_escrow.wasm \
   --source $SOURCE_SECRET \
   --network $STELLAR_NETWORK
 
@@ -275,12 +275,12 @@ that calls `env.deployer().update_current_contract_wasm(new_wasm_hash)`.
 ```bash
 # Step 1: Upload new WASM (get new hash)
 stellar contract upload \
-  --wasm target/wasm32v1-none/release/liquifact_escrow.wasm \
+  --wasm target/wasm32v1-none/release/karis-ky_escrow.wasm \
   --source $SOURCE_SECRET \
   --network $STELLAR_NETWORK
 
 # Step 2: Invoke the deployed contract's upgrade entrypoint, if present.
-# The current LiquiFact escrow contract does not expose this entrypoint.
+# The current karis-ky escrow contract does not expose this entrypoint.
 stellar contract invoke \
   --id <EXISTING_CONTRACT_ID> \
   --source $SOURCE_SECRET \

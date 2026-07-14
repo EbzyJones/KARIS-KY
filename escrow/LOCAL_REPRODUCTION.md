@@ -18,7 +18,7 @@ cargo install cargo-llvm-cov
 ### From workspace root:
 ```bash
 cd /path/to/Liquifact-contracts
-cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only -p liquifact_escrow
+cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only -p karis-ky_escrow
 ```
 
 ### From escrow directory:
@@ -62,10 +62,10 @@ cargo test -- --ignored
 
 The CI is configured in `.github/workflows/ci.yml` to run:
 1. `cargo fmt --all -- --check`
-2. `cargo clippy -p liquifact_escrow -- -D warnings`
+2. `cargo clippy -p karis-ky_escrow -- -D warnings`
 3. `cargo build`
 4. `cargo test`
-5. `cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only -p liquifact_escrow`
+5. `cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only -p karis-ky_escrow`
 
 ## Notes
 

@@ -1,4 +1,4 @@
-# LiquiFact Escrow — Glossary
+# karis-ky Escrow — Glossary
 
 Cross-team reference (legal, product, engineering) for terms used in the
 on-chain contract, off-chain indexers, and user-facing copy.

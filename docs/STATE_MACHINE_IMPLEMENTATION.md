@@ -1,4 +1,4 @@
-# LiquiFact Escrow State Machine Implementation — Issue #271
+# karis-ky Escrow State Machine Implementation — Issue #271
 
 **Status:** Complete ✅
 

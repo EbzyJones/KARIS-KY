@@ -1,6 +1,6 @@
 # Liquifact Escrow Typed Error Codes
 
-LiquiFact escrow emits typed Soroban contract errors through [`EscrowError`](../escrow/src/lib.rs).
+karis-ky escrow emits typed Soroban contract errors through [`EscrowError`](../escrow/src/lib.rs).
 Client SDKs **must branch on the numeric `ContractError(code)` value**, not on panic strings or
 diagnostic text.
 

@@ -2,7 +2,7 @@
 
 ## Description
 
-This PR implements comprehensive test cases for the LiquiFact escrow contract to enforce state-machine invariants regarding investor funding behavior, fully resolving issue **#260**.
+This PR implements comprehensive test cases for the karis-ky escrow contract to enforce state-machine invariants regarding investor funding behavior, fully resolving issue **#260**.
 
 Specifically, the contract requires that the selection of tier-based yield and claim-lock gates is permanently set during the investor's **first deposit**. Any subsequent contributions by the same investor must use the simple `fund()` entrypoint, which preserves their originally assigned yield and claim-lock gate.
 
@@ -48,5 +48,5 @@ cargo test
 *Documentation updated under:* `docs/adr/ADR-005-tiered-yield.md`
 
 ### Manual Verification
-- Verified compilation cleanliness of the `liquifact_escrow` library.
+- Verified compilation cleanliness of the `karis-ky_escrow` library.
 - Verified test suite integration and invariant assertions match ADR-005 spec.

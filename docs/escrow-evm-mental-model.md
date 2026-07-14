@@ -1,6 +1,6 @@
 # EVM Escrow Patterns vs. Soroban Invoice Escrow
 
-This document provides a comparative overview for teams familiar with Ethereum Virtual Machine (EVM) escrow patterns, particularly OpenZeppelin's `Escrow.sol`, when transitioning to Soroban's invoice escrow implementation in the LiquiFact contracts. It highlights mappings, differences, and key considerations for cross-chain integrations.
+This document provides a comparative overview for teams familiar with Ethereum Virtual Machine (EVM) escrow patterns, particularly OpenZeppelin's `Escrow.sol`, when transitioning to Soroban's invoice escrow implementation in the karis-ky contracts. It highlights mappings, differences, and key considerations for cross-chain integrations.
 
 ## Overview
 
@@ -10,7 +10,7 @@ EVM escrows typically hold funds until predefined conditions are met, with simpl
 
 ### 1. Account and Authorization Model
 
-| Aspect | EVM (OpenZeppelin Escrow) | Soroban (LiquiFact Invoice Escrow) |
+| Aspect | EVM (OpenZeppelin Escrow) | Soroban (karis-ky Invoice Escrow) |
 |--------|---------------------------|-----------------------------------|
 | **Account Types** | EOAs (externally owned accounts) and contracts | Stellar accounts (public keys) and contracts |
 | **Authorization** | `msg.sender` for transaction origin | `env.invoker()` or `require_auth()` for authenticated callers |

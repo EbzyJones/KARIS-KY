@@ -2,7 +2,7 @@
 
 ## Overview
 
-This PR implements comprehensive Sybil-limited counter semantics for the LiquiFact escrow contract, providing configurable caps on distinct investor addresses with thorough edge case handling and documentation.
+This PR implements comprehensive Sybil-limited counter semantics for the karis-ky escrow contract, providing configurable caps on distinct investor addresses with thorough edge case handling and documentation.
 
 ## Changes Made
 

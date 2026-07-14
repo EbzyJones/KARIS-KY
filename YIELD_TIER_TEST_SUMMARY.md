@@ -1,7 +1,7 @@
 # Yield Tier Validation Test Summary
 
 ## Overview
-Comprehensive unit test coverage for `validate_yield_tiers_table` and tier ladder selection logic in the LiquiFact escrow contract.
+Comprehensive unit test coverage for `validate_yield_tiers_table` and tier ladder selection logic in the karis-ky escrow contract.
 
 ## Test Results
 ✅ **16/16 tests passing** (100% success rate)

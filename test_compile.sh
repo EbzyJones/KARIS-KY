@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Gold Standard Integration Test Runner
-echo "🚀 Running LiquiFact Escrow Gold Standard Integration Test"
+echo "🚀 Running karis-ky Escrow Gold Standard Integration Test"
 echo "=================================================="
 
 cd escrow

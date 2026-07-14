@@ -1,8 +1,8 @@
-# LiquiFact Escrow Contracts
+# karis-ky Escrow Contracts
 
-Soroban smart contracts for LiquiFact, the invoice liquidity network on Stellar.
+Soroban smart contracts for karis-ky, the invoice liquidity network on Stellar.
 This repository contains the `escrow` contract that holds investor funds for
-tokenized invoices until settlement.
+tokenized invoices until settlement and is maintained under the `karis-ky` project name.
 
 ---
 
@@ -104,7 +104,7 @@ redeploy-vs-upgrade decision tree and Stellar/Soroban CLI examples.
 
 ## Release runbook: build, deploy, verify
 
-**Who may deploy production:** only addresses and keys owned by LiquiFact
+**Who may deploy production:** only addresses and keys owned by karis-ky
 governance (multisig / custody). Treat contract admin and deployer secrets as
 **highly sensitive**.
 
@@ -129,16 +129,16 @@ for your installed `stellar` CLI version.
 
 ```bash
 rustup target add wasm32v1-none
-cargo build --target wasm32v1-none --release -p liquifact_escrow
+cargo build --target wasm32v1-none --release -p karis-ky_escrow
 # Artifact (typical):
-# target/wasm32v1-none/release/liquifact_escrow.wasm
+# target/wasm32v1-none/release/karis-ky_escrow.wasm
 ```
 
 ### Lint
 
 ```bash
 # Escrow crate only (mirrors CI)
-cargo clippy -p liquifact_escrow -- -D warnings
+cargo clippy -p karis-ky_escrow -- -D warnings
 
 # Entire workspace
 cargo clippy --all-targets -- -D warnings
@@ -278,10 +278,10 @@ Run these before opening a PR:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy -p liquifact_escrow -- -D warnings
+cargo clippy -p karis-ky_escrow -- -D warnings
 cargo build
 cargo test
-cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only -p liquifact_escrow
+cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only -p karis-ky_escrow
 ```
 
 ### Cargo.lock process notes
