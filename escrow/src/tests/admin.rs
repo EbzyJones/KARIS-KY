@@ -88,6 +88,39 @@ fn test_update_maturity_unauthorized() {
 }
 
 #[test]
+fn test_verify_asset_custody_reports_signed_discrepancy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+    let token = install_stellar_asset_token(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "CUST001"),
+        &sme,
+        &1_000i128,
+        &800i64,
+        &0u64,
+        &token.id,
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.fund(&investor, &1_000i128);
+    token.stellar.mint(&client.address, &1_200i128);
+
+    let discrepancy = client.verify_asset_custody();
+    assert_eq!(discrepancy, 200i128);
+}
+
+#[test]
 fn test_propose_admin_sets_pending_without_changing_admin() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);

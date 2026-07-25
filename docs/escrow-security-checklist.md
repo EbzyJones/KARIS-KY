@@ -29,6 +29,7 @@ Every state-mutating entrypoint and the identity required to authorize it.
 | `withdraw` | `escrow.sme_address` | `escrow.sme_address.require_auth()` | `status == 1`; sets `status = 3` |
 | `claim_investor_payout` | `investor` (caller-supplied) | `investor.require_auth()` | `status == 2`; contribution > 0; claim-lock gate |
 | `sweep_terminal_dust` | `treasury` | `treasury.require_auth()` | `status == 2 or 3`; amount ≤ `MAX_DUST_SWEEP_AMOUNT` |
+| `verify_asset_custody` | `escrow.admin` | `escrow.admin.require_auth()` | Admin-triggered reconciliation check; suitable for manual audits or external schedulers |
 | `migrate` | **none** | *(no `require_auth`)* | **Always panics** on all current paths — safe now, dangerous if logic is added without adding an auth guard (see §5.1) |
 
 ### Read-only entrypoints
@@ -183,6 +184,15 @@ This creates a window where `funded_amount` > actual token balance (unfunded com
 ### 5.2 Accounting-custody decoupling
 
 `funded_amount` is a commitment record, not a token balance assertion. Integrations that custody principal on-chain must enforce that token transfers and `fund()` calls are atomic (e.g., via an outer orchestrator contract or a Soroban transaction with both operations). Without this, `funded_amount` can overstate actual holdings, and `sweep_terminal_dust` could drain funds that were never genuinely deposited.
+
+### 5.2a Reconciliation procedure for custody audits
+
+Operators should reconcile the escrow's recorded funding with its actual on-chain balance on a cadence that matches the custody workflow. The admin can call `verify_asset_custody()` to compare the contract's current funding-token balance with the stored `funded_amount`; the call returns a signed discrepancy (`contract_balance - recorded_funded_amount`) and emits an `AssetCustodyVerified` event for off-chain indexing.
+
+- Positive discrepancy: the contract holds more than the recorded funded amount (for example, a stray transfer or airdrop).
+- Negative discrepancy: the contract holds less than the recorded funded amount (for example, a missed transfer or partial withdrawal).
+- Use the result with custody statements, bridge receipts, or bank reconciliations before settlement, withdrawal, or a dust sweep.
+- External schedulers or trigger systems can invoke the same entrypoint automatically so reconciliation becomes part of the operating runbook.
 
 ### 5.3 Legal hold has no on-chain expiry
 
