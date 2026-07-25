@@ -37,8 +37,65 @@ jobs:
 
       - name: Add WASM target
         run: rustup target add wasm32-unknown-unknown
+
       - name: Build WASM
         run: cargo build --target wasm32-unknown-unknown --release -p karis-ky_escrow
+
+      # -----------------------------------------------------------------------
+      # WASM size tracking
+      # -----------------------------------------------------------------------
+
+      - name: Check WASM size
+        # Fails the build if the artifact exceeds 1 MB or grew >10% vs baseline.
+        # On pushes to main, --record updates the baseline JSON and it is
+        # committed back via the "Update WASM size baseline" step below.
+        run: |
+          python3 scripts/check_wasm_size.py \
+            --wasm target/wasm32-unknown-unknown/release/karis_ky_escrow.wasm \
+            --baseline scripts/wasm_size_baseline.json \
+            ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '--record' || '' }}
+
+      - name: Generate WASM size trend report
+        # Always runs (even on failure) so we get a report in the job summary.
+        if: always()
+        run: |
+          python3 scripts/wasm_size_report.py \
+            --baseline scripts/wasm_size_baseline.json \
+            --format markdown \
+            --out /tmp/wasm_size_report.md
+          # Append to the GitHub Actions job summary
+          cat /tmp/wasm_size_report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload WASM size report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-size-report
+          path: /tmp/wasm_size_report.md
+          retention-days: 90
+
+      - name: Upload WASM artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: karis-ky-escrow-wasm
+          path: target/wasm32-unknown-unknown/release/karis_ky_escrow.wasm
+          retention-days: 90
+
+      - name: Commit updated WASM size baseline
+        # Only runs on main push after a clean size check, so baseline stays
+        # in sync with production builds.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git diff --quiet scripts/wasm_size_baseline.json || (
+            git add scripts/wasm_size_baseline.json &&
+            git commit -m "chore: update WASM size baseline [skip ci]" &&
+            git push
+          )
+
+      # -----------------------------------------------------------------------
 
       - name: Workspace Clippy (all targets)
         run: cargo clippy -p karis-ky_escrow --all-targets -- -D warnings
