@@ -10,8 +10,8 @@
 use super::{
     AttestationDigestRevoked, CollateralRecordedEvt, DataKey, EscrowError, EscrowFunded,
     EscrowInitialized, FundingTargetUpdated, LiquifactEscrow, LiquifactEscrowClient,
-    MaxUniqueInvestorsCapLowered, YieldTier, MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT,
-    MAX_FUND_BATCH, SCHEMA_VERSION,
+    MaxUniqueInvestorsCapLowered, YieldClaimDelegationRevoked, YieldClaimDelegationSet, YieldTier,
+    MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT, MAX_FUND_BATCH, SCHEMA_VERSION,
 };
 use soroban_sdk::{
     symbol_short,
@@ -46,6 +46,7 @@ mod admin;
 mod attestations;
 mod cap_validation;
 mod coverage;
+mod delegation;
 mod external_calls;
 mod external_calls_mocked;
 mod funding;
