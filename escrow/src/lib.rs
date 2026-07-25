@@ -366,6 +366,11 @@ pub enum EscrowError {
     /// The contract's funding-token balance is less than `funded_amount` at withdraw time.
     /// Funds must be custodied in this contract before the SME can pull them.
     InsufficientContractBalance = 164,
+
+    /// [`LiquifactEscrow::clone_settled_escrow`] called on escrow that is not settled.
+    CloneNotSettled = 170,
+    /// [`LiquifactEscrow::clone_settled_escrow`] received a non-positive invoice amount.
+    CloneAmountNotPositive = 171,
 }
 
 #[inline(always)]
@@ -881,6 +886,28 @@ pub struct ContractUpgraded {
     #[topic]
     pub invoice_id: Symbol,
     pub new_wasm_hash: BytesN<32>,
+}
+
+#[contractevent]
+pub struct EscrowCloned {
+    #[topic]
+    pub name: Symbol,
+    /// Original (template) escrow's invoice_id.
+    #[topic]
+    pub template_invoice_id: Symbol,
+    /// New escrow's invoice_id.
+    #[topic]
+    pub new_invoice_id: Symbol,
+    /// Admin who performed the clone.
+    pub admin: Address,
+    /// SME address cloned from template.
+    pub sme_address: Address,
+    /// Yield basis points cloned from template.
+    pub yield_bps: i64,
+    /// Maturity timestamp cloned from template.
+    pub maturity: u64,
+    /// New amount for the cloned escrow.
+    pub new_amount: i128,
 }
 
 #[contract]
@@ -2513,6 +2540,149 @@ impl LiquifactEscrow {
         .publish(&env);
 
         escrow
+    }
+
+    /// Clone a settled escrow template to create a new independent escrow instance.
+    ///
+    /// Creates a fresh escrow for a **new invoice** (supplied by caller) with the same 
+    /// configuration parameters as the template escrow. The template must be in **settled** status
+    /// (status == 2). All immutable configuration (yield_bps, maturity, yield tiers, min contribution,
+    /// max unique investors, max per investor, legal hold clear delay, registry) is copied; 
+    /// per-investor state, funding state, and legal holds are **reset** for the new instance.
+    ///
+    /// # Parameters
+    ///
+    /// - `template_env`: The Soroban environment of the **template** contract (settled escrow).
+    ///   Clone internally calls the template's `get_escrow` to verify status and read immutable config.
+    ///
+    /// - `new_invoice_id` / `new_amount`: Caller must supply the new invoice identifier and funding target.
+    ///
+    /// The new escrow will have:
+    /// - `invoice_id = new_invoice_id` (caller-supplied).
+    /// - `admin, sme_address, yield_bps, maturity` = copied from template.
+    /// - `amount, funding_target = new_amount` (caller-supplied).
+    /// - `funded_amount = 0, status = 0` (open).
+    /// - All per-investor state: cleared (new instance).
+    /// - Immutable configuration (registry, token, treasury, yield tiers, caps, delays) = copied from template.
+    ///
+    /// # Errors
+    ///
+    /// - [`EscrowError::CloneNotSettled`] — template escrow is not in settled status.
+    /// - [`EscrowError::CloneAmountNotPositive`] — `new_amount` is not positive.
+    /// - [`EscrowError::InvoiceIdInvalidLength`] — `new_invoice_id` violates length constraints.
+    /// - [`EscrowError::InvoiceIdInvalidCharset`] — `new_invoice_id` contains invalid characters.
+    /// - Other [`EscrowError`] codes from `init` validation.
+    ///
+    /// # Authorization
+    ///
+    /// Only the **admin** (from the template escrow) may call this method.
+    pub fn clone_settled_escrow(
+        env: Env,
+        template_env: Env,
+        new_invoice_id: String,
+        new_amount: i128,
+    ) -> InvoiceEscrow {
+        // Load and validate the template escrow.
+        let template_escrow = Self::get_escrow(template_env.clone());
+        ensure(
+            &env,
+            template_escrow.status == 2,
+            EscrowError::CloneNotSettled,
+        );
+        ensure(&env, new_amount > 0, EscrowError::CloneAmountNotPositive);
+
+        // Require auth from the template admin.
+        template_escrow.admin.require_auth();
+
+        // Read immutable configuration from template storage.
+        let funding_token: Address = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::FundingToken)
+            .unwrap_or_else(|| fail(&env, EscrowError::FundingTokenNotSet));
+
+        let treasury: Address = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .unwrap_or_else(|| fail(&env, EscrowError::TreasuryNotSet));
+
+        let registry: Option<Address> = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::RegistryRef);
+
+        let yield_tiers: Option<Vec<YieldTier>> = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldTierTable);
+
+        let min_contribution_floor: i128 = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::MinContributionFloor)
+            .unwrap_or(0);
+
+        let max_unique_investors_cap: Option<u32> = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxUniqueInvestorsCap);
+
+        let max_per_investor_cap: Option<i128> = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxPerInvestorCap);
+
+        let legal_hold_clear_delay: Option<u64> = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::LegalHoldClearDelay)
+            .and_then(|d: u64| if d > 0 { Some(d) } else { None });
+
+        let funding_deadline: Option<u64> = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::FundingDeadline);
+
+        // Call init on the current (target) environment with cloned parameters.
+        Self::init(
+            env,
+            template_escrow.admin.clone(),
+            new_invoice_id.clone(),
+            template_escrow.sme_address.clone(),
+            new_amount,
+            template_escrow.yield_bps,
+            template_escrow.maturity,
+            funding_token,
+            registry,
+            treasury,
+            yield_tiers,
+            if min_contribution_floor > 0 {
+                Some(min_contribution_floor)
+            } else {
+                None
+            },
+            max_unique_investors_cap,
+            max_per_investor_cap,
+            legal_hold_clear_delay,
+            funding_deadline,
+        );
+
+        // Emit clone event.
+        let new_escrow = Self::get_escrow(env.clone());
+        EscrowCloned {
+            name: symbol_short!("escrow_cl"),
+            template_invoice_id: template_escrow.invoice_id.clone(),
+            new_invoice_id: new_escrow.invoice_id.clone(),
+            admin: template_escrow.admin.clone(),
+            sme_address: template_escrow.sme_address.clone(),
+            yield_bps: template_escrow.yield_bps,
+            maturity: template_escrow.maturity,
+            new_amount,
+        }
+        .publish(&env);
+
+        new_escrow
     }
 
     /// SME pulls funded liquidity. Transfers `funded_amount` of the bound funding token

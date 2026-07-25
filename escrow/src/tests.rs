@@ -45,6 +45,7 @@ pub(crate) fn assert_contract_error<T, E>(
 mod admin;
 mod attestations;
 mod cap_validation;
+mod clone;
 mod coverage;
 mod external_calls;
 mod external_calls_mocked;
