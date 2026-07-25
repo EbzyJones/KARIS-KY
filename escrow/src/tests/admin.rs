@@ -1517,3 +1517,172 @@ fn test_rotate_beneficiary_then_withdraw_goes_to_new_sme() {
     client.withdraw();
     assert_eq!(token.stellar.balance(&new_sme), TARGET);
 }
+
+
+// --- Dispute pause tests ---
+
+#[test]
+fn test_pause_dispute_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let ticket = soroban_sdk::String::from_str(&env, "TICKET-001");
+    let duration = 86400u64; // 1 day in seconds
+    client.pause_dispute(&ticket, &duration);
+
+    // Verify pause state is set
+    let pause_state = client.get_dispute_pause();
+    assert!(pause_state.is_some());
+    let state = pause_state.unwrap();
+    assert_eq!(state.ticket_id, ticket);
+    assert!(client.is_dispute_paused() == true);
+}
+
+#[test]
+#[should_panic]
+fn test_pause_dispute_empty_ticket_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let empty_ticket = soroban_sdk::String::from_str(&env, "");
+    let duration = 86400u64;
+    client.pause_dispute(&empty_ticket, &duration);
+}
+
+#[test]
+#[should_panic]
+fn test_pause_dispute_zero_duration_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let ticket = soroban_sdk::String::from_str(&env, "TICKET-002");
+    client.pause_dispute(&ticket, &0u64);
+}
+
+#[test]
+fn test_resume_dispute_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let ticket = soroban_sdk::String::from_str(&env, "TICKET-004");
+    let duration = 86400u64;
+    client.pause_dispute(&ticket, &duration);
+
+    // Verify pause is active
+    assert!(client.is_dispute_paused() == true);
+
+    // Resume the dispute
+    client.resume_dispute();
+
+    // Verify pause is cleared
+    assert!(client.is_dispute_paused() == false);
+    assert!(client.get_dispute_pause().is_none());
+}
+
+#[test]
+#[should_panic]
+fn test_resume_dispute_no_pause_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    // Try to resume when no pause is active
+    client.resume_dispute();
+}
+
+#[test]
+fn test_dispute_pause_blocks_funding() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let ticket = soroban_sdk::String::from_str(&env, "TICKET-005");
+    let duration = 86400u64;
+    client.pause_dispute(&ticket, &duration);
+
+    // Try to fund while pause is active
+    let investor = Address::generate(&env);
+    let result = client.try_fund(&investor, &500i128);
+    assert_contract_error(
+        result,
+        crate::EscrowError::DisputePausedBlocksFunding,
+    );
+}
+
+#[test]
+fn test_dispute_pause_blocks_settlement() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let investor = Address::generate(&env);
+    client.fund(&investor, &TARGET); // Reach funded status
+
+    let ticket = soroban_sdk::String::from_str(&env, "TICKET-006");
+    let duration = 86400u64;
+    client.pause_dispute(&ticket, &duration);
+
+    // Try to settle while pause is active
+    let result = client.try_settle();
+    assert_contract_error(
+        result,
+        crate::EscrowError::DisputePausedBlocksSettlement,
+    );
+}
+
+#[test]
+fn test_dispute_pause_blocks_withdrawal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let investor = Address::generate(&env);
+    client.fund(&investor, &TARGET); // Reach funded status
+
+    let ticket = soroban_sdk::String::from_str(&env, "TICKET-007");
+    let duration = 86400u64;
+    client.pause_dispute(&ticket, &duration);
+
+    // Try to withdraw while pause is active
+    let result = client.try_withdraw();
+    assert_contract_error(
+        result,
+        crate::EscrowError::DisputePausedBlocksWithdrawal,
+    );
+}
+
+#[test]
+fn test_dispute_pause_auto_expiration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let ticket = soroban_sdk::String::from_str(&env, "TICKET-008");
+    let duration = 100u64; // Short duration for testing
+    let initial_timestamp = env.ledger().timestamp();
+
+    client.pause_dispute(&ticket, &duration);
+    assert!(client.is_dispute_paused() == true);
+
+    // Advance ledger time past the expiration
+    let mut ledger_info = env.ledger().get();
+    ledger_info.timestamp = initial_timestamp + duration; // At expiration
+    env.ledger().set(ledger_info.clone());
+
+    // Pause should be inactive after expiration
+    assert!(client.is_dispute_paused() == false);
+    assert!(client.get_dispute_pause().is_none());
+}

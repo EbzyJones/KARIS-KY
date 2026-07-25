@@ -39,10 +39,10 @@ WASM.
 | 3 | Added `FundingCloseSnapshot`, `MinContributionFloor`, `MaxUniqueInvestorsCap`, `UniqueFunderCount` | Additive keys — old instances return `None` / `0` defaults |
 | 4 | Added attestation API (`PrimaryAttestationHash`, `AttestationAppendLog`) | Additive keys — no `migrate` call required |
 | 5 | Added `YieldTierTable` (`fund_with_commitment`), `RegistryRef`, `Treasury`; tightened `InvoiceEscrow` layout | **Redeploy required** if `InvoiceEscrow` struct layout differs from stored XDR |
-
 | 6 | Moved per-investor keys to persistent storage to bound instance footprint and decouple per-address TTL | **Redeploy required** — prior instances must be redeployed to pick up new storage locations |
+| 7 | Added `DisputePaused` state for temporary dispute resolution (separate from legal hold) | Additive keys — no `migrate` call required |
 
-> **Current:** `SCHEMA_VERSION = 6`
+> **Current:** `SCHEMA_VERSION = 7`
 
 ---
 
@@ -159,6 +159,10 @@ cargo clippy --all-targets -- -D warnings
 | `sweep_terminal_dust` | Treasury sweeps rounding residue from a terminal escrow. |
 | `migrate` | Schema version gate — **typed errors on all paths** in the current release (codes 90–92). |
 | `set_legal_hold` | Admin activates/clears compliance hold. |
+| `pause_dispute` | Admin temporarily freezes escrow due to dispute (separate from legal hold). |
+| `resume_dispute` | Admin manually resumes a paused escrow (or wait for auto-expiration). |
+| `is_dispute_paused` | Check if dispute pause is currently active. |
+| `get_dispute_pause` | Retrieve active dispute pause state (ticket, timestamps). |
 | `bind_primary_attestation_hash` | Admin sets a single-write 32-byte digest. |
 | `append_attestation_digest` | Admin appends to bounded audit log. |
 | `record_sme_collateral_commitment` | SME records collateral pledge (metadata only). |
@@ -191,7 +195,7 @@ Escrow tests are organized by feature area under
 | `init.rs` | Initialization, invoice-id validation, getters, init-shaped baselines |
 | `funding.rs` | Funding, contribution accounting, snapshots, tier selection |
 | `settlement.rs` | Settlement, withdrawal, investor claims, maturity boundaries, dust sweep |
-| `admin.rs` | Admin-governed state changes, legal hold, migration guards, collateral metadata |
+| `admin.rs` | Admin-governed state changes, legal hold, dispute pause, migration guards, collateral metadata |
 | `integration.rs` | External token-wrapper assumptions, metadata-only integration checks |
 | `properties.rs` | Proptest-based invariants |
 
@@ -239,6 +243,9 @@ See [`docs/escrow-sme-collateral.md`](docs/escrow-sme-collateral.md) for the ris
 - **Legal hold:** governance-controlled; misuse risk is mitigated by using a
   multisig `admin` and operational policy (see
   [`docs/OPERATOR_RUNBOOK.md`](docs/OPERATOR_RUNBOOK.md)).
+- **Dispute pause:** admin-triggered temporary freeze (separate from legal hold) for
+  resolving invoice disputes. Auto-expires after configured duration. See
+  [`docs/DEPLOYER_SECURITY.md`](docs/DEPLOYER_SECURITY.md) for operational guidance.
 - **Collateral record:** SME-reported metadata only; not proof of custody,
   token movement, reserved balance, or an enforceable on-chain claim.
 - **Token integration:** fee-on-transfer, rebasing, and hook tokens are

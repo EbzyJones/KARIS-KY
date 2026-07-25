@@ -133,9 +133,10 @@ pub mod external_calls;
 /// | 4 | Added `PrimaryAttestationHash`, `AttestationAppendLog` | Additive keys — no `migrate` call required |
 /// | 5 | Added `YieldTierTable`, `RegistryRef`, `Treasury`; `fund_with_commitment` | **Redeploy required** if `InvoiceEscrow` XDR changed |
 /// | 6 | Per-investor keys moved to **persistent** storage (see ADR-007) | **Redeploy required** — no `migrate` path (addresses not enumerable) |
+/// | 7 | Added `DisputePaused` state for temporary dispute resolution freezes (separate from legal hold) | Additive keys — no `migrate` call required |
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
@@ -366,6 +367,21 @@ pub enum EscrowError {
     /// The contract's funding-token balance is less than `funded_amount` at withdraw time.
     /// Funds must be custodied in this contract before the SME can pull them.
     InsufficientContractBalance = 164,
+
+    /// [`LiquifactEscrow::fund`] / [`LiquifactEscrow::fund_with_commitment`] blocked while a dispute pause is active.
+    DisputePausedBlocksFunding = 165,
+    /// [`LiquifactEscrow::settle`] blocked while a dispute pause is active.
+    DisputePausedBlocksSettlement = 166,
+    /// [`LiquifactEscrow::withdraw`] blocked while a dispute pause is active.
+    DisputePausedBlocksWithdrawal = 167,
+    /// [`LiquifactEscrow::pause_dispute`] received a non-positive pause duration in seconds.
+    DisputePauseDurationNotPositive = 168,
+    /// [`LiquifactEscrow::pause_dispute`] received an empty dispute ticket reference.
+    DisputeTicketIdEmpty = 169,
+    /// [`LiquifactEscrow::resume_dispute`] called when no dispute pause is active.
+    NoPauseActive = 170,
+    /// Computed ledger timestamp would overflow (e.g., `now + duration > u64::MAX`).
+    LedgerTimestampOverflow = 171,
 }
 
 #[inline(always)]
@@ -492,6 +508,10 @@ pub enum DataKey {
     DistributedPrincipal,
     /// Optional funding deadline (ledger timestamp); after it passes, new funds are rejected.
     FundingDeadline,
+    /// When active, temporarily freezes the escrow during dispute resolution (separate from legal hold).
+    /// Blocks `fund`, `settle`, and `withdraw`. Stores [`DisputePauseState`].
+    /// Absent ⇒ no dispute pause active.
+    DisputePaused,
 }
 
 // --- Data types ---
@@ -617,6 +637,25 @@ pub struct EscrowSummary {
     pub has_primary_attestation: bool,
     /// Number of entries in the attestation append log.
     pub attestation_log_length: u32,
+}
+
+/// State of a dispute pause on an escrow instance.
+/// 
+/// Dispute pause is **separate** from legal hold and is triggered by admin for dispute
+/// resolution (e.g., invoice validity challenge). It auto-expires after the configured
+/// duration or is manually resumed.
+///
+/// # Fields
+/// - `ticket_id`: Identifier or reference to the support/dispute ticket (for audit trail).
+/// - `paused_at_ledger_timestamp`: Soroban ledger timestamp when pause was activated.
+/// - `expires_at_ledger_timestamp`: Ledger timestamp after which the pause auto-expires.
+///   Once ledger time reaches or exceeds this value, the escrow is unpaused.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputePauseState {
+    pub ticket_id: String,
+    pub paused_at_ledger_timestamp: u64,
+    pub expires_at_ledger_timestamp: u64,
 }
 
 // --- Events ---
@@ -755,6 +794,32 @@ pub struct LegalHoldClearRequested {
     pub invoice_id: Symbol,
     /// Inclusive ledger timestamp when clearing may occur.
     pub clearable_at: u64,
+}
+
+/// Emitted when a dispute pause is activated or resumed on an escrow.
+///
+/// Dispute pause is separate from legal hold and is used for temporary resolution
+/// of invoice disputes (e.g., validity challenges). The escrow is frozen until either
+/// the auto-expiration timestamp is reached or an admin manually resumes it.
+///
+/// # Fields
+/// - `name`: Hardcoded symbol (e.g., `dispute_pause` or `disp_pause`).
+/// - `invoice_id`: Symbol representation of the invoice.
+/// - `ticket_id`: Support/dispute ticket reference for audit trail.
+/// - `action`: `1` = paused, `0` = resumed.
+/// - `paused_at`: Ledger timestamp when pause was activated.
+/// - `expires_at`: Ledger timestamp when pause auto-expires (or 0 if manually resumed).
+#[contractevent]
+pub struct DisputePausedEvt {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub ticket_id: String,
+    /// `1` = paused, `0` = resumed.
+    pub action: u32,
+    pub paused_at: u64,
+    pub expires_at: u64,
 }
 
 /// SME collateral commitment metadata recorded.
@@ -2257,6 +2322,11 @@ impl LiquifactEscrow {
         );
         ensure(
             &env,
+            !Self::is_dispute_paused(&env),
+            EscrowError::DisputePausedBlocksFunding,
+        );
+        ensure(
+            &env,
             escrow.status == 0,
             EscrowError::EscrowNotOpenForFunding,
         );
@@ -2483,6 +2553,11 @@ impl LiquifactEscrow {
             !Self::legal_hold_active(&env),
             EscrowError::LegalHoldBlocksSettlement,
         );
+        ensure(
+            &env,
+            !Self::is_dispute_paused(&env),
+            EscrowError::DisputePausedBlocksSettlement,
+        );
 
         // env.clone(): env is used again after this call for ledger timestamp, storage set, and publish.
         let mut escrow = Self::load_escrow_require_sme(&env);
@@ -2538,6 +2613,11 @@ impl LiquifactEscrow {
             &env,
             !Self::legal_hold_active(&env),
             EscrowError::LegalHoldBlocksWithdrawal,
+        );
+        ensure(
+            &env,
+            !Self::is_dispute_paused(&env),
+            EscrowError::DisputePausedBlocksWithdrawal,
         );
 
         let mut escrow = Self::load_escrow_require_sme(&env);
@@ -2996,6 +3076,152 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::DistributedPrincipal)
             .unwrap_or(0)
+    }
+
+    /// Pause the escrow due to a dispute (e.g., invoice validity challenge).
+    /// 
+    /// Freezes the escrow independently of legal hold: blocks `fund`, `settle`, and `withdraw`
+    /// until either auto-expiration (after `duration_secs`) or manual resumption.
+    /// 
+    /// # Parameters
+    /// - `ticket_id`: Support/dispute ticket reference (non-empty String for audit trail).
+    /// - `duration_secs`: How long the pause lasts (must be positive).
+    ///
+    /// # Guard ordering
+    ///
+    /// 1. Ticket ID validation (non-empty).
+    /// 2. Duration validation (positive).
+    /// 3. `admin.require_auth()` (via `load_escrow_require_admin`).
+    /// 4. Compute expiration timestamp and check for overflow.
+    /// 5. Storage write and event emission.
+    ///
+    /// # Errors
+    /// - [`EscrowError::DisputeTicketIdEmpty`] — `ticket_id` is empty.
+    /// - [`EscrowError::DisputePauseDurationNotPositive`] — `duration_secs <= 0`.
+    /// - [`EscrowError::LedgerTimestampOverflow`] — computing expiration timestamp overflows.
+    pub fn pause_dispute(env: Env, ticket_id: String, duration_secs: u64) {
+        ensure(
+            &env,
+            !ticket_id.is_empty(),
+            EscrowError::DisputeTicketIdEmpty,
+        );
+        ensure(
+            &env,
+            duration_secs > 0,
+            EscrowError::DisputePauseDurationNotPositive,
+        );
+
+        let escrow = Self::load_escrow_require_admin(&env);
+
+        let now = env.ledger().timestamp();
+        let expires_at = now
+            .checked_add(duration_secs)
+            .unwrap_or_else(|| fail(&env, EscrowError::LedgerTimestampOverflow));
+
+        let pause_state = DisputePauseState {
+            ticket_id: ticket_id.clone(),
+            paused_at_ledger_timestamp: now,
+            expires_at_ledger_timestamp: expires_at,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputePaused, &pause_state);
+
+        DisputePausedEvt {
+            name: symbol_short!("disppause"),
+            invoice_id: escrow.invoice_id.clone(),
+            ticket_id,
+            action: 1, // 1 = paused
+            paused_at: now,
+            expires_at,
+        }
+        .publish(&env);
+    }
+
+    /// Resume (unpause) a dispute pause on the escrow.
+    ///
+    /// Clears the dispute pause, allowing normal escrow operations to resume.
+    /// 
+    /// # Guard ordering
+    ///
+    /// 1. Dispute pause existence check.
+    /// 2. `admin.require_auth()` (via `load_escrow_require_admin`).
+    /// 3. Remove the pause state and emit event.
+    ///
+    /// # Errors
+    /// - [`EscrowError::NoPauseActive`] — no active dispute pause exists.
+    pub fn resume_dispute(env: Env) {
+        let escrow = Self::load_escrow_require_admin(&env);
+
+        let pause_state: Option<DisputePauseState> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputePaused);
+
+        ensure(
+            &env,
+            pause_state.is_some(),
+            EscrowError::NoPauseActive,
+        );
+
+        let state = pause_state.unwrap();
+        let now = env.ledger().timestamp();
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::DisputePaused);
+
+        DisputePausedEvt {
+            name: symbol_short!("disppause"),
+            invoice_id: escrow.invoice_id.clone(),
+            ticket_id: state.ticket_id,
+            action: 0, // 0 = resumed
+            paused_at: state.paused_at_ledger_timestamp,
+            expires_at: now, // Use current time to signal manual resumption
+        }
+        .publish(&env);
+    }
+
+    /// Check if a dispute pause is currently active on this escrow.
+    ///
+    /// Includes auto-expiration logic: if the pause was configured to expire and
+    /// current ledger time has reached/exceeded the expiration, the pause is
+    /// considered inactive (although the storage entry is not automatically cleaned).
+    /// 
+    /// # Returns
+    /// `true` if a dispute pause exists and has not auto-expired; `false` otherwise.
+    pub fn is_dispute_paused(env: &Env) -> bool {
+        let pause_state: Option<DisputePauseState> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputePaused);
+
+        if let Some(state) = pause_state {
+            let now = env.ledger().timestamp();
+            // Pause is active if current time is before expiration
+            now < state.expires_at_ledger_timestamp
+        } else {
+            false
+        }
+    }
+
+    /// Get the current dispute pause state, if active.
+    ///
+    /// Returns `None` if no pause is active or if the pause has auto-expired.
+    pub fn get_dispute_pause(env: Env) -> Option<DisputePauseState> {
+        let pause_state: Option<DisputePauseState> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputePaused);
+
+        if let Some(state) = pause_state {
+            let now = env.ledger().timestamp();
+            if now < state.expires_at_ledger_timestamp {
+                return Some(state);
+            }
+        }
+        None
     }
 }
 
