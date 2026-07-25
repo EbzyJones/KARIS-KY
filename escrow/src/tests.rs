@@ -48,6 +48,7 @@ mod cap_validation;
 mod coverage;
 mod external_calls;
 mod external_calls_mocked;
+mod validation;
 mod funding;
 mod init;
 mod integration;

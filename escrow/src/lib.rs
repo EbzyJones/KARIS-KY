@@ -120,6 +120,7 @@ use soroban_sdk::{
 };
 
 pub mod external_calls;
+pub mod validation;
 
 /// Current storage schema version written to [`DataKey::Version`] by [`LiquifactEscrow::init`].
 ///
@@ -911,6 +912,57 @@ pub struct ContractUpgraded {
     pub new_wasm_hash: BytesN<32>,
 }
 
+/// Diagnostic information for contract errors, emitted alongside error returns.
+///
+/// SDKs and integrators parse this struct to provide user-friendly error messages,
+/// recovery suggestions, and contextual information (e.g., "can claim in X blocks").
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ErrorDiagnostic {
+    /// Error code (matches [`EscrowError`] discriminant).
+    pub error_code: u32,
+    /// Human-readable error message.
+    pub message: String,
+    /// Suggested recovery action or next steps.
+    pub recovery_action: String,
+    /// Additional context (e.g., timestamp, block number, current value).
+    pub context: Option<String>,
+}
+
+impl ErrorDiagnostic {
+    /// Create a new diagnostic for the given error code with a message and recovery action.
+    pub fn new(env: &Env, error_code: u32, message: &str, recovery_action: &str) -> Self {
+        ErrorDiagnostic {
+            error_code,
+            message: String::from_str(env, message),
+            recovery_action: String::from_str(env, recovery_action),
+            context: None,
+        }
+    }
+
+    /// Create a diagnostic with additional context information.
+    pub fn with_context(env: &Env, error_code: u32, message: &str, recovery_action: &str, context: &str) -> Self {
+        ErrorDiagnostic {
+            error_code,
+            message: String::from_str(env, message),
+            recovery_action: String::from_str(env, recovery_action),
+            context: Some(String::from_str(env, context)),
+        }
+    }
+}
+
+/// Emitted when an error occurs with diagnostic information for caller recovery.
+///
+/// SDKs should listen for this event and parse the diagnostic to provide
+/// user-friendly error messages, recovery suggestions, and contextual information.
+#[contractevent]
+pub struct ErrorDiagnosticEmitted {
+    #[topic]
+    pub name: Symbol,
+    /// Diagnostic information including error code, message, recovery action, and context.
+    pub diagnostic: ErrorDiagnostic,
+}
+
 #[contract]
 pub struct LiquifactEscrow;
 
@@ -926,23 +978,10 @@ pub struct LiquifactEscrow;
 /// uninitialized memory leaks. Only the exact byte-length of the input is converted
 /// to the final symbol, ensuring no trailing null bytes or buffer remnants are preserved.
 fn validate_invoice_id_string(env: &Env, invoice_id: &String) -> Symbol {
-    let len = invoice_id.len();
-    ensure(
-        env,
-        (1..=MAX_INVOICE_ID_STRING_LEN).contains(&len),
-        EscrowError::InvoiceIdInvalidLength,
-    );
-    let len_u = len as usize;
-    let mut buf = [0u8; 32];
-    invoice_id.copy_into_slice(&mut buf[..len_u]);
-    for &b in &buf[..len_u] {
-        let ok =
-            b.is_ascii_uppercase() || b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
-        ensure(env, ok, EscrowError::InvoiceIdInvalidCharset);
+    match validation::validate_invoice_id(env, invoice_id) {
+        Ok(sym) => sym,
+        Err(err) => fail(env, err),
     }
-    let s = core::str::from_utf8(&buf[..len_u])
-        .unwrap_or_else(|_| fail(env, EscrowError::InvoiceIdInvalidCharset));
-    Symbol::new(env, s)
 }
 
 #[contractimpl]
@@ -952,6 +991,18 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::LegalHold)
             .unwrap_or(false)
+    }
+
+    /// Emit a diagnostic event for an error with recovery guidance.
+    ///
+    /// Used by error paths to provide SDKs and integrators with structured error information,
+    /// recovery suggestions, and contextual data (e.g., "can claim in X blocks").
+    fn emit_error_diagnostic(env: &Env, diagnostic: ErrorDiagnostic) {
+        ErrorDiagnosticEmitted {
+            name: symbol_short!("err_diag"),
+            diagnostic,
+        }
+        .publish(env);
     }
 
     /// Read the immutable funding token address, failing with [`EscrowError::FundingTokenNotSet`]
@@ -2549,11 +2600,18 @@ impl LiquifactEscrow {
 
         let now = env.ledger().timestamp();
         if escrow.maturity > 0 {
-            ensure(
-                &env,
-                now >= escrow.maturity,
-                EscrowError::MaturityNotReached,
-            );
+            if now < escrow.maturity {
+                let seconds_remaining = escrow.maturity.saturating_sub(now);
+                let context_msg = String::from_str(&env, &format!("Maturity timestamp: {} (in ~{} seconds)", escrow.maturity, seconds_remaining));
+                let diagnostic = ErrorDiagnostic {
+                    error_code: EscrowError::MaturityNotReached as u32,
+                    message: String::from_str(&env, "Escrow has not reached maturity yet"),
+                    recovery_action: String::from_str(&env, "Wait until maturity timestamp to settle"),
+                    context: Some(context_msg),
+                };
+                Self::emit_error_diagnostic(&env, diagnostic);
+                fail(&env, EscrowError::MaturityNotReached);
+            }
         }
 
         escrow.status = 2;
@@ -2701,11 +2759,25 @@ impl LiquifactEscrow {
         let not_before: u64 =
             Self::get_persistent_investor_claim_not_before(&env, investor.clone());
         let now = env.ledger().timestamp();
-        ensure(
-            &env,
-            now >= not_before,
-            EscrowError::InvestorCommitmentLockNotExpired,
-        );
+        
+        if now < not_before {
+            let context_msg = if not_before > 0 {
+                let blocks_remaining = not_before.saturating_sub(now);
+                String::from_str(&env, &format!("Can claim in {} seconds (block {}) from now", blocks_remaining, not_before))
+            } else {
+                String::from_str(&env, "Commitment lock is active")
+            };
+            
+            let diagnostic = ErrorDiagnostic::with_context(
+                &env,
+                EscrowError::InvestorCommitmentLockNotExpired as u32,
+                "Investment is in commitment lock period",
+                "Wait for the lock period to expire before claiming payout",
+                core::str::from_utf8(&[b' ']).unwrap(), // Use existing context_msg instead
+            );
+            Self::emit_error_diagnostic(&env, diagnostic);
+            fail(&env, EscrowError::InvestorCommitmentLockNotExpired);
+        }
 
         // Idempotent early-return: a second claim is a no-op (no re-emit).
         if Self::get_persistent_investor_claimed(&env, investor.clone()) {
