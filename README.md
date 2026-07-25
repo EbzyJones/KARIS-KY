@@ -164,6 +164,8 @@ cargo clippy --all-targets -- -D warnings
 | `record_sme_collateral_commitment` | SME records collateral pledge (metadata only). |
 | `get_escrow` | Read current escrow state. |
 | `get_version` | Read stored `DataKey::Version`. |
+| `export_state` | Admin serializes all enumerable instance-storage state into an `EscrowStateExport` (disaster recovery / migration). |
+| `import_state` | Admin restores instance-storage state from an `EscrowStateExport` onto a fresh, uninitialized instance. |
 
 ---
 

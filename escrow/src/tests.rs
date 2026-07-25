@@ -54,6 +54,7 @@ mod integration;
 mod legal_hold;
 mod properties;
 mod settlement;
+mod state_export_import;
 
 /// Registers a new escrow contract instance and returns its contract id.
 pub fn deploy_id(env: &Env) -> Address {
