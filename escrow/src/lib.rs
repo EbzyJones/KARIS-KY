@@ -358,6 +358,10 @@ pub enum EscrowError {
     /// Beneficiary rotation was attempted while the escrow was not in a
     /// pre-settlement state (`status` must be 0 = open or 1 = funded).
     RotationNotOpen = 161,
+    /// [`LiquifactEscrow::claim_investor_payout`] detected yield slippage exceeding configured threshold.
+    YieldSlippageDetected = 162,
+    /// Yield slippage threshold is out of valid range (0..=10_000 bps).
+    YieldSlippageThresholdOutOfRange = 163,
     /// The proposed new SME address is identical to the current beneficiary.
     NewSmeSameAsCurrent = 162,
 
@@ -492,6 +496,11 @@ pub enum DataKey {
     DistributedPrincipal,
     /// Optional funding deadline (ledger timestamp); after it passes, new funds are rejected.
     FundingDeadline,
+    /// Optional yield slippage threshold in basis points (bps) for real-time anomaly detection.
+    /// When set, [`LiquifactEscrow::claim_investor_payout`] compares actual vs. expected yield.
+    /// If deviation exceeds threshold, a [`YieldSlippageWarning`] is emitted.
+    /// Absent ⇒ `0` (no slippage check).
+    YieldSlippageThreshold,
 }
 
 // --- Data types ---
@@ -802,6 +811,24 @@ pub struct InvestorPayoutClaimed {
 }
 
 #[contractevent]
+pub struct YieldSlippageWarning {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub investor: Address,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Expected yield (in basis points) based on configured `yield_bps`.
+    pub expected_yield_bps: i64,
+    /// Actual effective yield (in basis points) determined at settlement.
+    pub actual_yield_bps: i64,
+    /// Configured slippage threshold (in basis points).
+    pub slippage_threshold_bps: i64,
+    /// Computed deviation (absolute difference) in basis points.
+    pub deviation_bps: i64,
+}
+
+#[contractevent]
 pub struct FundingCancelled {
     #[topic]
     pub name: Symbol,
@@ -1047,6 +1074,7 @@ impl LiquifactEscrow {
         max_per_investor: Option<i128>,
         legal_hold_clear_delay: Option<u64>,
         funding_deadline: Option<u64>,
+        yield_slippage_threshold: Option<i64>,
     ) -> InvoiceEscrow {
         admin.require_auth();
 
@@ -1145,6 +1173,19 @@ impl LiquifactEscrow {
             env.storage()
                 .instance()
                 .set(&DataKey::LegalHoldClearDelay, &delay);
+        }
+
+        // Validate and store yield slippage threshold
+        let threshold = yield_slippage_threshold.unwrap_or(0);
+        if threshold > 0 {
+            ensure(
+                &env,
+                (0..=10_000).contains(&threshold),
+                EscrowError::YieldSlippageThresholdOutOfRange,
+            );
+            env.storage()
+                .instance()
+                .set(&DataKey::YieldSlippageThreshold, &threshold);
         }
 
         EscrowInitialized {
@@ -1683,6 +1724,37 @@ impl LiquifactEscrow {
     /// Earliest ledger timestamp for [`LiquifactEscrow::claim_investor_payout`]; `0` if not gated.
     pub fn get_investor_claim_not_before(env: Env, investor: Address) -> u64 {
         Self::get_persistent_investor_claim_not_before(&env, investor)
+    }
+
+    /// Retrieve the configured yield slippage detection threshold (in basis points).
+    /// Returns `0` if slippage detection is disabled (no threshold configured).
+    ///
+    /// When the absolute difference between actual and expected yield exceeds this threshold,
+    /// a [`YieldSlippageWarning`] is emitted during [`LiquifactEscrow::claim_investor_payout`].
+    pub fn get_yield_slippage_threshold(env: Env) -> i64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::YieldSlippageThreshold)
+            .unwrap_or(0)
+    }
+
+    /// Compute expected and actual yield for an investor, and the resulting slippage deviation.
+    ///
+    /// Returns:
+    /// - `expected_yield_bps`: escrow base yield (from [`InvoiceEscrow::yield_bps`])
+    /// - `actual_yield_bps`: investor's effective yield (from [`DataKey::InvestorEffectiveYield`] or base)
+    /// - `deviation_bps`: absolute difference in basis points
+    ///
+    /// Useful for off-chain tools to preview whether a claim would trigger a slippage warning.
+    pub fn get_investor_yield_slippage(env: Env, investor: Address) -> (i64, i64, i64) {
+        // env.clone(): env is used again after this call for the InvestorEffectiveYield read.
+        let escrow = Self::get_escrow(env.clone());
+        let actual_yield_bps = Self::get_persistent_investor_effective_yield(&env, investor.clone())
+            .unwrap_or(escrow.yield_bps);
+        let expected_yield_bps = escrow.yield_bps;
+        let deviation_bps = (actual_yield_bps - expected_yield_bps).abs();
+
+        (expected_yield_bps, actual_yield_bps, deviation_bps)
     }
 
     /// Retrieve the currently recorded SME collateral commitment metadata from storage.
@@ -2657,6 +2729,9 @@ impl LiquifactEscrow {
         // Mark before emit — prevents re-emission on any re-entrant path.
         Self::set_persistent_investor_claimed(&env, investor.clone(), true);
 
+        // Real-time slippage detection: compare expected vs actual yield
+        Self::detect_yield_slippage(&env, investor.clone(), &escrow);
+
         InvestorPayoutClaimed {
             name: symbol_short!("inv_claim"),
             investor,
@@ -2745,6 +2820,61 @@ impl LiquifactEscrow {
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
             .checked_div(total_principal)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
+    }
+
+    /// Real-time slippage detection during investor claim.
+    ///
+    /// Compares expected yield (escrow base) vs. actual yield (investor's effective yield)
+    /// and emits a warning event if the deviation exceeds the configured threshold.
+    ///
+    /// # Detection logic
+    ///
+    /// - **Expected yield**: escrow's [`InvoiceEscrow::yield_bps`]
+    /// - **Actual yield**: investor's [`DataKey::InvestorEffectiveYield`] (or falls back to base)
+    /// - **Deviation**: absolute difference between actual and expected (in basis points)
+    /// - **Threshold**: stored in [`DataKey::YieldSlippageThreshold`] (0 = disabled)
+    ///
+    /// When `deviation > threshold`, emits [`YieldSlippageWarning`] for admin review.
+    ///
+    /// # Authorization
+    ///
+    /// None — pure read-only check; called internally during claim finalization.
+    fn detect_yield_slippage(env: &Env, investor: Address, escrow: &InvoiceEscrow) {
+        // Fetch configured slippage threshold; 0 means disabled
+        let threshold_bps: i64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldSlippageThreshold)
+            .unwrap_or(0);
+
+        if threshold_bps == 0 {
+            // Slippage detection is disabled
+            return;
+        }
+
+        // Resolve actual yield: investor-specific tier (set at first deposit) or escrow base.
+        let actual_yield_bps: i64 =
+            Self::get_persistent_investor_effective_yield(&env, investor.clone())
+                .unwrap_or(escrow.yield_bps);
+
+        let expected_yield_bps = escrow.yield_bps;
+
+        // Compute deviation (absolute difference in basis points)
+        let deviation_bps = (actual_yield_bps - expected_yield_bps).abs();
+
+        // Emit warning if deviation exceeds threshold
+        if deviation_bps > threshold_bps {
+            YieldSlippageWarning {
+                name: symbol_short!("yield_slip"),
+                investor,
+                invoice_id: escrow.invoice_id.clone(),
+                expected_yield_bps,
+                actual_yield_bps,
+                slippage_threshold_bps: threshold_bps,
+                deviation_bps,
+            }
+            .publish(&env);
+        }
     }
 
     pub fn update_maturity(env: Env, new_maturity: u64) -> InvoiceEscrow {

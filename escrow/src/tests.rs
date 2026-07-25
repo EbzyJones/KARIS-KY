@@ -10,7 +10,7 @@
 use super::{
     AttestationDigestRevoked, CollateralRecordedEvt, DataKey, EscrowError, EscrowFunded,
     EscrowInitialized, FundingTargetUpdated, LiquifactEscrow, LiquifactEscrowClient,
-    MaxUniqueInvestorsCapLowered, YieldTier, MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT,
+    MaxUniqueInvestorsCapLowered, YieldSlippageWarning, YieldTier, MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT,
     MAX_FUND_BATCH, SCHEMA_VERSION,
 };
 use soroban_sdk::{
@@ -54,6 +54,7 @@ mod integration;
 mod legal_hold;
 mod properties;
 mod settlement;
+mod yield_slippage;
 
 /// Registers a new escrow contract instance and returns its contract id.
 pub fn deploy_id(env: &Env) -> Address {
