@@ -2997,6 +2997,226 @@ impl LiquifactEscrow {
             .get(&DataKey::DistributedPrincipal)
             .unwrap_or(0)
     }
+
+    // ============================================================================
+    // Simulation Entrypoints (Dry-Run, Non-State-Changing)
+    // ============================================================================
+    //
+    // These entrypoints allow wallets and UIs to preview the outcome of state-changing
+    // operations without actually committing the changes to the ledger. They are read-only
+    // and do not require authorization from the investor or SME.
+    //
+    // **Important:** Simulation results may differ from actual results if:
+    // - Ledger state changes between simulation and invocation (e.g., new funding, maturity reached)
+    // - Legal holds are activated or cleared
+    // - Token balances or contract state are modified
+    //
+    // Simulations are for preview purposes only and must not be relied upon for
+    // correctness guarantees.
+
+    /// **Dry-run:** Preview the escrow state after a funding deposit (without persisting).
+    ///
+    /// Returns the escrow state that would result from calling [`LiquifactEscrow::fund`]
+    /// with the same `investor` and `amount`, performing all guard checks but NOT modifying
+    /// storage, transferring tokens, or emitting events.
+    ///
+    /// # Parameters
+    /// - `investor`: The address that would fund
+    /// - `amount`: The funding amount (in base units)
+    ///
+    /// # Returns
+    /// The resulting [`InvoiceEscrow`] state if the funding were to succeed.
+    ///
+    /// # Errors
+    /// Emits the same typed [`EscrowError`] codes as [`LiquifactEscrow::fund`]:
+    /// - Non-positive amount, legal hold, closed/settled escrow, allowlist rejection,
+    ///   capacity exhaustion, overflow guards, funding deadline, etc.
+    ///
+    /// # Differences from [`LiquifactEscrow::fund`]
+    /// - No `require_auth()` — accessible by any caller
+    /// - No storage writes (contribution tracking unchanged)
+    /// - No token transfers
+    /// - No event emission
+    /// - Returns the projected escrow state for inspection
+    ///
+    /// # Use Cases
+    /// - Wallet UI preview before user confirmation
+    /// - Off-chain script to validate funding feasibility
+    /// - Test coverage without state mutations
+    pub fn simulate_fund(env: Env, investor: Address, amount: i128) -> InvoiceEscrow {
+        // Guard checks (same as fund_impl)
+        ensure(&env, amount > 0, EscrowError::FundingAmountNotPositive);
+
+        let floor: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinContributionFloor)
+            .unwrap_or(0);
+        if floor > 0 {
+            ensure(
+                &env,
+                amount >= floor,
+                EscrowError::FundingBelowMinContribution,
+            );
+        }
+
+        let mut escrow = Self::get_escrow(env.clone());
+
+        ensure(
+            &env,
+            !Self::legal_hold_active(&env),
+            EscrowError::LegalHoldBlocksFunding,
+        );
+        ensure(
+            &env,
+            escrow.status == 0,
+            EscrowError::EscrowNotOpenForFunding,
+        );
+
+        // Check funding deadline
+        if let Some(deadline) = env.storage().instance().get(&DataKey::FundingDeadline) {
+            ensure(
+                &env,
+                env.ledger().timestamp() <= deadline,
+                EscrowError::FundingDeadlinePassed,
+            );
+        }
+
+        if Self::is_allowlist_active(env.clone()) {
+            ensure(
+                &env,
+                Self::is_investor_allowlisted(env.clone(), investor.clone()),
+                EscrowError::InvestorNotAllowlisted,
+            );
+        }
+
+        let prev: i128 = Self::get_persistent_investor_contribution(&env, investor.clone());
+        let new_contribution: i128 = prev
+            .checked_add(amount)
+            .unwrap_or_else(|| fail(&env, EscrowError::InvestorContributionOverflow));
+
+        if let Some(cap) = env
+            .storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::MaxPerInvestorCap)
+        {
+            ensure(
+                &env,
+                new_contribution <= cap,
+                EscrowError::InvestorContributionExceedsCap,
+            );
+        }
+
+        let cur_funder_count: u32 = if prev == 0 {
+            env.storage()
+                .instance()
+                .get(&DataKey::UniqueFunderCount)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        if prev == 0 {
+            if let Some(cap) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u32>(&DataKey::MaxUniqueInvestorsCap)
+            {
+                ensure(
+                    &env,
+                    cur_funder_count < cap,
+                    EscrowError::UniqueInvestorCapReached,
+                );
+            }
+        }
+
+        // Update funded_amount in the projected state (no storage write)
+        escrow.funded_amount = escrow
+            .funded_amount
+            .checked_add(amount)
+            .unwrap_or_else(|| fail(&env, EscrowError::FundedAmountOverflow));
+
+        // Transition to funded if target reached
+        if escrow.funded_amount >= escrow.funding_target && escrow.status == 0 {
+            escrow.status = 1;
+        }
+
+        escrow
+    }
+
+    /// **Dry-run:** Preview the escrow state after settlement (without persisting).
+    ///
+    /// Returns the escrow state that would result from calling [`LiquifactEscrow::settle`]
+    /// with the SME's authority, performing all guard checks but NOT modifying storage
+    /// or emitting events.
+    ///
+    /// # Returns
+    /// The resulting [`InvoiceEscrow`] state if settlement were to succeed (status → 2).
+    ///
+    /// # Errors
+    /// Emits the same typed [`EscrowError`] codes as [`LiquifactEscrow::settle`]:
+    /// - Legal hold active, escrow not funded, maturity not reached
+    ///
+    /// # Differences from [`LiquifactEscrow::settle`]
+    /// - No `require_auth()` from SME
+    /// - No storage write
+    /// - No event emission
+    /// - Returns the projected escrow state
+    ///
+    /// # Use Cases
+    /// - UI verification of settlement readiness (maturity check, funding status)
+    /// - Off-chain automation (check if settlement would succeed before invoking)
+    pub fn simulate_settle(env: Env) -> InvoiceEscrow {
+        ensure(
+            &env,
+            !Self::legal_hold_active(&env),
+            EscrowError::LegalHoldBlocksSettlement,
+        );
+
+        let mut escrow = Self::get_escrow(env.clone());
+
+        ensure(&env, escrow.status == 1, EscrowError::SettlementNotFunded);
+
+        let now = env.ledger().timestamp();
+        if escrow.maturity > 0 {
+            ensure(
+                &env,
+                now >= escrow.maturity,
+                EscrowError::MaturityNotReached,
+            );
+        }
+
+        escrow.status = 2;
+        escrow
+    }
+
+    /// **Dry-run:** Preview the investor payout after settlement (without persisting).
+    ///
+    /// Returns the pro-rata gross payout that an investor would receive via
+    /// [`LiquifactEscrow::claim_investor_payout`], based on the current
+    /// [`FundingCloseSnapshot`] and investor contribution.
+    ///
+    /// This is equivalent to reading the result of [`LiquifactEscrow::compute_investor_payout`]
+    /// and is included here for API symmetry.
+    ///
+    /// # Parameters
+    /// - `investor`: The investor address to compute payout for
+    ///
+    /// # Returns
+    /// The gross payout amount (principal + accrued yield), or `0` if:
+    /// - The investor has no contribution
+    /// - The escrow has not yet reached funded status (no snapshot)
+    ///
+    /// # Errors
+    /// Emits [`EscrowError::ComputePayoutArithmeticOverflow`] if payout computation
+    /// overflows during multiplication or division (extremely unlikely with realistic values).
+    ///
+    /// # Use Cases
+    /// - Wallet UI to show expected settlement payout before claiming
+    /// - Off-chain script to compute investor distributions
+    pub fn simulate_claim_investor_payout(env: Env, investor: Address) -> i128 {
+        Self::compute_investor_payout(env, investor)
+    }
 }
 
 #[cfg(test)]
