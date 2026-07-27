@@ -164,7 +164,7 @@ pub const SCHEMA_VERSION: u32 = 6;
 ///   on a case-by-case basis and prefer a bump when in doubt.
 ///
 /// See `docs/escrow-interface-versioning.md` for the full policy and examples.
-pub const CONTRACT_INTERFACE_VERSION: u32 = 1;
+pub const CONTRACT_INTERFACE_VERSION: u32 = 2;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
@@ -559,6 +559,9 @@ pub enum DataKey {
     /// representing the settled invoice, usable as collateral or proof of settlement.
     /// **Immutable** after init. Absent ⇒ no NFT minting.
     NftContract,
+    /// Settlement NFT metadata stored when [`LiquifactEscrow::settle`] mints an NFT.
+    /// Absent ⇒ no NFT has been minted yet. Written once during settlement.
+    SettlementNft,
 }
 
 // --- Data types ---
@@ -692,6 +695,15 @@ pub struct EscrowSummary {
     pub nft_contract: Option<Address>,
     /// Settlement NFT metadata if minted (None when no NFT contract is configured or not yet settled).
     pub settlement_nft: Option<SettlementNftMetadata>,
+}
+
+/// Custom option-like enum to represent the settlement NFT metadata.
+/// Models standard option semantics as a contracttype.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum SettlementNftSnapshot {
+    None,
+    Some(SettlementNftMetadata),
 }
 
 // --- Events ---
@@ -1933,7 +1945,10 @@ impl LiquifactEscrow {
             yield_token,
             oracle_contract,
             nft_contract,
-            settlement_nft: None,
+            settlement_nft: env
+                .storage()
+                .instance()
+                .get(&DataKey::SettlementNft),
         }
     }
 
@@ -3017,6 +3032,11 @@ impl LiquifactEscrow {
                 nft_contract: nft_addr.clone(),
                 sme_address: escrow.sme_address.clone(),
             };
+
+            // Persist metadata so third-party contracts can query it
+            env.storage()
+                .instance()
+                .set(&DataKey::SettlementNft, &nft_metadata);
 
             SettlementNftMinted {
                 name: symbol_short!("nft_mint"),

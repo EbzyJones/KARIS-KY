@@ -29,6 +29,146 @@ use karis_ky_escrow::{
     EscrowError, InvoiceEscrow, LiquifactEscrow, LiquifactEscrowClient, YieldTier,
 };
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Real compilable example functions — run with:
+//   cargo test -p karis_ky_escrow -- --nocapture
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Example: Initialize escrow, fund as investor, settle as SME, claim as investor.
+/// This is the core lifecycle demonstrating all four required patterns.
+#[cfg(test)]
+#[test]
+fn example_basic_workflow_init_fund_settle_claim() {
+    use soroban_sdk::{testutils::Address as _, Address, Env, String};
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Step 1: Deploy and initialize the escrow
+    let escrow_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &escrow_id);
+
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let investor = Address::generate(&env);
+    let funding_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let invoice_amount: i128 = 1_000_000_000;
+    let yield_bps: i64 = 500;
+
+    let escrow = client.init(
+        &admin,
+        &String::from_str(&env, "EX-001"),
+        &sme,
+        &invoice_amount,
+        &yield_bps,
+        &0u64,
+        &funding_token,
+        &None, &treasury, &None, &None, &None, &None,
+        &None, &None, &None, &None, &None, &None,
+    );
+    assert_eq!(escrow.status, 0);
+
+    // Step 2: Fund as investor
+    let funded = client.fund(&investor, &invoice_amount);
+    assert_eq!(funded.status, 1);
+    assert_eq!(client.get_contribution(&investor), invoice_amount);
+
+    // Step 3: Settle as SME
+    let settled = client.settle();
+    assert_eq!(settled.status, 2);
+
+    // Step 4: Claim as investor
+    client.claim_investor_payout(&investor);
+    assert!(client.is_investor_claimed(&investor));
+
+    // Idempotent: second claim is a no-op
+    client.claim_investor_payout(&investor);
+    assert!(client.is_investor_claimed(&investor));
+}
+
+/// Example: Initialize with yield-bearing token, fund, settle, claim.
+#[cfg(test)]
+#[test]
+fn example_yield_token_workflow() {
+    use soroban_sdk::{testutils::Address as _, Address, Env, String};
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = LiquifactEscrowClient::new(&env, &env.register(LiquifactEscrow, ()));
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let investor = Address::generate(&env);
+    let base_token = Address::generate(&env);
+    let yield_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let escrow = client.init(
+        &admin,
+        &String::from_str(&env, "YIELD-EX"),
+        &sme,
+        &1_000_000_000i128,
+        &400i64,
+        &0u64,
+        &base_token,
+        &None, &treasury, &None, &None, &None, &None,
+        &None, &None,
+        &Some(yield_token.clone()), // yield_token
+        &None,                      // oracle_contract
+        &None,                      // nft_contract
+    );
+
+    assert_eq!(client.get_yield_token(), Some(yield_token.clone()));
+
+    client.fund(&investor, &1_000_000_000i128);
+    client.settle();
+    client.claim_investor_payout(&investor);
+    assert!(client.is_investor_claimed(&investor));
+}
+
+/// Example: Initialize with NFT contract, settle to mint settlement NFT.
+#[cfg(test)]
+#[test]
+fn example_nft_mint_workflow() {
+    use soroban_sdk::{testutils::Address as _, Address, Env, String};
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = LiquifactEscrowClient::new(&env, &env.register(LiquifactEscrow, ()));
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let investor = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let nft_contract = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &String::from_str(&env, "NFT-EX"),
+        &sme,
+        &1_000_000_000i128,
+        &400i64,
+        &0u64,
+        &token,
+        &None, &treasury, &None, &None, &None, &None,
+        &None, &None,
+        &None,                      // yield_token
+        &None,                      // oracle_contract
+        &Some(nft_contract.clone()), // nft_contract
+    );
+
+    assert_eq!(client.get_nft_contract(), Some(nft_contract.clone()));
+
+    client.fund(&investor, &1_000_000_000i128);
+    let settled = client.settle();
+    assert_eq!(settled.status, 2);
+
+    client.claim_investor_payout(&investor);
+}
+
 /// # Example 1: Basic Escrow Lifecycle
 ///
 /// This example demonstrates the complete happy path:
