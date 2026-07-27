@@ -50,6 +50,7 @@ mod external_calls;
 mod external_calls_mocked;
 mod validation;
 mod funding;
+mod health_and_events;
 mod init;
 mod integration;
 mod legal_hold;
