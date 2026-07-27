@@ -858,6 +858,16 @@ pub struct TreasuryDustSwept {
 }
 
 #[contractevent]
+pub struct AssetCustodyVerified {
+    #[topic]
+    pub name: Symbol,
+    pub invoice_id: Symbol,
+    pub recorded_funded_amount: i128,
+    pub contract_balance: i128,
+    pub discrepancy: i128,
+}
+
+#[contractevent]
 pub struct PrimaryAttestationBound {
     #[topic]
     pub name: Symbol,
@@ -1233,6 +1243,40 @@ impl LiquifactEscrow {
     /// or [`None`] when no admin handover is in progress.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+    /// Compare the escrow contract's current funding-token balance to the recorded `funded_amount`.
+    ///
+    /// Returns a signed discrepancy equal to `contract_balance - recorded_funded_amount`.
+    /// Positive values indicate the contract holds more than the recorded funded amount;
+    /// negative values indicate a shortfall.
+    ///
+    /// # Authorization
+    /// Requires the current admin to authorize the call. This makes the entrypoint suitable for
+    /// manual audits and for off-chain schedulers or external triggers that reconcile custody.
+    pub fn verify_asset_custody(env: Env) -> i128 {
+        let escrow = Self::load_escrow_require_admin(&env);
+        let token_addr = Self::funding_token_or_fail(&env);
+        let this = env.current_contract_address();
+
+        let contract_balance = TokenClient::new(&env, &token_addr).balance(&this);
+        let recorded_funded_amount = escrow.funded_amount;
+        let discrepancy = if contract_balance >= recorded_funded_amount {
+            contract_balance - recorded_funded_amount
+        } else {
+            -(recorded_funded_amount - contract_balance)
+        };
+
+        AssetCustodyVerified {
+            name: symbol_short!("cust_ver"),
+            invoice_id: escrow.invoice_id.clone(),
+            recorded_funded_amount,
+            contract_balance,
+            discrepancy,
+        }
+        .publish(&env);
+
+        discrepancy
     }
 
     /// Return whether this escrow has a configured maturity time lock.
