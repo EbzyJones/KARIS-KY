@@ -51,10 +51,8 @@ fn init_open(
         &None,
         &None,
         &None,
-        &None, // yield_slippage_threshold
-        &None, // yield_token
-        &None, // oracle_contract
-        &None, // nft_contract
+        &None,
+        &None,
     );
     (token, treasury)
 }
@@ -86,10 +84,8 @@ fn init_open_with_clear_delay(
         &None,
         &legal_hold_clear_delay,
         &None,
-        &None, // yield_slippage_threshold
-        &None, // yield_token
-        &None, // oracle_contract
-        &None, // nft_contract
+        &None,
+        &None,
     );
     (token, treasury)
 }
@@ -125,10 +121,8 @@ fn init_funded_with_real_token<'a>(
         &None,
         &None,
         &None,
-        &None, // yield_slippage_threshold
-        &None, // yield_token
-        &None, // oracle_contract
-        &None, // nft_contract
+        &None,
+        &None,
     );
     client.fund(investor, &TARGET);
     sac_admin.mint(&escrow_id, &TARGET);
@@ -178,10 +172,8 @@ fn init_settled<'a>(
         &None,
         &None,
         &None,
-        &None, // yield_slippage_threshold
-        &None, // yield_token
-        &None, // oracle_contract
-        &None, // nft_contract
+        &None,
+        &None,
     );
     client.fund(investor, &TARGET);
     client.settle();

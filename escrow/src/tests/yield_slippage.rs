@@ -44,10 +44,8 @@ fn init_with_slippage_threshold(
         &None,
         &None,
         &Some(threshold_bps),
-        &None, // yield_slippage_threshold
-        &None, // yield_token
-        &None, // oracle_contract
-        &None, // nft_contract
+        &None,
+        &None,
     );
 }
 
@@ -78,10 +76,8 @@ fn init_with_tiers_and_slippage(
         &None,
         &None,
         &Some(threshold_bps),
-        &None, // yield_slippage_threshold
-        &None, // yield_token
-        &None, // oracle_contract
-        &None, // nft_contract
+        &None,
+        &None,
     );
 }
 
