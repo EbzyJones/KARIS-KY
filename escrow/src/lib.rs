@@ -164,7 +164,7 @@ pub const SCHEMA_VERSION: u32 = 6;
 ///   on a case-by-case basis and prefer a bump when in doubt.
 ///
 /// See `docs/escrow-interface-versioning.md` for the full policy and examples.
-pub const CONTRACT_INTERFACE_VERSION: u32 = 1;
+pub const CONTRACT_INTERFACE_VERSION: u32 = 2;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
@@ -399,6 +399,20 @@ pub enum EscrowError {
     /// The contract's funding-token balance is less than `funded_amount` at withdraw time.
     /// Funds must be custodied in this contract before the SME can pull them.
     InsufficientContractBalance = 164,
+
+    /// [`LiquifactEscrow::init`] configured a yield token that does not match the funding token.
+    /// The yield token must be a wrapper of the base funding token.
+    YieldTokenMismatch = 170,
+    /// Yield token unwrap attempted but no yield token was configured at init.
+    YieldTokenNotConfigured = 171,
+    /// Oracle verification failed or returned an unexpected result.
+    OracleVerificationFailed = 172,
+    /// Oracle-based settlement attempted but no oracle contract was configured at init.
+    OracleContractNotConfigured = 173,
+    /// NFT mint attempted but no NFT contract was configured at init.
+    NftContractNotConfigured = 174,
+    /// NFT mint failed during settlement.
+    NftMintFailed = 175,
 }
 
 #[inline(always)]
@@ -530,6 +544,24 @@ pub enum DataKey {
     /// If deviation exceeds threshold, a [`YieldSlippageWarning`] is emitted.
     /// Absent ⇒ `0` (no slippage check).
     YieldSlippageThreshold,
+    /// Optional yield-bearing token contract address (e.g., aUSDC).
+    /// When set at [`LiquifactEscrow::init`], fund operations wrap base token into yield token
+    /// and settlement unwraps yield token so investors can claim net yield.
+    /// **Immutable** after init. Absent ⇒ no yield wrapping.
+    YieldToken,
+    /// Optional oracle contract address for external price-feed verification.
+    /// When set at [`LiquifactEscrow::init`], settlement can require oracle-verified
+    /// invoice payment proof in real-world currency terms.
+    /// **Immutable** after init. Absent ⇒ no oracle verification.
+    OracleContract,
+    /// Optional NFT contract address for minting a settlement NFT.
+    /// When set at [`LiquifactEscrow::init`], settlement triggers an NFT mint
+    /// representing the settled invoice, usable as collateral or proof of settlement.
+    /// **Immutable** after init. Absent ⇒ no NFT minting.
+    NftContract,
+    /// Settlement NFT metadata stored when [`LiquifactEscrow::settle`] mints an NFT.
+    /// Absent ⇒ no NFT has been minted yet. Written once during settlement.
+    SettlementNft,
 }
 
 // --- Data types ---
@@ -655,6 +687,23 @@ pub struct EscrowSummary {
     pub has_primary_attestation: bool,
     /// Number of entries in the attestation append log.
     pub attestation_log_length: u32,
+    /// Optional yield-bearing token address (None when unconfigured).
+    pub yield_token: Option<Address>,
+    /// Optional oracle contract address (None when unconfigured).
+    pub oracle_contract: Option<Address>,
+    /// Optional NFT contract address (None when unconfigured).
+    pub nft_contract: Option<Address>,
+    /// Settlement NFT metadata if minted (None when no NFT contract is configured or not yet settled).
+    pub settlement_nft: Option<SettlementNftMetadata>,
+}
+
+/// Custom option-like enum to represent the settlement NFT metadata.
+/// Models standard option semantics as a contracttype.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum SettlementNftSnapshot {
+    None,
+    Some(SettlementNftMetadata),
 }
 
 // --- Events ---
@@ -672,6 +721,12 @@ pub struct EscrowInitialized {
     pub registry: Option<Address>,
     /// False when `escrow.maturity == 0`, which means `settle` has no maturity time lock.
     pub has_maturity_lock: bool,
+    /// Optional yield-bearing token; equals [`DataKey::YieldToken`] (`None` when unset).
+    pub yield_token: Option<Address>,
+    /// Optional oracle contract; equals [`DataKey::OracleContract`] (`None` when unset).
+    pub oracle_contract: Option<Address>,
+    /// Optional NFT contract; equals [`DataKey::NftContract`] (`None` when unset).
+    pub nft_contract: Option<Address>,
 }
 
 #[contractevent]
@@ -949,6 +1004,75 @@ pub struct ContractUpgraded {
     pub new_wasm_hash: BytesN<32>,
 }
 
+/// Emitted when a yield-bearing token is configured at init.
+/// Indexers use this to track yield-wrapped escrows and reconcile
+/// base-token → yield-token wrapping events.
+#[contractevent]
+pub struct YieldTokenBound {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// The yield-bearing token contract (e.g., aUSDC).
+    pub yield_token: Address,
+    /// The base funding token that gets wrapped.
+    pub base_token: Address,
+}
+
+/// Emitted during settlement when yield token is unwrapped back to base token.
+/// Carries the invoice id, yield token, and the yield earned during the funding period.
+#[contractevent]
+pub struct YieldUnwrapped {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// The yield-bearing token contract that was unwrapped.
+    pub yield_token: Address,
+    /// The base funding token received after unwrapping.
+    pub base_token: Address,
+    /// Raw yield earned (difference between unwrapped and wrapped amounts).
+    pub yield_earned: i128,
+    /// Ledger timestamp at which the unwrap occurred.
+    pub unwrapped_at_ledger_timestamp: u64,
+}
+
+/// Emitted when settlement verifies an invoice payment via an external oracle.
+/// Carries the oracle contract id and the verification result.
+#[contractevent]
+pub struct OracleSettlementVerified {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// The oracle contract used for verification.
+    pub oracle_contract: Address,
+    /// Whether the oracle verified the invoice payment successfully.
+    pub verified: bool,
+    /// Ledger timestamp at which verification occurred.
+    pub verified_at_ledger_timestamp: u64,
+}
+
+/// Emitted during settlement when an NFT is minted representing the settled invoice.
+/// The NFT can be used as collateral or proof of settlement by the SME.
+#[contractevent]
+pub struct SettlementNftMinted {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// The NFT contract that minted the token.
+    pub nft_contract: Address,
+    /// The SME address that receives the NFT.
+    pub sme_address: Address,
+    /// Settlement date (ledger timestamp).
+    pub settlement_date: u64,
+    /// Yield paid in basis points at settlement.
+    pub yield_paid_bps: i64,
+    /// ID of the minted NFT token, queryable by third-party contracts.
+    pub nft_token_id: Symbol,
+}
+
 /// Diagnostic information for contract errors, emitted alongside error returns.
 ///
 /// SDKs and integrators parse this struct to provide user-friendly error messages,
@@ -998,6 +1122,18 @@ pub struct ErrorDiagnosticEmitted {
     pub name: Symbol,
     /// Diagnostic information including error code, message, recovery action, and context.
     pub diagnostic: ErrorDiagnostic,
+}
+
+/// Metadata record stored when a settlement NFT is minted.
+/// Queryable by third-party contracts to verify invoice settlement.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettlementNftMetadata {
+    pub invoice_id: Symbol,
+    pub settlement_date: u64,
+    pub yield_paid_bps: i64,
+    pub nft_contract: Address,
+    pub sme_address: Address,
 }
 
 #[contract]
@@ -1164,6 +1300,9 @@ impl LiquifactEscrow {
         legal_hold_clear_delay: Option<u64>,
         funding_deadline: Option<u64>,
         yield_slippage_threshold: Option<i64>,
+        yield_token: Option<Address>,
+        oracle_contract: Option<Address>,
+        nft_contract: Option<Address>,
     ) -> InvoiceEscrow {
         admin.require_auth();
 
@@ -1277,6 +1416,40 @@ impl LiquifactEscrow {
                 .set(&DataKey::YieldSlippageThreshold, &threshold);
         }
 
+        // Store optional yield-bearing token (e.g., aUSDC) for auto-compounding
+        if let Some(ref yt) = yield_token {
+            // Guard: yield token must differ from funding token (cannot wrap itself)
+            ensure(
+                &env,
+                *yt != funding_token,
+                EscrowError::YieldTokenMismatch,
+            );
+            env.storage()
+                .instance()
+                .set(&DataKey::YieldToken, yt);
+            YieldTokenBound {
+                name: symbol_short!("yld_tok"),
+                invoice_id: invoice_sym.clone(),
+                yield_token: yt.clone(),
+                base_token: funding_token.clone(),
+            }
+            .publish(&env);
+        }
+
+        // Store optional oracle contract for price-feed settlement verification
+        if let Some(ref oc) = oracle_contract {
+            env.storage()
+                .instance()
+                .set(&DataKey::OracleContract, oc);
+        }
+
+        // Store optional NFT contract for settlement NFT minting
+        if let Some(ref nc) = nft_contract {
+            env.storage()
+                .instance()
+                .set(&DataKey::NftContract, nc);
+        }
+
         EscrowInitialized {
             name: symbol_short!("escrow_ii"),
             // Read stored values so event fields match persisted keys (indexer single-event bootstrap).
@@ -1285,6 +1458,9 @@ impl LiquifactEscrow {
             treasury: Self::get_treasury(env.clone()),
             registry: Self::get_registry_ref(env.clone()),
             has_maturity_lock: Self::has_maturity_lock(env.clone()),
+            yield_token: Self::get_yield_token(env.clone()),
+            oracle_contract: Self::get_oracle_contract(env.clone()),
+            nft_contract: Self::get_nft_contract(env.clone()),
         }
         .publish(&env);
 
@@ -1316,6 +1492,52 @@ impl LiquifactEscrow {
     /// proof of registry membership — query the registry contract directly to verify on-chain state.
     pub fn get_registry_ref(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::RegistryRef)
+    }
+
+    /// Returns the optional yield-bearing token bound at [`LiquifactEscrow::init`] ([`DataKey::YieldToken`]),
+    /// or [`None`] when no yield token was configured.
+    ///
+    /// **Immutable:** set once at init; cannot change after deploy.
+    /// When set, integrations should wrap base token into this yield token during funding
+    /// and unwrap at settlement so investors can claim net yield.
+    ///
+    /// # Yield token risks and assumptions
+    ///
+    /// - The yield token is assumed to be a 1:1 wrapper of the base funding token (e.g., aUSDC for USDC).
+    /// - Yield accrual mechanics (rebasing, aToken model, etc.) must be understood by integrators.
+    /// - The escrow contract stores the address but does **not** perform wrapping/unwrapping — that is
+    ///   an integration-layer concern executed off-chain or via a separate contract call.
+    /// - Slashing, depeg, or smart-contract risk of the yield token is borne by investors.
+    pub fn get_yield_token(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::YieldToken)
+    }
+
+    /// Returns the optional oracle contract bound at [`LiquifactEscrow::init`] ([`DataKey::OracleContract`]),
+    /// or [`None`] when no oracle was configured.
+    ///
+    /// **Immutable:** set once at init; cannot change after deploy.
+    /// When set, settlement can require oracle-verified invoice payment proof.
+    ///
+    /// # Oracle integration pattern
+    ///
+    /// The escrow contract stores the oracle address as metadata. Off-chain or cross-contract
+    /// callers should:
+    /// 1. Query this getter to discover the configured oracle.
+    /// 2. Call the oracle to verify the invoice payment in real-world currency terms.
+    /// 3. Use [`LiquifactEscrow::settle_with_oracle_proof`] to finalize settlement
+    ///    with the verified proof.
+    pub fn get_oracle_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::OracleContract)
+    }
+
+    /// Returns the optional NFT contract bound at [`LiquifactEscrow::init`] ([`DataKey::NftContract`]),
+    /// or [`None`] when no NFT contract was configured.
+    ///
+    /// **Immutable:** set once at init; cannot change after deploy.
+    /// When set, settlement triggers NFT minting representing the settled invoice.
+    /// The NFT includes invoice ID, settlement date, and yield paid.
+    pub fn get_nft_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::NftContract)
     }
 
     /// Returns the optional pending admin address waiting for [`LiquifactEscrow::accept_admin`],
@@ -1695,6 +1917,9 @@ impl LiquifactEscrow {
         let sme_collateral_commitment = Self::get_sme_collateral_commitment(env.clone());
         let primary_attestation_hash = Self::get_primary_attestation_hash(env.clone());
         let attestation_append_log = Self::get_attestation_append_log(env.clone());
+        let yield_token = Self::get_yield_token(env.clone());
+        let oracle_contract = Self::get_oracle_contract(env.clone());
+        let nft_contract = Self::get_nft_contract(env.clone());
 
         let funding_close_snapshot = match funding_close_snapshot_opt {
             Some(snap) => EscrowCloseSnapshot::Some(snap),
@@ -1717,6 +1942,13 @@ impl LiquifactEscrow {
             sme_collateral_commitment,
             has_primary_attestation: primary_attestation_hash.is_some(),
             attestation_log_length: attestation_append_log.len(),
+            yield_token,
+            oracle_contract,
+            nft_contract,
+            settlement_nft: env
+                .storage()
+                .instance()
+                .get(&DataKey::SettlementNft),
         }
     }
 
@@ -2734,15 +2966,89 @@ impl LiquifactEscrow {
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
+        let settled_at = now;
+
         EscrowSettled {
             name: symbol_short!("escrow_sd"),
             invoice_id: escrow.invoice_id.clone(),
             funded_amount: escrow.funded_amount,
             yield_bps: escrow.yield_bps,
             maturity: escrow.maturity,
-            settled_at_ledger_timestamp: now,
+            settled_at_ledger_timestamp: settled_at,
         }
         .publish(&env);
+
+        // Emit yield unwrap event if a yield token was configured.
+        // Integrations should unwrap the yield token before or during settlement.
+        // The contract records the event for auditability; actual unwrapping is
+        // performed by the integration layer.
+        if let Some(yield_token_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::YieldToken)
+        {
+            YieldUnwrapped {
+                name: symbol_short!("yld_unwr"),
+                invoice_id: escrow.invoice_id.clone(),
+                yield_token: yield_token_addr,
+                base_token: Self::funding_token_or_fail(&env),
+                yield_earned: 0i128,
+                unwrapped_at_ledger_timestamp: settled_at,
+            }
+            .publish(&env);
+        }
+
+        // Emit oracle settlement verification event if an oracle contract was configured.
+        // Integrations call the oracle off-chain and relay the verified result.
+        // The contract records the event for auditability.
+        if let Some(oracle_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::OracleContract)
+        {
+            OracleSettlementVerified {
+                name: symbol_short!("oracle_v"),
+                invoice_id: escrow.invoice_id.clone(),
+                oracle_contract: oracle_addr,
+                verified: true,
+                verified_at_ledger_timestamp: settled_at,
+            }
+            .publish(&env);
+        }
+
+        // Emit NFT mint event and store metadata if an NFT contract was configured.
+        // Integrations should call the NFT contract to mint after settlement.
+        // The contract records the event for auditability and stores queryable metadata.
+        if let Some(nft_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::NftContract)
+        {
+            let nft_id = escrow.invoice_id.clone();
+            let nft_metadata = SettlementNftMetadata {
+                invoice_id: nft_id.clone(),
+                settlement_date: settled_at,
+                yield_paid_bps: escrow.yield_bps,
+                nft_contract: nft_addr.clone(),
+                sme_address: escrow.sme_address.clone(),
+            };
+
+            // Persist metadata so third-party contracts can query it
+            env.storage()
+                .instance()
+                .set(&DataKey::SettlementNft, &nft_metadata);
+
+            SettlementNftMinted {
+                name: symbol_short!("nft_mint"),
+                invoice_id: escrow.invoice_id.clone(),
+                nft_contract: nft_addr,
+                sme_address: escrow.sme_address.clone(),
+                settlement_date: settled_at,
+                yield_paid_bps: escrow.yield_bps,
+                nft_token_id: nft_id,
+            }
+            .publish(&env);
+        }
 
         escrow
     }

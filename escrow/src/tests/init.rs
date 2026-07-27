@@ -26,6 +26,10 @@ fn test_init_stores_escrow() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
     assert_eq!(escrow.invoice_id, symbol_short!("INV001"));
     assert_eq!(escrow.admin, admin);
@@ -58,6 +62,10 @@ fn test_init_stores_keyed_invoice_and_lists_it() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
     let got = client.get_escrow();
     assert_eq!(got, escrow);
@@ -83,6 +91,10 @@ fn test_init_requires_admin_auth() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
     assert!(
         env.auths().iter().any(|(addr, _)| *addr == admin),
@@ -136,6 +148,10 @@ fn test_init_unauthorized_panics() {
             &None,
             &None,
             &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
         );
     }));
     assert!(result.is_err(), "Expected panic without auth");
@@ -178,6 +194,10 @@ fn test_cost_baseline_init() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -201,6 +221,10 @@ fn test_cost_baseline_init_zero_maturity() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -224,6 +248,10 @@ fn test_cost_baseline_init_max_amount() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -252,6 +280,10 @@ fn test_init_invoice_id_empty_string_panics() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -280,6 +312,10 @@ fn test_init_invoice_id_whitespace_panics() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -309,6 +345,10 @@ fn test_init_invoice_id_too_long_panics() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -337,6 +377,10 @@ fn test_init_invoice_id_bad_charset_hyphen_panics() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -365,6 +409,10 @@ fn test_init_invoice_id_non_ascii_multibyte_panics() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -385,6 +433,10 @@ fn test_init_invoice_id_embedded_null_panics() {
     client.init(
         &admin, &s, &sme, &1000i128, &500i64, &0u64, &t, &None, &tr, &None, &None, &None, &None,
         &None, &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -414,6 +466,10 @@ fn test_init_stores_registry_some_and_getters() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
     assert_eq!(client.get_registry_ref(), Some(reg));
     assert_eq!(client.get_funding_token(), token);
@@ -447,6 +503,10 @@ fn test_init_min_contribution_floor_stored() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
     assert_eq!(client.get_min_contribution_floor(), 1_000i128);
 }
@@ -476,6 +536,10 @@ fn test_init_min_contribution_floor_defaults_to_zero() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
     assert_eq!(client.get_min_contribution_floor(), 0i128);
 }
@@ -506,6 +570,10 @@ fn test_init_min_contribution_zero_panics() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -535,6 +603,10 @@ fn test_init_min_contribution_exceeds_amount_panics() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -563,6 +635,10 @@ fn test_init_min_contribution_equal_to_amount_accepted() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
     assert_eq!(client.get_min_contribution_floor(), 5_000i128);
 }
@@ -608,6 +684,10 @@ fn test_get_funding_token_after_init_succeeds() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
     assert_eq!(client.get_funding_token(), token);
 }
@@ -633,6 +713,10 @@ fn test_get_treasury_after_init_succeeds() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
     assert_eq!(client.get_treasury(), treasury);
 }
@@ -669,6 +753,10 @@ fn test_init_registry_none_roundtrip() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
     assert_eq!(client.get_registry_ref(), None);
 }
@@ -703,6 +791,10 @@ fn test_init_escrow_initialized_event_includes_bound_refs() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     assert_eq!(
@@ -714,6 +806,9 @@ fn test_init_escrow_initialized_event_includes_bound_refs() {
             treasury,
             registry: Some(registry),
             has_maturity_lock: true,
+            yield_token: None,
+            oracle_contract: None,
+            nft_contract: None,
         }
         .to_xdr(&env, &contract_id)]
     );
@@ -748,6 +843,10 @@ fn test_init_escrow_initialized_event_registry_none() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     assert_eq!(
@@ -759,6 +858,9 @@ fn test_init_escrow_initialized_event_registry_none() {
             treasury,
             registry: None,
             has_maturity_lock: false,
+            yield_token: None,
+            oracle_contract: None,
+            nft_contract: None,
         }
         .to_xdr(&env, &contract_id)]
     );
@@ -792,6 +894,10 @@ fn try_init_with_id(env: &Env, id: &str) -> Result<(), ()> {
             &None,
             &None,
             &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
         );
     }));
     result.map(|_| ()).map_err(|_| ())
@@ -840,6 +946,10 @@ fn test_invoice_id_length_33_panics() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -1048,6 +1158,10 @@ fn datakey_distributed_principal_starts_at_zero_and_increments_on_refund() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     assert_eq!(client.get_distributed_principal(), 0i128);

@@ -136,6 +136,10 @@ pub fn default_init(client: &LiquifactEscrowClient<'_>, env: &Env, admin: &Addre
         &None,
         &None,
         &None, // No funding deadline
+        &None, // No yield slippage threshold
+        &None, // No yield token
+        &None, // No oracle contract
+        &None, // No NFT contract
     );
 }
 
@@ -181,6 +185,10 @@ pub fn init_and_fund_with_real_token<'a>(
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     let investor = Address::generate(env);
