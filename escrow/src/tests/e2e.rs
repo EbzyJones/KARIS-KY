@@ -638,9 +638,10 @@ fn test_e2e_funding_deadline() {
         &None,
         &None,
         &None,
-        &None,
-        &None,
         &Some(deadline),
+        &None,
+        &None,
+        &None,
     );
 
     // Fund before deadline — succeeds

@@ -330,9 +330,10 @@ fn test_regression_207_funding_deadline_edge() {
         &None,
         &None,
         &None,
-        &None,
-        &None,
         &Some(deadline),
+        &None,
+        &None,
+        &None,
     );
 
     // Set timestamp to exact deadline

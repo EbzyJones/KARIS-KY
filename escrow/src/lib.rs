@@ -2992,9 +2992,9 @@ impl LiquifactEscrow {
                     // fee_amount = gross_coupon * fee_percentage / 10_000 (floor)
                     let fee_amount = gross_coupon
                         .checked_mul(fee_percentage as i128)
-                        .unwrap_or(0)
+                        .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
                         .checked_div(10_000)
-                        .unwrap_or(0);
+                        .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
 
                     if fee_amount > 0 {
                         let net_coupon = gross_coupon.saturating_sub(fee_amount);
@@ -3002,18 +3002,16 @@ impl LiquifactEscrow {
                         let token_addr = Self::funding_token_or_fail(&env);
                         let this = env.current_contract_address();
 
-                        // Only transfer if the contract holds enough tokens.
-                        let contract_balance =
-                            TokenClient::new(&env, &token_addr).balance(&this);
-                        if contract_balance >= fee_amount {
-                            external_calls::transfer_funding_token_with_balance_checks(
-                                &env,
-                                &token_addr,
-                                &this,
-                                &treasury,
-                                fee_amount,
-                            );
-                        }
+                        // Transfer fee to treasury. If the contract lacks sufficient balance,
+                        // the transfer will fail with a typed error — operators must ensure the
+                        // contract holds enough tokens before calling settle.
+                        external_calls::transfer_funding_token_with_balance_checks(
+                            &env,
+                            &token_addr,
+                            &this,
+                            &treasury,
+                            fee_amount,
+                        );
 
                         ProtocolFeeCollected {
                             name: symbol_short!("fee_coll"),
@@ -3290,9 +3288,9 @@ impl LiquifactEscrow {
         let net_coupon = if fee_percentage > 0 && gross_coupon > 0 {
             let fee_amount = gross_coupon
                 .checked_mul(fee_percentage as i128)
-                .unwrap_or(0)
+                .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
                 .checked_div(10_000)
-                .unwrap_or(0);
+                .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
             gross_coupon.saturating_sub(fee_amount)
         } else {
             gross_coupon
