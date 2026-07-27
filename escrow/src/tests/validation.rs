@@ -313,6 +313,8 @@ mod validation_tests {
             &None,
             &None,
             &None,
+        &None,
+        &None,
         );
 
         // Should fail with AmountMustBePositive
@@ -348,6 +350,8 @@ mod validation_tests {
             &None,
             &None,
             &None,
+        &None,
+        &None,
         );
 
         // Should fail with YieldBpsOutOfRange
@@ -383,6 +387,8 @@ mod validation_tests {
             &None,
             &None,
             &None,
+        &None,
+        &None,
         );
 
         // Should fail with InvoiceIdInvalidLength
@@ -418,6 +424,8 @@ mod validation_tests {
             &None,
             &None,
             &None,
+        &None,
+        &None,
         );
 
         // Should fail with MinContributionNotPositive
@@ -453,6 +461,8 @@ mod validation_tests {
             &None,
             &None,
             &None,
+        &None,
+        &None,
         );
 
         // Should fail with MinContributionExceedsAmount

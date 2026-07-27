@@ -3085,8 +3085,8 @@ fn test_fund_batch_equals_n_single_funds() {
             &None,
             &None,
             &None,
-            &None,
-            &None,
+        &None,
+        &None,
         );
     }
 

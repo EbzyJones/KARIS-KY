@@ -26,6 +26,8 @@ fn test_init_stores_escrow() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     assert_eq!(escrow.invoice_id, symbol_short!("INV001"));
     assert_eq!(escrow.admin, admin);
@@ -52,6 +54,8 @@ fn test_init_stores_keyed_invoice_and_lists_it() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -138,8 +142,8 @@ fn test_init_unauthorized_panics() {
             &None,
             &None,
             &None,
-            &None,
-            &None,
+        &None,
+        &None,
         );
     }));
     assert!(result.is_err(), "Expected panic without auth");
@@ -836,8 +840,8 @@ fn try_init_with_id(env: &Env, id: &str) -> Result<(), ()> {
             &None,
             &None,
             &None,
-            &None,
-            &None,
+        &None,
+        &None,
         );
     }));
     result.map(|_| ()).map_err(|_| ())

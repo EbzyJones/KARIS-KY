@@ -35,6 +35,8 @@ fn typed_error_codes_cover_init_and_state_guards() {
             &None,
         ),
         EscrowError::AmountMustBePositive,
+        &None,
+        &None,
     );
 
     client.init(
@@ -244,6 +246,8 @@ fn typed_error_codes_cover_range_boundaries() {
             &None,
         ),
         EscrowError::AmountMustBePositive,
+        &None,
+        &None,
     );
     let mut bad_tiers = SorobanVec::new(&env);
     bad_tiers.push_back(YieldTier {
@@ -274,6 +278,8 @@ fn typed_error_codes_cover_range_boundaries() {
             &None,
         ),
         EscrowError::TierYieldNotNonDecreasing,
+        &None,
+        &None,
     );
 
     // Metadata group: 20 and 22
