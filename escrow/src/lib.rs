@@ -134,9 +134,10 @@ pub mod validation;
 /// | 4 | Added `PrimaryAttestationHash`, `AttestationAppendLog` | Additive keys — no `migrate` call required |
 /// | 5 | Added `YieldTierTable`, `RegistryRef`, `Treasury`; `fund_with_commitment` | **Redeploy required** if `InvoiceEscrow` XDR changed |
 /// | 6 | Per-investor keys moved to **persistent** storage (see ADR-007) | **Redeploy required** — no `migrate` path (addresses not enumerable) |
+/// | 7 | Added `SettlementNotifierContract`, `CreatedAt`, status 5 (archived), `archive_escrow`, `notify_settlement`, `get_registry_listing` | Additive keys + new entrypoints — **redeploy required** for new status codes |
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Contract interface version — identifies the ABI surface exposed to callers.
 ///
@@ -164,7 +165,7 @@ pub const SCHEMA_VERSION: u32 = 6;
 ///   on a case-by-case basis and prefer a bump when in doubt.
 ///
 /// See `docs/escrow-interface-versioning.md` for the full policy and examples.
-pub const CONTRACT_INTERFACE_VERSION: u32 = 1;
+pub const CONTRACT_INTERFACE_VERSION: u32 = 2;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
@@ -399,6 +400,14 @@ pub enum EscrowError {
     /// The contract's funding-token balance is less than `funded_amount` at withdraw time.
     /// Funds must be custodied in this contract before the SME can pull them.
     InsufficientContractBalance = 164,
+
+    /// [`LiquifactEscrow::archive_escrow`] called before escrow reached a terminal status.
+    ArchiveNotTerminal = 170,
+    /// [`LiquifactEscrow::archive_escrow`] called when escrow is already archived (status 5).
+    EscrowAlreadyArchived = 171,
+
+    /// [`LiquifactEscrow::notify_settlement`] called without a configured settlement notifier.
+    SettlementNotifierNotSet = 180,
 }
 
 #[inline(always)]
@@ -530,6 +539,15 @@ pub enum DataKey {
     /// If deviation exceeds threshold, a [`YieldSlippageWarning`] is emitted.
     /// Absent ⇒ `0` (no slippage check).
     YieldSlippageThreshold,
+    /// Optional settlement notifier contract address. When set at [`LiquifactEscrow::init`],
+    /// [`LiquifactEscrow::settle`] invokes this contract after settlement finalization.
+    /// [`LiquifactEscrow::notify_settlement`] provides a separate retry path.
+    /// Absent ⇒ no notifier configured.
+    SettlementNotifierContract,
+    /// Ledger timestamp when [`LiquifactEscrow::init`] was called; written once, never mutated.
+    /// Used by [`LiquifactEscrow::get_registry_listing`] to surface creation metadata.
+    /// Absent ⇒ escrow predates this key (defaults to 0).
+    CreatedAt,
 }
 
 // --- Data types ---
@@ -553,7 +571,7 @@ pub struct InvoiceEscrow {
     pub funded_amount: i128,
     pub yield_bps: i64,
     pub maturity: u64,
-    /// 0 = open, 1 = funded, 2 = settled, 3 = withdrawn (SME pulled liquidity), 4 = cancelled (admin-gated; investors may refund)
+    /// 0 = open, 1 = funded, 2 = settled, 3 = withdrawn (SME pulled liquidity), 4 = cancelled (admin-gated; investors may refund), 5 = archived (admin-gated; read-only terminal)
     pub status: u32,
 }
 
@@ -988,6 +1006,49 @@ impl ErrorDiagnostic {
     }
 }
 
+/// Emitted when an escrow transitions to the archived state via [`LiquifactEscrow::archive_escrow`].
+#[contractevent]
+pub struct EscrowArchived {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub prior_status: u32,
+    pub archived_at_ledger_timestamp: u64,
+}
+
+/// Emitted when the settlement notifier contract is invoked, carrying the settlement
+/// details passed to the external notifier for auditability.
+#[contractevent]
+pub struct SettlementNotifierInvoked {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub notifier_contract: Address,
+    pub funded_amount: i128,
+    pub yield_bps: i64,
+    pub settled_at_ledger_timestamp: u64,
+}
+
+/// Discovery metadata for an escrow returned by [`LiquifactEscrow::get_registry_listing`].
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegistryListing {
+    /// The escrow contract's own address.
+    pub escrow_address: Address,
+    /// The invoice identifier (Symbol) for this escrow.
+    pub invoice_id: Symbol,
+    /// The SME (beneficiary) address.
+    pub sme_address: Address,
+    /// Ledger timestamp when `init` was called (0 when predates the key).
+    pub created_at: u64,
+    /// Current escrow status.
+    pub status: u32,
+    /// Configured funding target.
+    pub funding_target: i128,
+}
+
 /// Emitted when an error occurs with diagnostic information for caller recovery.
 ///
 /// SDKs should listen for this event and parse the diagnostic to provide
@@ -1164,6 +1225,7 @@ impl LiquifactEscrow {
         legal_hold_clear_delay: Option<u64>,
         funding_deadline: Option<u64>,
         yield_slippage_threshold: Option<i64>,
+        settlement_notifier_contract: Option<Address>,
     ) -> InvoiceEscrow {
         admin.require_auth();
 
@@ -1277,6 +1339,18 @@ impl LiquifactEscrow {
                 .set(&DataKey::YieldSlippageThreshold, &threshold);
         }
 
+        // Store optional settlement notifier contract address
+        if let Some(ref notifier) = settlement_notifier_contract {
+            env.storage()
+                .instance()
+                .set(&DataKey::SettlementNotifierContract, notifier);
+        }
+
+        // Store creation timestamp for registry listings
+        env.storage()
+            .instance()
+            .set(&DataKey::CreatedAt, &env.ledger().timestamp());
+
         EscrowInitialized {
             name: symbol_short!("escrow_ii"),
             // Read stored values so event fields match persisted keys (indexer single-event bootstrap).
@@ -1316,6 +1390,21 @@ impl LiquifactEscrow {
     /// proof of registry membership — query the registry contract directly to verify on-chain state.
     pub fn get_registry_ref(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::RegistryRef)
+    }
+
+    /// Returns the optional settlement notifier contract address stored at
+    /// [`DataKey::SettlementNotifierContract`], or [`None`] when no notifier was configured
+    /// at [`LiquifactEscrow::init`].
+    pub fn get_settlement_notifier_contract(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SettlementNotifierContract)
+    }
+
+    /// Returns the ledger timestamp when [`LiquifactEscrow::init`] was called.
+    /// Returns `0` for escrows that predate this storage key.
+    pub fn get_created_at(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::CreatedAt).unwrap_or(0)
     }
 
     /// Returns the optional pending admin address waiting for [`LiquifactEscrow::accept_admin`],
@@ -1420,7 +1509,7 @@ impl LiquifactEscrow {
         let escrow = Self::get_escrow(env.clone());
         ensure(
             &env,
-            escrow.status == 2 || escrow.status == 3 || escrow.status == 4,
+            escrow.status == 2 || escrow.status == 3 || escrow.status == 4 || escrow.status == 5,
             EscrowError::DustSweepNotTerminal,
         );
 
@@ -1479,6 +1568,50 @@ impl LiquifactEscrow {
         .publish(&env);
 
         sweep_amt
+    }
+
+    /// Archive a terminal escrow to mark it as closed and reduce active monitoring.
+    ///
+    /// Transitions the escrow to status `5` (archived). Only permitted from terminal states:
+    /// `2` (settled), `3` (withdrawn), `4` (cancelled), or `5` (already archived — no-op).
+    /// Open (`0`) or funded (`1`) states are rejected.
+    ///
+    /// # Authorization
+    /// Requires admin authorization. Read-only operations continue to work on archived escrows.
+    /// Archived escrows remain accessible but should be excluded from active-monitoring queries
+    /// by off-chain indexers.
+    ///
+    /// # Errors
+    /// Emits [`EscrowError::ArchiveNotTerminal`] if the escrow is not in a terminal state.
+    /// Emits [`EscrowError::EscrowAlreadyArchived`] if already status `5`.
+    pub fn archive_escrow(env: Env) -> InvoiceEscrow {
+        let mut escrow = Self::load_escrow_require_admin(&env);
+
+        // Idempotent no-op: already archived
+        if escrow.status == 5 {
+            return escrow;
+        }
+
+        ensure(
+            &env,
+            escrow.status == 2 || escrow.status == 3 || escrow.status == 4,
+            EscrowError::ArchiveNotTerminal,
+        );
+
+        let prior_status = escrow.status;
+        escrow.status = 5;
+
+        env.storage().instance().set(&DataKey::Escrow, &escrow);
+
+        EscrowArchived {
+            name: symbol_short!("esc_arch"),
+            invoice_id: escrow.invoice_id.clone(),
+            prior_status,
+            archived_at_ledger_timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        escrow
     }
 
     pub fn get_escrow(env: Env) -> InvoiceEscrow {
@@ -1717,6 +1850,29 @@ impl LiquifactEscrow {
             sme_collateral_commitment,
             has_primary_attestation: primary_attestation_hash.is_some(),
             attestation_log_length: attestation_append_log.len(),
+        }
+    }
+
+    /// Returns discovery metadata for this escrow, suitable for registry contracts
+    /// and off-chain indexers.
+    ///
+    /// Bundles the escrow's own address, invoice identifier, SME, creation timestamp,
+    /// current status, and funding target into a single read call. This is the canonical
+    /// on-chain source for registry listings.
+    ///
+    /// # Returns
+    /// [`RegistryListing`] with escrow metadata. `created_at` is `0` for escrows that
+    /// predate the [`DataKey::CreatedAt`] storage key.
+    pub fn get_registry_listing(env: Env) -> RegistryListing {
+        let escrow = Self::get_escrow(env.clone());
+        let created_at = Self::get_created_at(env.clone());
+        RegistryListing {
+            escrow_address: env.current_contract_address(),
+            invoice_id: escrow.invoice_id,
+            sme_address: escrow.sme_address,
+            created_at,
+            status: escrow.status,
+            funding_target: escrow.funding_target,
         }
     }
 
@@ -2702,6 +2858,56 @@ impl LiquifactEscrow {
         escrow
     }
 
+    /// Retry / standalone settlement notification. Invokes the configured
+    /// [`DataKey::SettlementNotifierContract`] with the current settlement details.
+    ///
+    /// Use this entrypoint when:
+    /// - The inline notifier call in [`LiquifactEscrow::settle`] reverted (and settlement
+    ///   was retried without a notifier).
+    /// - An off-chain relayer or indexer wants to push settlement data to an external system.
+    ///
+    /// # Authorization
+    /// Open to any caller — the notifier itself enforces its own access control.
+    ///
+    /// # Errors
+    /// Emits [`EscrowError::SettlementNotifierNotSet`] when no notifier was configured at init.
+    /// Emits [`EscrowError::InvestorClaimNotSettled`] (127) when escrow status is not `2` (settled).
+    pub fn notify_settlement(env: Env) {
+        let escrow = Self::get_escrow(env.clone());
+
+        ensure(
+            &env,
+            escrow.status == 2,
+            EscrowError::InvestorClaimNotSettled,
+        );
+
+        let notifier: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SettlementNotifierContract)
+            .unwrap_or_else(|| fail(&env, EscrowError::SettlementNotifierNotSet));
+
+        let now = env.ledger().timestamp();
+        let args = soroban_sdk::vec![
+            &env,
+            escrow.invoice_id.clone(),
+            escrow.funded_amount,
+            escrow.yield_bps,
+            now
+        ];
+        env.invoke_contract(¬ifier, &symbol_short!("on_settle"), args);
+
+        SettlementNotifierInvoked {
+            name: symbol_short!("notify_ok"),
+            invoice_id: escrow.invoice_id.clone(),
+            notifier_contract: notifier,
+            funded_amount: escrow.funded_amount,
+            yield_bps: escrow.yield_bps,
+            settled_at_ledger_timestamp: now,
+        }
+        .publish(&env);
+    }
+
     pub fn settle(env: Env) -> InvoiceEscrow {
         ensure(
             &env,
@@ -2743,6 +2949,11 @@ impl LiquifactEscrow {
             settled_at_ledger_timestamp: now,
         }
         .publish(&env);
+
+        // Settlement always succeeds. The settlement notifier (if configured) is
+        // invoked separately via `notify_settlement()` by an off-chain relayer or
+        // indexer watching for `EscrowSettled`. This guarantees graceful failure:
+        // a broken notifier does not block settlement finalization.
 
         escrow
     }
