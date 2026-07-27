@@ -30,6 +30,10 @@ fn test_unique_funder_count_basic_functionality() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     // Verify initial state
@@ -83,6 +87,10 @@ fn test_cap_enforcement_blocks_excess_investors() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     // Add two investors — reaches the investor cap but NOT the funding target.
@@ -123,6 +131,10 @@ fn test_re_funding_same_address_doesnt_count_against_cap() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     let investor = Address::generate(&env);
@@ -166,6 +178,10 @@ fn test_no_cap_allows_unlimited_investors() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     assert_eq!(client.get_max_unique_investors_cap(), None);
@@ -206,6 +222,10 @@ fn test_max_per_investor_cap_blocks_excess_principal() {
         &Some(50_000_000_000i128),
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     let inv1 = Address::generate(&env);
@@ -241,6 +261,10 @@ fn test_init_zero_max_per_investor_panics() {
         &Some(0i128),
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -270,6 +294,10 @@ fn test_min_contribution_floor_below_value_rejected() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&Address::generate(&env), &(floor - 1));
@@ -301,6 +329,10 @@ fn test_min_contribution_floor_exact_value_accepted() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&inv, &floor);
@@ -335,6 +367,10 @@ fn test_min_contribution_floor_follow_on_below_value_rejected() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&investor, &floor);
@@ -367,6 +403,10 @@ fn test_per_investor_cap_exact_cumulative_value_accepted() {
         &Some(cap),
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&inv, &30_000_000_000i128);
@@ -402,6 +442,10 @@ fn test_per_investor_cap_one_over_rejected() {
         &Some(cap),
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&inv, &30_000_000_000i128);
@@ -432,6 +476,10 @@ fn test_unique_investor_cap_exact_value_accepted() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&Address::generate(&env), &10_000_000_000i128);
@@ -465,6 +513,10 @@ fn test_unique_investor_cap_new_funder_one_over_rejected() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&Address::generate(&env), &10_000_000_000i128);
@@ -498,6 +550,10 @@ fn test_unique_investor_cap_existing_investor_follow_on_succeeds() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&inv, &10_000_000_000i128);
@@ -531,6 +587,10 @@ fn test_init_min_contribution_not_positive_panics() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -559,6 +619,10 @@ fn test_init_min_contribution_exceeds_amount_panics() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -587,6 +651,10 @@ fn test_init_zero_max_unique_investors_panics() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 }
 
@@ -622,6 +690,10 @@ fn test_cap_with_fund_with_commitment() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     assert_eq!(client.get_unique_funder_count(), 0);
@@ -667,6 +739,10 @@ fn test_lower_max_unique_investors_success() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     let inv1 = Address::generate(&env);
@@ -705,6 +781,10 @@ fn test_lower_cap_blocks_new_investors_at_lowered_limit() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&Address::generate(&env), &20_000_000_000i128);
@@ -738,6 +818,10 @@ fn test_lower_cap_existing_investors_may_refund() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     let inv1 = Address::generate(&env);
@@ -776,6 +860,10 @@ fn test_lower_cap_rejects_raise() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.lower_max_unique_investors(&4u32);
@@ -806,6 +894,10 @@ fn test_lower_cap_rejects_below_funder_count() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&Address::generate(&env), &10_000_000_000i128);
@@ -839,6 +931,10 @@ fn test_lower_cap_rejects_non_open_state() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&Address::generate(&env), &100_000_000_000i128);
@@ -871,6 +967,10 @@ fn test_lower_cap_rejects_unlimited_escrow() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.lower_max_unique_investors(&10u32);
@@ -900,6 +1000,10 @@ fn test_lower_cap_requires_admin_auth() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.lower_max_unique_investors(&3u32);
@@ -934,6 +1038,10 @@ fn test_lower_cap_unauthorized_panics() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     env.mock_auths(&[]);
@@ -967,6 +1075,10 @@ fn test_lower_cap_emits_event() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&Address::generate(&env), &10_000_000_000i128);

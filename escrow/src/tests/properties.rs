@@ -34,6 +34,10 @@ proptest! {
             &None,
             &None,
             &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
         );
 
         let before = client.get_escrow().funded_amount;
@@ -77,6 +81,10 @@ proptest! {
             &None,
             &None,
             &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
         );
         prop_assert_eq!(escrow.status, 0);
 
@@ -163,6 +171,10 @@ proptest! {
             &max_unique_investors,
             &None,
             &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
         );
 
         let investors: Vec<Address> = (0..investor_count)
@@ -337,6 +349,10 @@ fn prop_status_transitions_open_to_funded_only() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     let initial = client.get_escrow();
@@ -377,6 +393,10 @@ fn prop_status_settle_transition() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&investor, &target);
@@ -415,6 +435,10 @@ fn prop_status_withdraw_transition() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&investor, &target);
@@ -457,6 +481,10 @@ fn prop_no_regression_from_funded_status() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&investor, &target);
@@ -497,6 +525,10 @@ fn prop_no_regression_after_withdraw() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&investor, &target);
@@ -535,6 +567,10 @@ fn prop_settled_is_terminal_for_settle() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&investor, &target);
@@ -571,6 +607,10 @@ fn prop_withdrawn_is_terminal_for_withdraw() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     client.fund(&investor, &target);
@@ -607,6 +647,10 @@ fn prop_status_invariant_all_states_valid_range() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     assert!(client.get_escrow().status == 0);
@@ -649,6 +693,10 @@ fn prop_funded_amount_sum_of_contributions() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     let inv1 = Address::generate(&env);
@@ -701,6 +749,10 @@ fn prop_funded_amount_respects_funding_target() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     let fund_amount = target + excess;
@@ -741,6 +793,10 @@ fn prop_funded_amount_non_decreasing_across_multiple_funders() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     let amt1: i128 = 50_000_000_000i128;
@@ -795,6 +851,10 @@ fn prop_funded_amount_equals_contribution_sum_for_funded_escrow() {
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     let amounts: [i128; 3] = [50_000_000_000i128, 100_000_000_000i128, 50_000_000_000i128];
@@ -914,6 +974,10 @@ fn fuzz_multi_investor_fund_ordering_snapshot_once_only() {
             &None,
             &None,
             &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
         );
 
         // Randomize investor count/order and positive amounts. Keep the sequence small so
@@ -1139,6 +1203,10 @@ fn funded_and_settled_escrow<'a>(
         &None,
         &None,
         &None,
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
     );
 
     for (investor, amount) in contributions {
