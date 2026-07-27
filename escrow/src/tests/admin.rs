@@ -25,6 +25,8 @@ fn test_update_maturity_success() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     let updated = client.update_maturity(&2000u64);
     assert_eq!(updated.maturity, 2000u64);
@@ -111,6 +113,8 @@ fn test_verify_asset_custody_reports_signed_discrepancy() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     client.fund(&investor, &1_000i128);
@@ -135,6 +139,8 @@ fn test_propose_admin_sets_pending_without_changing_admin() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -169,6 +175,8 @@ fn test_accept_admin_promotes_pending_and_clears_pending() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     client.propose_admin(&new_admin);
@@ -194,6 +202,8 @@ fn test_transfer_admin_deprecated_shim_only_proposes() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -403,6 +413,8 @@ fn test_record_collateral_stored_and_does_not_block_settle() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     let c = client.record_sme_collateral_commitment(&symbol_short!("USDC"), &5000i128);
     assert_eq!(c.amount, 5000i128);
@@ -581,6 +593,8 @@ fn test_update_funding_target_by_admin_succeeds() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     let updated = client.update_funding_target(&10_000i128);
@@ -608,6 +622,8 @@ fn test_update_funding_target_by_non_admin_panics() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -745,6 +761,8 @@ fn test_update_funding_target_event_fields() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -923,6 +941,8 @@ fn test_update_maturity_event_fields() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     client.update_maturity(&2000u64);
@@ -1051,6 +1071,8 @@ fn test_update_maturity_to_zero_succeeds() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     let updated = client.update_maturity(&0u64);
     assert_eq!(updated.maturity, 0u64);
@@ -1156,6 +1178,8 @@ fn test_update_maturity_twice_overwrites() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
