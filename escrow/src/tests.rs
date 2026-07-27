@@ -46,6 +46,7 @@ mod admin;
 mod attestations;
 mod cap_validation;
 mod coverage;
+mod e2e;
 mod external_calls;
 mod external_calls_mocked;
 mod validation;
@@ -54,6 +55,7 @@ mod init;
 mod integration;
 mod legal_hold;
 mod properties;
+mod regressions;
 mod settlement;
 mod yield_slippage;
 
@@ -136,6 +138,9 @@ pub fn default_init(client: &LiquifactEscrowClient<'_>, env: &Env, admin: &Addre
         &None,
         &None,
         &None, // No funding deadline
+        &None, // max_funding_rate
+        &None, // yield_slippage_threshold
+        &None, // fee_percentage
     );
 }
 
@@ -177,6 +182,9 @@ pub fn init_and_fund_with_real_token<'a>(
         &treasury,
         &None,
         &None,
+        &None,
+        &None,
+        &None,        &None,
         &None,
         &None,
         &None,
