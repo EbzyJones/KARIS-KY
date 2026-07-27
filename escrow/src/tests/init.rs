@@ -142,6 +142,8 @@ fn test_init_unauthorized_panics() {
             &None,
             &None,
             &None,
+        &None,
+        &None,
         );
     }));
     assert!(result.is_err(), "Expected panic without auth");
@@ -184,6 +186,8 @@ fn test_cost_baseline_init() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -207,6 +211,8 @@ fn test_cost_baseline_init_zero_maturity() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -224,6 +230,8 @@ fn test_cost_baseline_init_max_amount() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -258,6 +266,8 @@ fn test_init_invoice_id_empty_string_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -280,6 +290,8 @@ fn test_init_invoice_id_whitespace_panics() {
         &t,
         &None,
         &tr,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -315,6 +327,8 @@ fn test_init_invoice_id_too_long_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -337,6 +351,8 @@ fn test_init_invoice_id_bad_charset_hyphen_panics() {
         &t,
         &None,
         &tr,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -371,6 +387,8 @@ fn test_init_invoice_id_non_ascii_multibyte_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -391,6 +409,8 @@ fn test_init_invoice_id_embedded_null_panics() {
     client.init(
         &admin, &s, &sme, &1000i128, &500i64, &0u64, &t, &None, &tr, &None, &None, &None, &None,
         &None, &None,
+        &None,
+        &None,
     );
 }
 
@@ -518,6 +538,8 @@ fn test_init_min_contribution_zero_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -543,6 +565,8 @@ fn test_init_min_contribution_exceeds_amount_panics() {
         &tre,
         &None,
         &Some(1_001i128),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -816,6 +840,8 @@ fn try_init_with_id(env: &Env, id: &str) -> Result<(), ()> {
             &None,
             &None,
             &None,
+        &None,
+        &None,
         );
     }));
     result.map(|_| ()).map_err(|_| ())
@@ -858,6 +884,8 @@ fn test_invoice_id_length_33_panics() {
         &t,
         &None,
         &tr,
+        &None,
+        &None,
         &None,
         &None,
         &None,

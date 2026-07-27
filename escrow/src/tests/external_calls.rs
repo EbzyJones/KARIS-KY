@@ -397,6 +397,8 @@ fn sweep_liability_floor_zero_funded_amount_allows_sweep() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.cancel_funding();
 

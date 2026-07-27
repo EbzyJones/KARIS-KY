@@ -46,6 +46,7 @@ fn init_with_slippage_threshold(
         &None,
         &Some(threshold_bps),
         &None,
+        &None,
     );
 }
 
@@ -77,6 +78,7 @@ fn init_with_tiers_and_slippage(
         &None,
         &None,
         &Some(threshold_bps),
+        &None,
         &None,
     );
 }

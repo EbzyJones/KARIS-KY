@@ -34,6 +34,8 @@ proptest! {
             &None,
             &None,
             &None,
+        &None,
+        &None,
         );
 
         let before = client.get_escrow().funded_amount;
@@ -77,6 +79,8 @@ proptest! {
             &None,
             &None,
             &None,
+        &None,
+        &None,
         );
         prop_assert_eq!(escrow.status, 0);
 
@@ -163,6 +167,8 @@ proptest! {
             &max_unique_investors,
             &None,
             &None,
+        &None,
+        &None,
         );
 
         let investors: Vec<Address> = (0..investor_count)
@@ -938,6 +944,8 @@ fn fuzz_multi_investor_fund_ordering_snapshot_once_only() {
             &None,
             &None,
             &None,
+        &None,
+        &None,
         );
 
         // Randomize investor count/order and positive amounts. Keep the sequence small so

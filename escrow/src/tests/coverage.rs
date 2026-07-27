@@ -35,6 +35,8 @@ fn typed_error_codes_cover_init_and_state_guards() {
             &None,
         ),
         EscrowError::AmountMustBePositive,
+        &None,
+        &None,
     );
 
     client.init(
@@ -243,6 +245,8 @@ fn typed_error_codes_cover_range_boundaries() {
             &None,
         ),
         EscrowError::AmountMustBePositive,
+        &None,
+        &None,
     );
     let mut bad_tiers = SorobanVec::new(&env);
     bad_tiers.push_back(YieldTier {
@@ -273,6 +277,8 @@ fn typed_error_codes_cover_range_boundaries() {
             &None,
         ),
         EscrowError::TierYieldNotNonDecreasing,
+        &None,
+        &None,
     );
 
     // Metadata group: 20 and 22
@@ -292,6 +298,8 @@ fn typed_error_codes_cover_range_boundaries() {
         &funding_token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -326,6 +334,8 @@ fn typed_error_codes_cover_range_boundaries() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     hold_sweep_client.set_legal_hold(&true);
     assert_contract_error(
@@ -348,6 +358,8 @@ fn typed_error_codes_cover_range_boundaries() {
         &token.id,
         &None,
         &sweep_treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -540,6 +552,8 @@ fn typed_error_codes_cover_range_boundaries() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     settle_client.set_legal_hold(&true);
     assert_contract_error(
@@ -564,6 +578,8 @@ fn typed_error_codes_cover_range_boundaries() {
         &funding_token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -601,6 +617,8 @@ fn typed_error_codes_cover_range_boundaries() {
         &None,
         &Some(10u64),
         &None,
+        &None,
+        &None,
     );
     lh_client.set_legal_hold(&true);
     assert_contract_error(
@@ -625,6 +643,8 @@ fn typed_error_codes_cover_range_boundaries() {
         &funding_token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -694,6 +714,8 @@ fn typed_error_codes_cover_legal_hold_clear_delay_overflow() {
         &None,
         &None,
         &Some(10u64),
+        &None,
+        &None,
         &None,
     );
     client.set_legal_hold(&true);
@@ -1275,6 +1297,8 @@ fn test_bump_ttl_covers_persistent_investor_keys() {
         &funding_token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1922,6 +1946,8 @@ fn test_init_yield_out_of_range() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -1944,6 +1970,8 @@ fn test_init_min_contribution_zero() {
         &treasury,
         &None,
         &Some(0),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1978,6 +2006,8 @@ fn test_init_tiers_unsorted() {
         &None,
         &treasury,
         &Some(tiers),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -2018,6 +2048,8 @@ fn test_init_tiers_not_increasing_yield() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -2044,6 +2076,8 @@ fn test_init_tiers_lower_than_base() {
         &None,
         &treasury,
         &Some(tiers),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -2114,6 +2148,8 @@ fn test_init_tier_yield_out_of_range() {
         &None,
         &treasury,
         &Some(tiers),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -2534,6 +2570,8 @@ fn init_settleable_test(
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -2679,6 +2717,8 @@ fn test_settle_event_timestamp_matches_ledger_time() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     fund_to_target_stl(&env, &client);
 
@@ -2710,6 +2750,8 @@ fn test_settle_event_timestamp_with_maturity() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -2748,6 +2790,8 @@ fn test_settle_event_emitted_at_current_ledger_time() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,

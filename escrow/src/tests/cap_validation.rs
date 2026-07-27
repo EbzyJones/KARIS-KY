@@ -214,6 +214,8 @@ fn test_max_per_investor_cap_blocks_excess_principal() {
         &Some(50_000_000_000i128),
         &None,
         &None,
+        &None,
+        &None,
     );
 
     let inv1 = Address::generate(&env);
@@ -247,6 +249,8 @@ fn test_init_zero_max_per_investor_panics() {
         &None,
         &Some(2u32),
         &Some(0i128),
+        &None,
+        &None,
         &None,
         &None,
     );
@@ -381,6 +385,8 @@ fn test_per_investor_cap_exact_cumulative_value_accepted() {
         &Some(cap),
         &None,
         &None,
+        &None,
+        &None,
     );
 
     client.fund(&inv, &30_000_000_000i128);
@@ -414,6 +420,8 @@ fn test_per_investor_cap_one_over_rejected() {
         &None,
         &None,
         &Some(cap),
+        &None,
+        &None,
         &None,
         &None,
     );
@@ -551,6 +559,8 @@ fn test_init_min_contribution_not_positive_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -575,6 +585,8 @@ fn test_init_min_contribution_exceeds_amount_panics() {
         &Address::generate(&env),
         &None,
         &Some(20_000_000_000i128),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -604,6 +616,8 @@ fn test_init_zero_max_unique_investors_panics() {
         &None,
         &None,
         &Some(0u32),
+        &None,
+        &None,
         &None,
         &None,
         &None,

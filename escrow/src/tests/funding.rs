@@ -141,6 +141,8 @@ fn test_single_investor_contribution_tracked() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &(30_000_000_000i128));
     let contribution = client.get_contribution(&investor);
@@ -173,6 +175,8 @@ fn test_repeated_funding_accumulates_contribution() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -352,6 +356,8 @@ fn test_per_investor_contribution_uses_persistent_storage() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &500i128);
 
@@ -503,6 +509,8 @@ fn test_multiple_investors_tracked_independently() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&inv_a, &(20_000_000_000i128));
     client.fund(&inv_b, &(50_000_000_000i128));
@@ -533,6 +541,8 @@ fn test_contributions_sum_equals_funded_amount() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -570,6 +580,8 @@ fn test_cost_baseline_fund_partial() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &(10_000_000_000i128));
 }
@@ -589,6 +601,8 @@ fn test_cost_baseline_fund_full() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -620,6 +634,8 @@ fn test_cost_baseline_fund_overshoot() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &(150_000_000_000i128));
     assert_eq!(client.get_escrow().status, 1);
@@ -640,6 +656,8 @@ fn test_cost_baseline_fund_two_step_completion() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -715,6 +733,8 @@ fn test_funding_snapshot_immutable_across_second_fund_after_funded() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&a, &(TARGET / 2));
     assert_eq!(client.get_funding_close_snapshot(), None);
@@ -745,6 +765,8 @@ fn test_pro_rata_weight_ratio_from_snapshot() {
         &tok,
         &None,
         &tre,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -795,6 +817,8 @@ fn test_tiered_yield_and_follow_on_fund() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund_with_commitment(&inv, &5_000i128, &200u64);
     assert_eq!(client.get_investor_yield_bps(&inv), 900);
@@ -830,6 +854,8 @@ fn test_tier_selection_edges_base_vs_high_bucket() {
         &None,
         &tre,
         &Some(tiers),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -873,6 +899,8 @@ fn test_fund_with_commitment_twice_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund_with_commitment(&inv, &5_000i128, &10u64);
     client.fund_with_commitment(&inv, &5_000i128, &10u64);
@@ -898,6 +926,8 @@ fn test_fund_then_fund_with_commitment_panics() {
         &tok,
         &None,
         &tre,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1359,6 +1389,8 @@ fn test_init_bad_tier_order_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -1387,6 +1419,8 @@ fn test_init_tier_yield_below_base_panics() {
         &None,
         &tre,
         &Some(tiers),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1994,6 +2028,8 @@ fn test_cap_validation_at_init_positive_value_required() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -2015,6 +2051,8 @@ fn test_init_panics_for_zero_cap() {
         &None,
         &None,
         &Some(0u32), // Invalid: zero cap
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -2237,6 +2275,8 @@ fn init_with_token<'a>(
         &token.id,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -2845,6 +2885,8 @@ fn init_with_maturity(
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -3043,6 +3085,8 @@ fn test_fund_batch_equals_n_single_funds() {
             &None,
             &None,
             &None,
+        &None,
+        &None,
         );
     }
 
@@ -3110,6 +3154,8 @@ fn test_fund_batch_per_investor_cap_rejection() {
         &None,
         &None,
         &Some(per_investor_cap),
+        &None,
+        &None,
         &None,
         &None,
     );
@@ -3209,6 +3255,8 @@ fn test_fund_batch_duplicate_addresses() {
         &None,
         &None,
         &Some(per_investor_cap),
+        &None,
+        &None,
         &None,
         &None,
     );
