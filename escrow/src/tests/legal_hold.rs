@@ -51,6 +51,8 @@ fn init_open(
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     (token, treasury)
 }
@@ -82,6 +84,8 @@ fn init_open_with_clear_delay(
         &None,
         &legal_hold_clear_delay,
         &None,
+        &None,
+        &None,
     );
     (token, treasury)
 }
@@ -111,6 +115,8 @@ fn init_funded_with_real_token<'a>(
         &token_id,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -160,6 +166,8 @@ fn init_settled<'a>(
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,

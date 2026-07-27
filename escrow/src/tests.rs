@@ -136,6 +136,8 @@ pub fn default_init(client: &LiquifactEscrowClient<'_>, env: &Env, admin: &Addre
         &None,
         &None,
         &None, // No funding deadline
+        &None, // No yield slippage threshold
+        &None, // No sanctions provider
     );
 }
 
@@ -175,6 +177,8 @@ pub fn init_and_fund_with_real_token<'a>(
         &token_id,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
