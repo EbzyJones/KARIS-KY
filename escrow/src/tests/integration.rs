@@ -56,18 +56,21 @@ fn test_legal_hold_midflow_blocks_and_resumes_with_ordered_events() {
         &None,
         &None,
         &None,
-    );
+    ,
+    &None,
+    &None,
+);
 
     // We will not fund or settle — just exercise legal hold at multiple points.
     // The contract id is derived from the deploy_and_init sequence, so we
     // capture it for auth mock setup.
 
     // --- Phase 1: enable hold, see it reflected ---
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(client.get_legal_hold());
 
     // --- Phase 2: clear hold ---
-    client.set_legal_hold(&false);
+    client.set_legal_hold(&false, &String::from_str(&env, ""));
     assert!(!client.get_legal_hold());
 
     // --- Phase 3: fund (hold is off) ---
@@ -75,11 +78,11 @@ fn test_legal_hold_midflow_blocks_and_resumes_with_ordered_events() {
     assert_eq!(client.get_escrow().funded_amount, 100_000_000);
 
     // --- Phase 4: enable hold mid-stream (post-fund, pre-settle) ---
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(client.get_legal_hold());
 
     // --- Phase 5: clear hold, settle ---
-    client.set_legal_hold(&false);
+    client.set_legal_hold(&false, &String::from_str(&env, ""));
     assert!(!client.get_legal_hold());
 
     // --- Phase 6: settle ---
@@ -87,11 +90,11 @@ fn test_legal_hold_midflow_blocks_and_resumes_with_ordered_events() {
     assert_eq!(client.get_escrow().status, 2);
 
     // --- Phase 7: enable hold again after settlement ---
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(client.get_legal_hold());
 
     // --- Phase 8: clear hold for cleanup ---
-    client.set_legal_hold(&false);
+    client.set_legal_hold(&false, &String::from_str(&env, ""));
     assert!(!client.get_legal_hold());
 
     // --- Event verification ---
@@ -162,7 +165,10 @@ fn test_escrow_gold_standard_happy_path_open_overfund_snapshot_settle_claim() {
         &None,
         &None,
         &None,
-    );
+    ,
+    &None,
+    &None,
+);
 
     let initial_escrow = client.get_escrow();
     assert_eq!(
@@ -391,7 +397,10 @@ fn test_escrow_tiered_yield_with_commitment_locks() {
         &None,
         &None,
         &None,
-    );
+    ,
+    &None,
+    &None,
+);
 
     let investor_base = Address::generate(&env);
     let investor_tier1 = Address::generate(&env);
@@ -517,7 +526,10 @@ fn test_collateral_record_is_metadata_only_and_does_not_invoke_token_contract() 
         &None,
         &None,
         &None,
-    );
+    ,
+    &None,
+    &None,
+);
 
     let commitment = client.record_sme_collateral_commitment(&symbol_short!("USDC"), &5_000i128);
     assert_eq!(commitment.asset, symbol_short!("USDC"));
@@ -748,14 +760,17 @@ fn test_legal_hold_midflow_blocks_then_resumes_with_ordered_events() {
         &None,
         &None,
         &None,
-    );
+    ,
+    &None,
+    &None,
+);
 
     // Initial funding succeeds while hold is off.
     let open_state = client.fund(&investor, &4_000i128);
     assert_eq!(open_state.status, 0);
 
     // Hold on: next funding + settle attempts must be blocked.
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(client.get_legal_hold());
 
     let fund_blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -871,7 +886,10 @@ fn setup_withdraw_with_token(
         &None,
         &None,
         &None,
-    );
+    ,
+    &None,
+    &None,
+);
 
     let investor = soroban_sdk::Address::generate(env);
     client.fund(&investor, &target);
@@ -946,7 +964,7 @@ fn withdraw_blocked_by_legal_hold_integration() {
     let (client, _escrow_id, _token, _sme) =
         setup_withdraw_with_token(&env, 10_000_000i128, "WD_LH001");
 
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     client.withdraw(); // must panic: LegalHoldBlocksWithdrawal
 }
 
@@ -982,7 +1000,10 @@ fn withdraw_rejected_wrong_status_open() {
         &None,
         &None,
         &None,
-    );
+    ,
+    &None,
+    &None,
+);
     // No funding — status is 0.
     client.withdraw(); // must panic: WithdrawalNotFunded
 }
@@ -1023,7 +1044,10 @@ fn withdraw_rejected_insufficient_contract_balance() {
         &None,
         &None,
         &None,
-    );
+    ,
+    &None,
+    &None,
+);
 
     let investor = soroban_sdk::Address::generate(&env);
     client.fund(&investor, &target);

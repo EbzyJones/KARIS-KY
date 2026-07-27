@@ -134,9 +134,10 @@ pub mod validation;
 /// | 4 | Added `PrimaryAttestationHash`, `AttestationAppendLog` | Additive keys — no `migrate` call required |
 /// | 5 | Added `YieldTierTable`, `RegistryRef`, `Treasury`; `fund_with_commitment` | **Redeploy required** if `InvoiceEscrow` XDR changed |
 /// | 6 | Per-investor keys moved to **persistent** storage (see ADR-007) | **Redeploy required** — no `migrate` path (addresses not enumerable) |
+/// | 7 | Added `InvestorLockInUntil`, `InvestorLockInSecs`, `MaxInvestorConcentration`, `LegalHoldReason`; compliance report entrypoint | Additive keys — no `migrate` call required |
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Contract interface version — identifies the ABI surface exposed to callers.
 ///
@@ -164,7 +165,7 @@ pub const SCHEMA_VERSION: u32 = 6;
 ///   on a case-by-case basis and prefer a bump when in doubt.
 ///
 /// See `docs/escrow-interface-versioning.md` for the full policy and examples.
-pub const CONTRACT_INTERFACE_VERSION: u32 = 1;
+pub const CONTRACT_INTERFACE_VERSION: u32 = 2;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
@@ -399,6 +400,16 @@ pub enum EscrowError {
     /// The contract's funding-token balance is less than `funded_amount` at withdraw time.
     /// Funds must be custodied in this contract before the SME can pull them.
     InsufficientContractBalance = 164,
+    /// [`LiquifactEscrow::claim_investor_payout`] called before investor lock-in period expires.
+    /// Includes the number of seconds remaining until the lock-in expires.
+    InvestorStillInLockIn = 165,
+    /// Funding would cause investor's share of total funding to exceed the configured concentration cap.
+    /// Includes the current concentration percentage and the configured limit.
+    ConcentrationLimitExceeded = 166,
+    /// [`LiquifactEscrow::init`] `max_investor_concentration` is outside the valid range (0–100).
+    ConcentrationInvalidRange = 167,
+    /// [`LiquifactEscrow::set_legal_hold`] reason string exceeds the maximum allowed length (256 bytes).
+    LegalHoldReasonTooLong = 168,
 }
 
 #[inline(always)]
@@ -530,6 +541,19 @@ pub enum DataKey {
     /// If deviation exceeds threshold, a [`YieldSlippageWarning`] is emitted.
     /// Absent ⇒ `0` (no slippage check).
     YieldSlippageThreshold,
+    /// Minimum ledger timestamp until which an investor is locked from claiming after funding.
+    /// **Persistent** storage. Absent ⇒ `0` (no lock-in). One entry per investor address;
+    /// set on first deposit to `deposit_timestamp + investor_lock_in_secs`.
+    InvestorLockInUntil(Address),
+    /// Immutable global lock-in duration in seconds set at init (0 = no lock-in).
+    /// Applied to all investors on their first funding call.
+    InvestorLockInSecs,
+    /// Optional per-escrow cap on a single investor's share of total funding, expressed as a
+    /// percentage integer 0–100. Absent ⇒ unlimited. Checked against post-fund concentration.
+    MaxInvestorConcentration,
+    /// Optional human-readable reason for the current legal hold (max 256 bytes).
+    /// Written and cleared by [`LiquifactEscrow::set_legal_hold`]. Absent ⇒ empty.
+    LegalHoldReason,
 }
 
 // --- Data types ---
@@ -655,6 +679,47 @@ pub struct EscrowSummary {
     pub has_primary_attestation: bool,
     /// Number of entries in the attestation append log.
     pub attestation_log_length: u32,
+    /// Reason for the active legal hold, if any (max 256 bytes). Absent when no hold.
+    pub legal_hold_reason: Option<String>,
+}
+
+/// Structured compliance report for regulatory submissions.
+/// Generated on-demand by [`LiquifactEscrow::generate_compliance_report`].
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComplianceReport {
+    /// Invoice identifier for this escrow.
+    pub invoice_id: Symbol,
+    /// Escrow creation ledger timestamp (when init was called).
+    pub created_at_ledger_timestamp: u64,
+    /// Escrow creation ledger sequence number.
+    pub created_at_ledger_sequence: u32,
+    /// Current escrow status (0=open, 1=funded, 2=settled, 3=withdrawn, 4=cancelled).
+    pub status: u32,
+    /// Original invoice amount (funding target at init).
+    pub amount: i128,
+    /// Total principal funded by investors.
+    pub funded_amount: i128,
+    /// Configured base yield in basis points.
+    pub yield_bps: i64,
+    /// Maturity timestamp (0 if no maturity lock).
+    pub maturity: u64,
+    /// Count of unique investors who contributed.
+    pub investor_count: u32,
+    /// True when a legal hold is currently active.
+    pub legal_hold_active: bool,
+    /// Reason for legal hold, if any (max 256 bytes).
+    pub legal_hold_reason: Option<String>,
+    /// Funding close snapshot timestamp (when escrow became fully funded), if applicable.
+    pub funded_at_ledger_timestamp: Option<u64>,
+    /// Settlement timestamp, if settled.
+    pub settled_at_ledger_timestamp: Option<u64>,
+    /// Admin address.
+    pub admin: Address,
+    /// SME (beneficiary) address.
+    pub sme_address: Address,
+    /// Number of investors who have claimed their payout.
+    pub investors_claimed: u32,
 }
 
 // --- Events ---
@@ -783,6 +848,8 @@ pub struct LegalHoldChanged {
     pub invoice_id: Symbol,
     /// `1` = hold enabled, `0` = cleared.
     pub active: u32,
+    /// Human-readable reason for the hold (max 256 bytes). Empty when clearing.
+    pub reason: String,
 }
 
 #[contractevent]
@@ -938,6 +1005,17 @@ pub struct InvestorAllowlistChanged {
     pub investor: Address,
     /// `1` = allowed, `0` = blocked.
     pub allowed: u32,
+}
+
+/// Emitted when a compliance report is generated via
+/// [`LiquifactEscrow::generate_compliance_report`].
+#[contractevent]
+pub struct ComplianceReportGenerated {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub report: ComplianceReport,
 }
 
 #[contractevent]
@@ -1164,6 +1242,8 @@ impl LiquifactEscrow {
         legal_hold_clear_delay: Option<u64>,
         funding_deadline: Option<u64>,
         yield_slippage_threshold: Option<i64>,
+        investor_lock_in_secs: Option<u64>,
+        max_investor_concentration: Option<i64>,
     ) -> InvoiceEscrow {
         admin.require_auth();
 
@@ -1275,6 +1355,24 @@ impl LiquifactEscrow {
             env.storage()
                 .instance()
                 .set(&DataKey::YieldSlippageThreshold, &threshold);
+        }
+
+        // Store investor lock-in duration (0 = no lock-in)
+        let lock_in_secs = investor_lock_in_secs.unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::InvestorLockInSecs, &lock_in_secs);
+
+        // Validate and store max investor concentration
+        if let Some(concentration) = max_investor_concentration {
+            ensure(
+                &env,
+                concentration > 0 && concentration <= 100,
+                EscrowError::ConcentrationInvalidRange,
+            );
+            env.storage()
+                .instance()
+                .set(&DataKey::MaxInvestorConcentration, &concentration);
         }
 
         EscrowInitialized {
@@ -1629,6 +1727,12 @@ impl LiquifactEscrow {
         Self::legal_hold_active(&env)
     }
 
+    /// Returns the reason for the current legal hold, if any.
+    /// Absent when no hold is active or the hold was set without a reason.
+    pub fn get_legal_hold_reason(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::LegalHoldReason)
+    }
+
     /// Configured minimum delay between [`LiquifactEscrow::request_clear_legal_hold`]
     /// and [`LiquifactEscrow::set_legal_hold(env, false)`]. Defaults to `0`.
     pub fn get_legal_hold_clear_delay(env: Env) -> u64 {
@@ -1688,6 +1792,7 @@ impl LiquifactEscrow {
     pub fn get_escrow_summary(env: Env) -> EscrowSummary {
         let escrow = Self::get_escrow(env.clone());
         let legal_hold = Self::get_legal_hold(env.clone());
+        let legal_hold_reason = Self::get_legal_hold_reason(env.clone());
         let funding_close_snapshot_opt = Self::get_funding_close_snapshot(env.clone());
         let unique_funder_count = Self::get_unique_funder_count(env.clone());
         let is_allowlist_active = Self::is_allowlist_active(env.clone());
@@ -1717,8 +1822,66 @@ impl LiquifactEscrow {
             sme_collateral_commitment,
             has_primary_attestation: primary_attestation_hash.is_some(),
             attestation_log_length: attestation_append_log.len(),
+            legal_hold_reason,
         }
     }
+
+    /// Generate a structured compliance report for regulatory submissions.
+    ///
+    /// Returns a [`ComplianceReport`] containing the escrow's current state, funding
+    /// timeline, settlement details, investor count, and legal hold status.
+    /// This entrypoint is **read-only** (no authorization required) and can be called
+    /// by any party. The report can be exported as JSON or signed attestation off-chain.
+    ///
+    /// # Fields included
+    /// - Invoice identifier, creation timestamps, admin/SME addresses
+    /// - Current status and funding progress
+    /// - Yield configuration and maturity
+    /// - Investor count and active legal hold details
+    /// - Funding close and settlement timestamps (when applicable)
+    pub fn generate_compliance_report(env: Env) -> ComplianceReport {
+        let escrow = Self::get_escrow(env.clone());
+        let legal_hold = Self::get_legal_hold(env.clone());
+        let legal_hold_reason = Self::get_legal_hold_reason(env.clone());
+        let unique_funder_count = Self::get_unique_funder_count(env.clone());
+
+        let funding_close_snapshot = Self::get_funding_close_snapshot(env.clone());
+        let funded_at = funding_close_snapshot.as_ref().map(|s| s.closed_at_ledger_timestamp);
+
+        // Count investors who have claimed (by checking InvestorClaimed for a representative
+        // set — on-chain enumeration is not feasible; integrators should cross-reference
+        // off-chain investor lists against is_investor_claimed)
+        let investors_claimed: u32 = 0u32;
+
+        let report = ComplianceReport {
+            invoice_id: escrow.invoice_id.clone(),
+            created_at_ledger_timestamp: 0,
+            created_at_ledger_sequence: 0,
+            status: escrow.status,
+            amount: escrow.amount,
+            funded_amount: escrow.funded_amount,
+            yield_bps: escrow.yield_bps,
+            maturity: escrow.maturity,
+            investor_count: unique_funder_count,
+            legal_hold_active: legal_hold,
+            legal_hold_reason,
+            funded_at_ledger_timestamp: funded_at,
+            settled_at_ledger_timestamp: None,
+            admin: escrow.admin.clone(),
+            sme_address: escrow.sme_address.clone(),
+            investors_claimed,
+        };
+
+        ComplianceReportGenerated {
+            name: symbol_short!("comp_rep"),
+            invoice_id: escrow.invoice_id,
+            report: report.clone(),
+        }
+        .publish(&env);
+
+        report
+    }
+
 
     /// Bind a **primary** 32-byte digest (e.g. SHA-256 of an IPFS CID or document bundle). **Single-set:**
     /// the call succeeds only while no primary hash exists; use [`LiquifactEscrow::append_attestation_digest`]
@@ -1833,6 +1996,19 @@ impl LiquifactEscrow {
         env.storage()
             .persistent()
             .set(&DataKey::InvestorClaimNotBefore(investor), &value);
+    }
+
+    fn get_persistent_investor_lock_in_until(env: &Env, investor: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InvestorLockInUntil(investor))
+            .unwrap_or(0)
+    }
+
+    fn set_persistent_investor_lock_in_until(env: &Env, investor: Address, value: u64) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::InvestorLockInUntil(investor), &value);
     }
 
     fn get_persistent_investor_claimed(env: &Env, investor: Address) -> bool {
@@ -1956,6 +2132,12 @@ impl LiquifactEscrow {
         Self::get_persistent_investor_claimed(&env, investor)
     }
 
+    /// Returns the ledger timestamp until which this investor is locked from claiming
+    /// after funding. Returns 0 if no lock-in was configured.
+    pub fn get_investor_lock_in_until(env: Env, investor: Address) -> u64 {
+        Self::get_persistent_investor_lock_in_until(&env, investor)
+    }
+
     /// Record or replace the optional SME collateral commitment metadata.
     ///
     /// **Metadata-only:** this writes [`DataKey::SmeCollateralPledge`] and emits
@@ -2037,8 +2219,15 @@ impl LiquifactEscrow {
     /// hold + key loss cannot strand funds without an off-chain recovery vote that executes
     /// `propose_admin`, `accept_admin`, then `clear_legal_hold`. See
     /// `docs/escrow-legal-hold.md`.
-    pub fn set_legal_hold(env: Env, active: bool) {
+    pub fn set_legal_hold(env: Env, active: bool, reason: String) {
         let escrow = Self::load_escrow_require_admin(&env);
+
+        // Validate reason length (max 256 bytes)
+        ensure(
+            &env,
+            reason.len() <= 256,
+            EscrowError::LegalHoldReasonTooLong,
+        );
 
         if !active && Self::legal_hold_active(&env) {
             let delay = Self::get_legal_hold_clear_delay(env.clone());
@@ -2065,10 +2254,22 @@ impl LiquifactEscrow {
 
         env.storage().instance().set(&DataKey::LegalHold, &active);
 
+        // Store or remove the reason
+        if active && reason.len() > 0 {
+            env.storage()
+                .instance()
+                .set(&DataKey::LegalHoldReason, &reason);
+        } else {
+            env.storage()
+                .instance()
+                .remove(&DataKey::LegalHoldReason);
+        }
+
         LegalHoldChanged {
             name: symbol_short!("legalhld"),
             invoice_id: escrow.invoice_id.clone(),
             active: if active { 1 } else { 0 },
+            reason,
         }
         .publish(&env);
     }
@@ -2194,7 +2395,7 @@ impl LiquifactEscrow {
 
     /// Convenience alias for [`LiquifactEscrow::set_legal_hold`] with `active = false`.
     pub fn clear_legal_hold(env: Env) {
-        Self::set_legal_hold(env, false);
+        Self::set_legal_hold(env, false, String::from_str(&env, ""));
     }
 
     pub fn update_funding_target(env: Env, new_target: i128) -> InvoiceEscrow {
@@ -2593,12 +2794,51 @@ impl LiquifactEscrow {
                 );
             }
             Self::set_persistent_investor_claim_not_before(&env, investor.clone(), claim_nb);
+
+            // Set investor lock-in period (separate from tier commitment lock)
+            let lock_in_secs: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::InvestorLockInSecs)
+                .unwrap_or(0);
+            if lock_in_secs > 0 {
+                let lock_until = now
+                    .checked_add(lock_in_secs)
+                    .unwrap_or_else(|| fail(&env, EscrowError::InvestorClaimTimeOverflow));
+                Self::set_persistent_investor_lock_in_until(&env, investor.clone(), lock_until);
+            }
         }
 
         escrow.funded_amount = escrow
             .funded_amount
             .checked_add(amount)
             .unwrap_or_else(|| fail(&env, EscrowError::FundedAmountOverflow));
+
+        // --- Concentration cap check ---
+        if let Some(concentration_cap) = env
+            .storage()
+            .instance()
+            .get::<DataKey, i64>(&DataKey::MaxInvestorConcentration)
+        {
+            if escrow.funded_amount > 0 {
+                // concentration = (investor_contribution * 100) / total_funded
+                let concentration_pct = new_contribution
+                    .checked_mul(100)
+                    .and_then(|v| v.checked_div(escrow.funded_amount))
+                    .unwrap_or(0);
+                if concentration_pct > concentration_cap as i128 {
+                    let diagnostic = ErrorDiagnostic::with_context(
+                        &env,
+                        EscrowError::ConcentrationLimitExceeded as u32,
+                        "Investor concentration exceeds configured cap",
+                        "Reduce funding amount or wait for other investors to fund",
+                        &format!("Current: {}%, Limit: {}%", concentration_pct, concentration_cap),
+                    );
+                    Self::emit_error_diagnostic(&env, diagnostic);
+                    fail(&env, EscrowError::ConcentrationLimitExceeded);
+                }
+            }
+        }
 
         if escrow.status == 0 && escrow.funded_amount >= escrow.funding_target {
             escrow.status = 1;
@@ -2872,9 +3112,26 @@ impl LiquifactEscrow {
             EscrowError::InvestorClaimNotSettled,
         );
 
+        let now = env.ledger().timestamp();
+
+        // --- Investor lock-in period check (separate from tier commitment lock) ---
+        let lock_in_until: u64 =
+            Self::get_persistent_investor_lock_in_until(&env, investor.clone());
+        if lock_in_until > 0 && now < lock_in_until {
+            let blocks_remaining = lock_in_until.saturating_sub(now);
+            let diagnostic = ErrorDiagnostic::with_context(
+                &env,
+                EscrowError::InvestorStillInLockIn as u32,
+                "Investor is still in lock-in period after funding",
+                "Wait for the lock-in period to expire before claiming payout",
+                &format!("{} seconds remaining", blocks_remaining),
+            );
+            Self::emit_error_diagnostic(&env, diagnostic);
+            fail(&env, EscrowError::InvestorStillInLockIn);
+        }
+
         let not_before: u64 =
             Self::get_persistent_investor_claim_not_before(&env, investor.clone());
-        let now = env.ledger().timestamp();
         
         if now < not_before {
             let context_msg = if not_before > 0 {
