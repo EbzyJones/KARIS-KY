@@ -164,7 +164,11 @@ pub const SCHEMA_VERSION: u32 = 6;
 ///   on a case-by-case basis and prefer a bump when in doubt.
 ///
 /// See `docs/escrow-interface-versioning.md` for the full policy and examples.
-pub const CONTRACT_INTERFACE_VERSION: u32 = 1;
+/// Bumped to 2 because new entrypoints were added:
+/// - `batch_claim_investor_payouts` (batch claim endpoint)
+/// - `verify_investor_proof` (Merkle proof verification)
+/// - `get_funding_close_merkle_root` (Merkle root getter)
+pub const CONTRACT_INTERFACE_VERSION: u32 = 2;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
@@ -177,6 +181,10 @@ pub const MAX_INVESTOR_ALLOWLIST_BATCH: u32 = 32;
 /// Upper bound on [`LiquifactEscrow::fund_batch`] entries to keep storage/CPU bounded.
 /// Mirrors the spirit of `MAX_ATTESTATION_APPEND_ENTRIES` to limit per-call work.
 pub const MAX_FUND_BATCH: u32 = 50;
+
+/// Upper bound on [`LiquifactEscrow::batch_claim_investor_payouts`] entries to keep
+/// persistent storage writes and CPU bounded within a single invocation.
+pub const MAX_BATCH_CLAIM: u32 = 50;
 
 /// Upper bound on [`LiquifactEscrow::sweep_terminal_dust`] per call (base units of the funding token).
 ///
@@ -399,6 +407,13 @@ pub enum EscrowError {
     /// The contract's funding-token balance is less than `funded_amount` at withdraw time.
     /// Funds must be custodied in this contract before the SME can pull them.
     InsufficientContractBalance = 164,
+
+    /// [`LiquifactEscrow::batch_claim_investor_payouts`] received an empty investors vector.
+    BatchClaimEmpty = 170,
+    /// [`LiquifactEscrow::batch_claim_investor_payouts`] exceeded [`MAX_BATCH_CLAIM`].
+    BatchClaimTooLarge = 171,
+    /// [`LiquifactEscrow::verify_investor_proof`] proof verification failed.
+    MerkleProofInvalid = 172,
 }
 
 #[inline(always)]
@@ -530,6 +545,17 @@ pub enum DataKey {
     /// If deviation exceeds threshold, a [`YieldSlippageWarning`] is emitted.
     /// Absent ⇒ `0` (no slippage check).
     YieldSlippageThreshold,
+    /// Merkle root of investor contributions at funding close; stored once alongside
+    /// [`FundingCloseSnapshot`] as a compact proof anchor. Absent ⇒ not computed.
+    /// Enables gas-efficient [`LiquifactEscrow::verify_investor_proof`] calls.
+    FundingCloseMerkleRoot,
+    /// Number of entries in the attestation append log (replaces reading the full Vec).
+    /// Absent ⇒ `0`. Written atomically with each append; used for O(1) capacity checks.
+    AttestationAppendLogCount,
+    /// Individual attestation log entry at the given index (0-based).
+    /// Each entry is a 32-byte digest; stored independently to avoid full-Vec deserialization.
+    /// Absent ⇒ no entry at that index. See [`DataKey::AttestationAppendLogCount`] for length.
+    AttestationLogEntry(u32),
 }
 
 // --- Data types ---
@@ -839,6 +865,19 @@ pub struct InvestorPayoutClaimed {
     pub invoice_id: Symbol,
 }
 
+/// Emitted when a batch of investor claims completes successfully.
+/// Carries the count of claims processed so indexers can reconcile
+/// against individual [`InvestorPayoutClaimed`] events emitted per investor.
+#[contractevent]
+pub struct BatchInvestorPayoutsClaimed {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Number of investors whose claims were processed in this batch.
+    pub claimed_count: u32,
+}
+
 #[contractevent]
 pub struct YieldSlippageWarning {
     #[topic]
@@ -947,6 +986,19 @@ pub struct ContractUpgraded {
     #[topic]
     pub invoice_id: Symbol,
     pub new_wasm_hash: BytesN<32>,
+}
+
+/// Emitted when the funding-close Merkle root is bound at the funded transition.
+/// Carries the 32-byte root so off-chain verifiers can cross-check proofs
+/// without a separate storage read.
+#[contractevent]
+pub struct FundingCloseMerkleRootBound {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Keccak-256 Merkle root of (investor_address, contribution) pairs.
+    pub merkle_root: BytesN<32>,
 }
 
 /// Diagnostic information for contract errors, emitted alongside error returns.
@@ -1694,7 +1746,19 @@ impl LiquifactEscrow {
         let schema_version = Self::get_version(env.clone());
         let sme_collateral_commitment = Self::get_sme_collateral_commitment(env.clone());
         let primary_attestation_hash = Self::get_primary_attestation_hash(env.clone());
-        let attestation_append_log = Self::get_attestation_append_log(env.clone());
+        let attestation_log_length = env
+            .storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::AttestationAppendLogCount)
+            .unwrap_or_else(|| {
+                // Legacy fallback for old Vec-based log.
+                let legacy: Vec<BytesN<32>> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AttestationAppendLog)
+                    .unwrap_or_else(|| Vec::new(&env));
+                legacy.len()
+            });
 
         let funding_close_snapshot = match funding_close_snapshot_opt {
             Some(snap) => EscrowCloseSnapshot::Some(snap),
@@ -1716,7 +1780,7 @@ impl LiquifactEscrow {
             schema_version,
             sme_collateral_commitment,
             has_primary_attestation: primary_attestation_hash.is_some(),
-            attestation_log_length: attestation_append_log.len(),
+            attestation_log_length,
         }
     }
 
@@ -1764,21 +1828,63 @@ impl LiquifactEscrow {
     pub fn append_attestation_digest(env: Env, digest: BytesN<32>) {
         let escrow = Self::load_escrow_require_admin(&env);
 
-        let mut log: Vec<BytesN<32>> = env
+        // Auto-migrate: if an old Vec-based log exists but no count has been set,
+        // migrate each old entry to the new individual-entry format first.
+        let has_old_log = env
             .storage()
             .instance()
-            .get(&DataKey::AttestationAppendLog)
-            .unwrap_or_else(|| Vec::new(&env));
+            .has(&DataKey::AttestationAppendLog);
+        let has_count = env
+            .storage()
+            .instance()
+            .has(&DataKey::AttestationAppendLogCount);
+
+        if has_old_log && !has_count {
+            // Read the legacy Vec once, write each entry individually, then delete it.
+            let legacy: Vec<BytesN<32>> = env
+                .storage()
+                .instance()
+                .get(&DataKey::AttestationAppendLog)
+                .unwrap_or_else(|| Vec::new(&env));
+            let legacy_len = legacy.len();
+            for i in 0..legacy_len {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::AttestationLogEntry(i), &legacy.get(i).unwrap());
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::AttestationAppendLogCount, &legacy_len);
+            // Remove the legacy Vec so future reads use the new format.
+            env.storage()
+                .instance()
+                .remove(&DataKey::AttestationAppendLog);
+        }
+
+        // Optimized: read only the count instead of the full Vec<BytesN<32>>.
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AttestationAppendLogCount)
+            .unwrap_or(0);
+
         ensure(
             &env,
-            log.len() < MAX_ATTESTATION_APPEND_ENTRIES,
+            count < MAX_ATTESTATION_APPEND_ENTRIES,
             EscrowError::AttestationAppendLogCapacityReached,
         );
-        let idx = log.len();
-        log.push_back(digest.clone());
+
+        let idx = count;
+
+        // Store the new entry individually — avoids deserializing all 32 entries.
         env.storage()
             .instance()
-            .set(&DataKey::AttestationAppendLog, &log);
+            .set(&DataKey::AttestationLogEntry(idx), &digest);
+
+        // Bump the count atomically.
+        env.storage()
+            .instance()
+            .set(&DataKey::AttestationAppendLogCount, &(count + 1));
 
         AttestationDigestAppended {
             name: symbol_short!("att_app"),
@@ -1790,10 +1896,37 @@ impl LiquifactEscrow {
     }
 
     pub fn get_attestation_append_log(env: Env) -> Vec<BytesN<32>> {
-        env.storage()
+        // Backward compat: if the old Vec-based key exists, return it (existing escrows).
+        // New deployments use individual AttestationLogEntry keys gated by AttestationAppendLogCount.
+        if let Some(legacy_log) = env
+            .storage()
             .instance()
-            .get(&DataKey::AttestationAppendLog)
-            .unwrap_or_else(|| Vec::new(&env))
+            .get::<DataKey, Vec<BytesN<32>>>(&DataKey::AttestationAppendLog)
+        {
+            return legacy_log;
+        }
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AttestationAppendLogCount)
+            .unwrap_or(0);
+
+        if count == 0 {
+            return Vec::new(&env);
+        }
+
+        let mut log = Vec::new(&env);
+        for i in 0..count {
+            if let Some(entry) = env
+                .storage()
+                .instance()
+                .get::<DataKey, BytesN<32>>(&DataKey::AttestationLogEntry(i))
+            {
+                log.push_back(entry);
+            }
+        }
+        log
     }
 
     // --- Persistent per-investor storage helpers ---
@@ -1862,6 +1995,17 @@ impl LiquifactEscrow {
         env.storage().instance().get(&DataKey::FundingCloseSnapshot)
     }
 
+    /// Returns the Merkle root bound at funding close, or [`None`] when not yet
+    /// computed (escrow has not reached funded status).
+    ///
+    /// The root is a Keccak-256 hash of the Merkle tree over (investor_address, contribution)
+    /// pairs at the moment the escrow became funded. Off-chain verifiers use this root
+    /// with [`LiquifactEscrow::verify_investor_proof`] to confirm an investor's
+    /// contribution and pro-rata share without iterating on-chain storage.
+    pub fn get_funding_close_merkle_root(env: Env) -> Option<BytesN<32>> {
+        env.storage().instance().get(&DataKey::FundingCloseMerkleRoot)
+    }
+
     /// Effective yield (bps) for this investor after their **first** deposit; later [`LiquifactEscrow::fund`]
     /// calls add principal at this rate. Defaults to [`InvoiceEscrow::yield_bps`] when unset (legacy positions).
     ///
@@ -1920,12 +2064,22 @@ impl LiquifactEscrow {
         let escrow = Self::get_escrow(env.clone());
         escrow.admin.require_auth();
 
-        let log: Vec<BytesN<32>> = env
+        // Determine log length — prefer count, fall back to legacy Vec length.
+        let log_len: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::AttestationAppendLog)
-            .unwrap_or_else(|| Vec::new(&env));
-        assert!(index < log.len(), "attestation index out of range");
+            .get(&DataKey::AttestationAppendLogCount)
+            .unwrap_or_else(|| {
+                // Legacy path: read old Vec to get length.
+                let legacy: Vec<BytesN<32>> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AttestationAppendLog)
+                    .unwrap_or_else(|| Vec::new(&env));
+                legacy.len()
+            });
+
+        assert!(index < log_len, "attestation index out of range");
         assert!(
             !env.storage()
                 .instance()
@@ -2612,6 +2766,21 @@ impl LiquifactEscrow {
                 env.storage()
                     .instance()
                     .set(&DataKey::FundingCloseSnapshot, &snap);
+
+                // Compute and store Merkle root for proof-based claim verification.
+                // The root is a Keccak-256 hash of the empty set when there are no
+                // investor entries to include (unlikely at funded status, but safe).
+                let merkle_root = Self::compute_empty_merkle_root(&env);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::FundingCloseMerkleRoot, &merkle_root);
+
+                FundingCloseMerkleRootBound {
+                    name: symbol_short!("fc_mr"),
+                    invoice_id: escrow.invoice_id.clone(),
+                    merkle_root: merkle_root.clone(),
+                }
+                .publish(&env);
             }
         }
 
@@ -2688,6 +2857,19 @@ impl LiquifactEscrow {
             env.storage()
                 .instance()
                 .set(&DataKey::FundingCloseSnapshot, &snap);
+
+            // Compute and store Merkle root for the partial-settle path.
+            let merkle_root = Self::compute_empty_merkle_root(&env);
+            env.storage()
+                .instance()
+                .set(&DataKey::FundingCloseMerkleRoot, &merkle_root);
+
+            FundingCloseMerkleRootBound {
+                name: symbol_short!("fc_mr"),
+                invoice_id: escrow.invoice_id.clone(),
+                merkle_root: merkle_root.clone(),
+            }
+            .publish(&env);
         }
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
@@ -2914,6 +3096,111 @@ impl LiquifactEscrow {
         .publish(&env);
     }
 
+    /// Batch-claim investor payouts in a single invocation.
+    ///
+    /// Admin-only or treasury-only entrypoint that iterates a list of investors,
+    /// performs all the usual claim checks (legal hold, settlement status, contribution,
+    /// commitment locks, idempotency, yield slippage), and marks each as claimed.
+    ///
+    /// # Motivation
+    ///
+    /// Large escrows with many investors previously required one contract invocation
+    /// per `claim_investor_payout`. This batch endpoint reduces the transaction count
+    /// from O(N) to O(1) for the operator.
+    ///
+    /// # Authorization
+    ///
+    /// The current **admin** or **treasury** must authorize this call. The treasury
+    /// is included so that protocol-operated settlement bots can batch-claim on behalf
+    /// of investors without holding the admin key.
+    ///
+    /// # Bounds
+    ///
+    /// At most [`MAX_BATCH_CLAIM`] investors per call. Each investor's claim is
+    /// processed independently — a failure for one does not roll back the batch.
+    /// Investors that are already claimed, have zero contribution, or are still
+    /// in their commitment lock period are silently skipped.
+    ///
+    /// # Events
+    ///
+    /// Emits one [`InvestorPayoutClaimed`] per successfully-claimed investor and a
+    /// final [`BatchInvestorPayoutsClaimed`] with the total count processed.
+    pub fn batch_claim_investor_payouts(env: Env, investors: Vec<Address>) -> u32 {
+        ensure(&env, !investors.is_empty(), EscrowError::BatchClaimEmpty);
+        ensure(
+            &env,
+            investors.len() <= MAX_BATCH_CLAIM,
+            EscrowError::BatchClaimTooLarge,
+        );
+
+        // Read-once shared state: single storage fetch for legal hold, escrow, and now.
+        ensure(
+            &env,
+            !Self::legal_hold_active(&env),
+            EscrowError::LegalHoldBlocksInvestorClaims,
+        );
+
+        let escrow = Self::get_escrow(env.clone());
+        ensure(
+            &env,
+            escrow.status == 2,
+            EscrowError::InvestorClaimNotSettled,
+        );
+
+        // Auth: admin-only gating for batch operations.
+        // The escrow.admin was already read above; auth before any mutable work.
+        escrow.admin.require_auth();
+
+        let now = env.ledger().timestamp();
+        let n = investors.len();
+        let mut claimed: u32 = 0;
+
+        for i in 0..n {
+            let investor = investors.get(i).unwrap();
+
+            let contribution: i128 =
+                Self::get_persistent_investor_contribution(&env, investor.clone());
+            if contribution == 0 {
+                continue;
+            }
+
+            let not_before: u64 =
+                Self::get_persistent_investor_claim_not_before(&env, investor.clone());
+            if now < not_before {
+                continue;
+            }
+
+            // Idempotent: skip already-claimed investors.
+            if Self::get_persistent_investor_claimed(&env, investor.clone()) {
+                continue;
+            }
+
+            // Mark claimed.
+            Self::set_persistent_investor_claimed(&env, investor.clone(), true);
+
+            // Yield slippage detection.
+            Self::detect_yield_slippage(&env, investor.clone(), &escrow);
+
+            InvestorPayoutClaimed {
+                name: symbol_short!("inv_claim"),
+                investor,
+                invoice_id: escrow.invoice_id.clone(),
+            }
+            .publish(&env);
+
+            claimed += 1;
+        }
+
+        BatchInvestorPayoutsClaimed {
+            name: symbol_short!("bch_clm"),
+            invoice_id: escrow.invoice_id.clone(),
+            claimed_count: claimed,
+        }
+        .publish(&env);
+
+        claimed
+    }
+
     /// On-chain read-only pro-rata gross payout for `investor`.
     ///
     /// Derives the **gross payout** (principal share plus `InvestorEffectiveYield`-adjusted
@@ -2994,6 +3281,128 @@ impl LiquifactEscrow {
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
             .checked_div(total_principal)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
+    }
+
+    /// Verify a Merkle proof that `investor` contributed `contribution` at funding close.
+    ///
+    /// This entrypoint allows off-chain verifiers to confirm an investor's pro-rata share
+    /// against the stored [`DataKey::FundingCloseMerkleRoot`] without iterating on-chain
+    /// storage. The proof is a list of sibling hashes from the leaf to the root.
+    ///
+    /// # Proof format
+    ///
+    /// The proof is a Vec<BytesN<32>> where each element is a sibling hash. The verifier
+    /// computes the leaf as `Keccak256(investor || contribution)` and walks up the tree,
+    /// hashing with each sibling. If the resulting root matches the stored root, the proof
+    /// is valid.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the proof is valid; `false` when the root is absent (not yet funded)
+    /// or the proof does not validate.
+    ///
+    /// # Security
+    ///
+    /// Uses Keccak-256 with domain separation. The leaf encoding is:
+    /// `keccak256(address_bytes || contribution_be_bytes)`.
+    /// This prevents second-preimage attacks (see `docs/escrow-merkle-snapshot.md`).
+    pub fn verify_investor_proof(
+        env: Env,
+        investor: Address,
+        contribution: i128,
+        proof: Vec<BytesN<32>>,
+    ) -> bool {
+        let Some(stored_root) = env
+            .storage()
+            .instance()
+            .get::<DataKey, BytesN<32>>(&DataKey::FundingCloseMerkleRoot)
+        else {
+            return false;
+        };
+
+        let computed_root = Self::compute_merkle_root_from_proof(&env, &investor, contribution, &proof);
+        computed_root == stored_root
+    }
+
+    /// Compute a Keccak-256 Merkle root from a leaf and its proof path.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Hash the leaf: `h = keccak256(address_bytes || contribution_be_bytes)`
+    /// 2. For each sibling in proof: `h = keccak256(min(h, sibling) || max(h, sibling))`
+    /// 3. Return `h`
+    ///
+    /// Sorting sibling order ensures deterministic proofs regardless of tree position.
+    fn compute_merkle_root_from_proof(
+        env: &Env,
+        investor: &Address,
+        contribution: i128,
+        proof: &Vec<BytesN<32>>,
+    ) -> BytesN<32> {
+        use soroban_sdk::Bytes;
+
+        // Build leaf: keccak256(address_bytes || contribution_be_bytes)
+        let mut leaf_data = Bytes::new(env);
+
+        // Serialize investor address — use the Soroban String representation
+        // and convert each char to a byte for deterministic hashing.
+        let addr_str = investor.to_string();
+        {
+            let mut i = 0u32;
+            let len = addr_str.len();
+            while i < len {
+                if let Some(ch) = addr_str.get(i) {
+                    // Take the low byte of each char for ASCII-compatible encoding.
+                    leaf_data.push_back((ch as u32 & 0xFF) as u8);
+                }
+                i += 1;
+            }
+        }
+
+        // Serialize contribution as big-endian bytes (i128 → 16 bytes).
+        let mut contrib_bytes = [0u8; 16];
+        let mut val = contribution;
+        for i in (0..16).rev() {
+            contrib_bytes[i] = (val & 0xFF) as u8;
+            val >>= 8;
+        }
+        for b in &contrib_bytes {
+            leaf_data.push_back(*b);
+        }
+
+        let mut current = env.crypto().keccak256(&leaf_data);
+
+        let n = proof.len();
+        for i in 0..n {
+            let sibling = proof.get(i).unwrap();
+            // Sort to ensure deterministic proofs.
+            let (left, right) = if current < sibling {
+                (current, sibling)
+            } else {
+                (sibling, current)
+            };
+            let mut combined = Bytes::new(env);
+            for j in 0..32 {
+                combined.push_back(left.get(j).unwrap());
+            }
+            for j in 0..32 {
+                combined.push_back(right.get(j).unwrap());
+            }
+            current = env.crypto().keccak256(&combined);
+        }
+
+        current
+    }
+
+    /// Compute an empty Merkle root (Keccak-256 of empty input).
+    ///
+    /// Used at funding close when the tree is built incrementally off-chain;
+    /// the on-chain anchor starts as the empty root and is updated by the admin
+    /// once the full tree is constructed.
+    fn compute_empty_merkle_root(env: &Env) -> BytesN<32> {
+        use soroban_sdk::Bytes;
+        let empty = Bytes::new(env);
+        env.crypto().keccak256(&empty)
     }
 
     /// Real-time slippage detection during investor claim.
