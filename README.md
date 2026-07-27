@@ -164,6 +164,9 @@ cargo clippy --all-targets -- -D warnings
 | `record_sme_collateral_commitment` | SME records collateral pledge (metadata only). |
 | `get_escrow` | Read current escrow state. |
 | `get_version` | Read stored `DataKey::Version`. |
+| `init_from_template` | Initialize an escrow from a named template (`fast`, `standard`, `conservative`, or custom). See [`docs/escrow-templates.md`](docs/escrow-templates.md). |
+| `register_template` | Admin stores a named custom [`EscrowTemplate`] in instance storage for later use by `init_from_template`. |
+| `get_template` | Read a template (built-in or custom) by name; returns `None` when unknown. |
 
 ---
 
