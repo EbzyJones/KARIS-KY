@@ -227,6 +227,35 @@ See `docs/escrow-legal-hold.md` § "Failure mode: hold + lost admin key".
 
 ---
 
+## 7. Timing and side-channel threat model
+
+### 7.1 Threat model
+
+- This escrow contract does not process confidential inputs. All on-chain entrypoint parameters, investor contributions, yield tiers, funding amounts, and ledger timestamps are either publicly observable on the ledger or controlled by the transaction sender.
+- Soroban contract storage and transaction inputs are public; there is no private secret within this escrow logic that requires constant-time protection.
+- The primary security goal is correctness and invariant enforcement, not side-channel secrecy.
+
+### 7.2 Value-dependent execution
+
+- `effective_yield_for_commitment()` iterates the immutable `YieldTierTable` and selects the best tier based on `committed_lock_secs`. The tier table and commitment value are public in the transaction context.
+- `compute_investor_payout()`, `claim_investor_payout()`, and other investor-facing entrypoints branch on public snapshot values and stored contribution records. There is no hidden secret being protected by these branches.
+- `fund_impl()` performs public input validation (`amount`, caps, allowlist membership) and recording. Any timing differences are on data that is already observable or attacker-controlled.
+- `withdraw()` and `sweep_terminal_dust()` perform SEP-41 balance-delta checks. These operations are not constant-time, but their security goal is to detect non-standard token behavior, not to protect confidential data.
+
+### 7.3 Constant-time assessment
+
+- No constant-time alternatives are required for the current escrow implementation because there is no secret-dependent branching or private state within this contract.
+- The current design already fails safely on non-standard token behavior through strict pre/post balance invariants in `external_calls::transfer_funding_token_with_balance_checks`.
+- If future features introduce confidential or privacy-sensitive inputs, add a focused side-channel review at that time.
+
+### 7.4 Risk statement
+
+- Current side-channel risk is low: contract state and transaction inputs are public and visible to ledger observers.
+- The main remaining security risk class is unsupported token economics and governance allowlist failure, not execution-timing leaks.
+- This conclusion is intentional: the contract does not need a constant-time rewrite for the current threat model.
+
+---
+
 ## 6. Authorization guard ordering (issue #265)
 
 Per [Stellar contract authorization](https://developers.stellar.org/docs/build/guides/auth/contract-authorization),
