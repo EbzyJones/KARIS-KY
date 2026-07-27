@@ -2,7 +2,10 @@ use super::{
     free_addresses, install_stellar_asset_token, setup, MAX_ATTESTATION_APPEND_ENTRIES,
     SCHEMA_VERSION,
 };
-use crate::{CollateralCommitmentSnapshot, DataKey, EscrowCloseSnapshot, EscrowError, YieldTier};
+use crate::{
+    CollateralCommitmentSnapshot, DataKey, EscrowCloseSnapshot, EscrowError, EscrowHealthMetrics,
+    YieldTier, FundReceived, AdminChanged, LegalHoldSet, EscrowPaused,
+};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     Address, BytesN, Env, Error, InvokeError, Vec as SorobanVec,
@@ -203,8 +206,9 @@ fn escrow_error_discriminants_match_canonical_table() {
         (EscrowError::NewSmeSameAsCurrent, 162),
         (EscrowError::FundingDeadlinePassed, 164),
         (EscrowError::NoPendingAdmin, 163),
+        (EscrowError::EscrowIsPaused, 165),
     ];
-    assert_eq!(TABLE.len(), 84);
+    assert_eq!(TABLE.len(), 85);
     for (variant, code) in TABLE {
         assert_eq!(*variant as u32, *code, "discriminant drift for code {code}");
     }
