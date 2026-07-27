@@ -374,6 +374,8 @@ fn test_register_template_no_maturity_lock() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     assert!(!client3.has_maturity_lock());
 }

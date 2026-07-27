@@ -72,6 +72,8 @@ fn setup_funded_with_token<'a>(
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     // Fund to target (accounting only — no real tokens yet).
@@ -338,6 +340,8 @@ fn test_claim_by_non_investor_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     // Escrow settled but stranger never funded
     let investor = Address::generate(&env);
@@ -518,6 +522,8 @@ fn test_claim_gating_exact_timestamp() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     let lock_duration = 500u64;
@@ -562,6 +568,8 @@ fn test_claim_gating_with_multiple_investors() {
         &tok,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -663,6 +671,8 @@ fn settle_with_maturity_zero_succeeds_immediately() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     assert!(
@@ -702,6 +712,8 @@ fn settle_one_second_before_maturity_traps_and_preserves_state() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -756,6 +768,8 @@ fn settle_at_maturity_succeeds() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -905,6 +919,8 @@ fn test_sweep_terminal_dust_after_settle_transfers_to_treasury() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     let investor = Address::generate(&env);
     client.fund(&investor, &1_000i128);
@@ -939,6 +955,8 @@ fn test_sweep_terminal_dust_after_withdraw_and_ledger_tick() {
         &token.id,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
