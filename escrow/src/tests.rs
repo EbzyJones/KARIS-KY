@@ -135,9 +135,8 @@ pub fn default_init(client: &LiquifactEscrowClient<'_>, env: &Env, admin: &Addre
         &None,
         &None,
         &None,
-        &None, // No funding deadline
-        &None, // No investor lock-in
-        &None, // No concentration cap
+        &None, // No yield slippage threshold
+        &None, // No settlement notifier
     );
 }
 
@@ -182,8 +181,8 @@ pub fn init_and_fund_with_real_token<'a>(
         &None,
         &None,
         &None,
-        &None,
-        &None,
+        &None, // No yield slippage threshold
+        &None, // No settlement notifier
     );
 
     let investor = Address::generate(env);
