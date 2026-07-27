@@ -399,6 +399,15 @@ pub enum EscrowError {
     /// The contract's funding-token balance is less than `funded_amount` at withdraw time.
     /// Funds must be custodied in this contract before the SME can pull them.
     InsufficientContractBalance = 164,
+
+    /// [`LiquifactEscrow::init`] rejected `fee_percentage` outside `0..=10_000`.
+    FeePercentageOutOfRange = 165,
+    /// Funding velocity exceeded the configured per-ledger [`DataKey::MaxFundingRate`].
+    FundingVelocityExceeded = 166,
+    /// Funding is currently paused due to a velocity breach or admin action.
+    FundingIsPaused = 167,
+    /// [`LiquifactEscrow::init`] rejected a non-positive `max_funding_rate`.
+    FundingRateNotPositive = 168,
 }
 
 #[inline(always)]
@@ -530,6 +539,23 @@ pub enum DataKey {
     /// If deviation exceeds threshold, a [`YieldSlippageWarning`] is emitted.
     /// Absent ⇒ `0` (no slippage check).
     YieldSlippageThreshold,
+    /// Optional protocol fee percentage in basis points (e.g., 200 = 2%).
+    /// Applied to the gross yield coupon at settlement; the fee is sent to treasury.
+    /// Absent ⇒ `0` (no protocol fee).
+    FeePercentage,
+    /// Optional per-ledger funding velocity cap. When set, a single ledger cannot
+    /// receive more than this amount of funding. Exceeding it auto-pauses funding.
+    /// Absent ⇒ unlimited.
+    MaxFundingRate,
+    /// When `true`, funding is paused (auto-paused by velocity breach or admin action).
+    /// Absent ⇒ `false` (funding open). Cleared by [`LiquifactEscrow::resume_funding`].
+    FundingPaused,
+    /// The ledger sequence of the most recent fund operation; used for velocity tracking.
+    /// Absent ⇒ `0`.
+    LastFundLedger,
+    /// Total amount funded in the current ledger; used for velocity tracking.
+    /// Reset when `LastFundLedger` changes. Absent ⇒ `0`.
+    CurrentLedgerFunded,
 }
 
 // --- Data types ---
@@ -949,6 +975,50 @@ pub struct ContractUpgraded {
     pub new_wasm_hash: BytesN<32>,
 }
 
+/// Emitted when a protocol fee is collected from yield and transferred to treasury.
+#[contractevent]
+pub struct ProtocolFeeCollected {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Gross yield coupon before fee deduction.
+    pub gross_coupon: i128,
+    /// Fee percentage in basis points.
+    pub fee_percentage: i64,
+    /// Fee amount transferred to treasury.
+    pub fee_amount: i128,
+    /// Net yield after fee deduction.
+    pub net_coupon: i128,
+}
+
+/// Emitted when funding is paused, either automatically due to a velocity breach
+/// or manually by the admin.
+#[contractevent]
+pub struct FundingPausedEvent {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// The current ledger sequence at which funding was paused.
+    pub paused_at_ledger: u32,
+    /// The configured max funding rate (0 = no rate configured).
+    pub max_funding_rate: u64,
+    /// The amount funded in this ledger when the breach occurred.
+    pub ledger_funded: i128,
+}
+
+/// Emitted when funding is resumed by admin after a pause.
+#[contractevent]
+pub struct FundingResumedEvent {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Updated max funding rate (0 = no rate configured).
+    pub max_funding_rate: u64,
+}
+
 /// Diagnostic information for contract errors, emitted alongside error returns.
 ///
 /// SDKs and integrators parse this struct to provide user-friendly error messages,
@@ -1163,7 +1233,9 @@ impl LiquifactEscrow {
         max_per_investor: Option<i128>,
         legal_hold_clear_delay: Option<u64>,
         funding_deadline: Option<u64>,
+        max_funding_rate: Option<u64>,
         yield_slippage_threshold: Option<i64>,
+        fee_percentage: Option<i64>,
     ) -> InvoiceEscrow {
         admin.require_auth();
 
@@ -1275,6 +1347,26 @@ impl LiquifactEscrow {
             env.storage()
                 .instance()
                 .set(&DataKey::YieldSlippageThreshold, &threshold);
+        }
+
+        // Validate and store max funding rate (velocity gate)
+        if let Some(rate) = max_funding_rate {
+            ensure(&env, rate > 0, EscrowError::FundingRateNotPositive);
+            env.storage()
+                .instance()
+                .set(&DataKey::MaxFundingRate, &rate);
+        }
+
+        // Validate and store protocol fee percentage
+        if let Some(fee) = fee_percentage {
+            ensure(
+                &env,
+                (0..=10_000).contains(&fee),
+                EscrowError::FeePercentageOutOfRange,
+            );
+            env.storage()
+                .instance()
+                .set(&DataKey::FeePercentage, &fee);
         }
 
         EscrowInitialized {
@@ -1891,6 +1983,33 @@ impl LiquifactEscrow {
             .unwrap_or(0)
     }
 
+    /// Returns the configured protocol fee percentage in basis points, or `0` if
+    /// no fee was configured at init. Applied to the gross yield coupon at settlement;
+    /// the fee is transferred to treasury.
+    pub fn get_fee_percentage(env: Env) -> i64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeePercentage)
+            .unwrap_or(0)
+    }
+
+    /// Returns the configured per-ledger maximum funding rate, or `0` if unlimited.
+    pub fn get_max_funding_rate(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxFundingRate)
+            .unwrap_or(0)
+    }
+
+    /// Returns `true` when funding is paused (auto-paused by velocity breach or
+    /// manual admin action). Admin may resume via [`LiquifactEscrow::resume_funding`].
+    pub fn is_funding_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::FundingPaused)
+            .unwrap_or(false)
+    }
+
     /// Compute expected and actual yield for an investor, and the resulting slippage deviation.
     ///
     /// Returns:
@@ -2127,6 +2246,64 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::AllowlistActive)
             .unwrap_or(false)
+    }
+
+    /// Resume funding after an automatic velocity pause or manual admin pause.
+    ///
+    /// Clears the [`DataKey::FundingPaused`] flag. Does not alter the configured
+    /// [`DataKey::MaxFundingRate`] — use [`LiquifactEscrow::set_max_funding_rate`]
+    /// to adjust the rate after a breach.
+    ///
+    /// # Authorization
+    /// The configured **admin** must authorize this call.
+    pub fn resume_funding(env: Env) {
+        let escrow = Self::load_escrow_require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::FundingPaused, &false);
+
+        let rate: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxFundingRate)
+            .unwrap_or(0);
+
+        FundingResumedEvent {
+            name: symbol_short!("fund_resm"),
+            invoice_id: escrow.invoice_id.clone(),
+            max_funding_rate: rate,
+        }
+        .publish(&env);
+    }
+
+    /// Adjust the per-ledger maximum funding rate.
+    ///
+    /// Useful after a velocity breach: admin may raise the rate before resuming
+    /// funding.
+    ///
+    /// # Authorization
+    /// The configured **admin** must authorize this call.
+    pub fn set_max_funding_rate(env: Env, new_rate: u64) {
+        let escrow = Self::load_escrow_require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxFundingRate, &new_rate);
+
+        // Clear the current-ledger accumulator so a new rate takes effect
+        // immediately without carrying forward stale velocity data.
+        env.storage()
+            .instance()
+            .set(&DataKey::LastFundLedger, &env.ledger().sequence());
+        env.storage()
+            .instance()
+            .set(&DataKey::CurrentLedgerFunded, &0i128);
+
+        FundingResumedEvent {
+            name: symbol_short!("fund_resm"),
+            invoice_id: escrow.invoice_id.clone(),
+            max_funding_rate: new_rate,
+        }
+        .publish(&env);
     }
 
     /// Add or remove an investor from the allowlist.
@@ -2495,6 +2672,67 @@ impl LiquifactEscrow {
             );
         }
 
+        // ── Funding velocity auto-pause ──
+        // Check whether funding has been paused (auto or manual).
+        let funding_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::FundingPaused)
+            .unwrap_or(false);
+        ensure(&env, !funding_paused, EscrowError::FundingIsPaused);
+
+        // Velocity gate: if max_funding_rate is configured, enforce per-ledger cap.
+        if let Some(rate) = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::MaxFundingRate)
+        {
+            let current_ledger = env.ledger().sequence();
+            let last_ledger: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::LastFundLedger)
+                .unwrap_or(0);
+            let ledger_funded: i128 = if current_ledger == last_ledger {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::CurrentLedgerFunded)
+                    .unwrap_or(0)
+            } else {
+                0i128
+            };
+
+            let new_ledger_total = ledger_funded
+                .checked_add(amount)
+                .unwrap_or_else(|| fail(&env, EscrowError::InvestorContributionOverflow));
+
+            if new_ledger_total > rate as i128 {
+                // Auto-pause: velocity exceeded — block further funding.
+                env.storage()
+                    .instance()
+                    .set(&DataKey::FundingPaused, &true);
+
+                FundingPausedEvent {
+                    name: symbol_short!("fund_paus"),
+                    invoice_id: escrow.invoice_id.clone(),
+                    paused_at_ledger: current_ledger,
+                    max_funding_rate: rate,
+                    ledger_funded,
+                }
+                .publish(&env);
+
+                fail(&env, EscrowError::FundingVelocityExceeded);
+            }
+
+            // Update velocity tracking.
+            env.storage()
+                .instance()
+                .set(&DataKey::LastFundLedger, &current_ledger);
+            env.storage()
+                .instance()
+                .set(&DataKey::CurrentLedgerFunded, &new_ledger_total);
+        }
+
         if Self::is_allowlist_active(env.clone()) {
             ensure(
                 &env,
@@ -2731,6 +2969,65 @@ impl LiquifactEscrow {
         }
 
         escrow.status = 2;
+
+        // ── Protocol fee collection ──
+        // Compute gross coupon, deduct protocol fee, transfer fee to treasury.
+        // Fee is computed as: gross_coupon * fee_pct / 10_000 (floor division).
+        let fee_percentage: i64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeePercentage)
+            .unwrap_or(0);
+        if fee_percentage > 0 {
+            let total_principal = escrow.funded_amount;
+            if total_principal > 0 {
+                // Gross coupon = total_principal * yield_bps / 10_000
+                let gross_coupon = total_principal
+                    .checked_mul(escrow.yield_bps as i128)
+                    .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
+                    .checked_div(10_000)
+                    .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+
+                if gross_coupon > 0 {
+                    // fee_amount = gross_coupon * fee_percentage / 10_000 (floor)
+                    let fee_amount = gross_coupon
+                        .checked_mul(fee_percentage as i128)
+                        .unwrap_or(0)
+                        .checked_div(10_000)
+                        .unwrap_or(0);
+
+                    if fee_amount > 0 {
+                        let net_coupon = gross_coupon.saturating_sub(fee_amount);
+                        let treasury = Self::treasury_or_fail(&env);
+                        let token_addr = Self::funding_token_or_fail(&env);
+                        let this = env.current_contract_address();
+
+                        // Only transfer if the contract holds enough tokens.
+                        let contract_balance =
+                            TokenClient::new(&env, &token_addr).balance(&this);
+                        if contract_balance >= fee_amount {
+                            external_calls::transfer_funding_token_with_balance_checks(
+                                &env,
+                                &token_addr,
+                                &this,
+                                &treasury,
+                                fee_amount,
+                            );
+                        }
+
+                        ProtocolFeeCollected {
+                            name: symbol_short!("fee_coll"),
+                            invoice_id: escrow.invoice_id.clone(),
+                            gross_coupon,
+                            fee_percentage,
+                            fee_amount,
+                            net_coupon,
+                        }
+                        .publish(&env);
+                    }
+                }
+            }
+        }
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
@@ -2978,14 +3275,31 @@ impl LiquifactEscrow {
                 .unwrap_or(escrow.yield_bps);
 
         // coupon = total_principal × effective_yield_bps / 10_000  (floor)
-        let coupon = total_principal
+        let gross_coupon = total_principal
             .checked_mul(effective_yield_bps as i128)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
             .checked_div(10_000)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
 
+        // Deduct protocol fee from the coupon: fee = gross_coupon * fee_pct / 10_000
+        let fee_percentage: i64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeePercentage)
+            .unwrap_or(0);
+        let net_coupon = if fee_percentage > 0 && gross_coupon > 0 {
+            let fee_amount = gross_coupon
+                .checked_mul(fee_percentage as i128)
+                .unwrap_or(0)
+                .checked_div(10_000)
+                .unwrap_or(0);
+            gross_coupon.saturating_sub(fee_amount)
+        } else {
+            gross_coupon
+        };
+
         let settle_pool = total_principal
-            .checked_add(coupon)
+            .checked_add(net_coupon)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
 
         // gross_payout = contribution × settle_pool / total_principal  (floor)
