@@ -55,6 +55,8 @@ mod integration;
 mod legal_hold;
 mod properties;
 mod settlement;
+mod state_inconsistency;
+mod token_cache;
 mod yield_slippage;
 
 /// Registers a new escrow contract instance and returns its contract id.

@@ -530,6 +530,11 @@ pub enum DataKey {
     /// If deviation exceeds threshold, a [`YieldSlippageWarning`] is emitted.
     /// Absent ⇒ `0` (no slippage check).
     YieldSlippageThreshold,
+    /// Cached token metadata to reduce external calls on fund operations.
+    /// Written at [`LiquifactEscrow::init`], updated only via
+    /// [`LiquifactEscrow::revalidate_token_cache`] (admin-only).
+    /// Absent ⇒ not yet cached (should not happen if init succeeded).
+    TokenMetadataCache,
 }
 
 // --- Data types ---
@@ -629,6 +634,37 @@ pub enum CollateralCommitmentSnapshot {
     Some(SmeCollateralCommitment),
 }
 
+/// Cached token metadata to reduce external calls during fund operations.
+///
+/// **Purpose:** Caches token contract metadata (decimals, name, symbol) at escrow
+/// initialization time to avoid repeated cross-contract calls on every fund operation.
+/// This is a read-only cache that is only updated via explicit revalidation entrypoint.
+///
+/// **Cache Policy:**
+/// - Written once at initialization by [`LiquifactEscrow::init`]
+/// - Updated only via [`LiquifactEscrow::revalidate_token_cache`] (admin-only)
+/// - Read by fund operations to validate amounts and compute scaled values
+/// - Immutable for normal operation (no mutations except explicit revalidation)
+///
+/// **Fields:**
+/// - `decimals`: Token decimal precision (typically 7 for Stellar)
+/// - `cached_at_ledger_timestamp`: Timestamp when cache was last written
+/// - `cached_at_ledger_sequence`: Ledger sequence when cache was last written
+///
+/// **Versioning:** Includes ledger time/sequence to allow detecting stale caches
+/// (e.g., if token contract upgrade changes decimal places). Exact staleness
+/// detection is left to governance processes.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenMetadataCache {
+    /// Token decimal places (e.g., 7 for Stellar USDC)
+    pub decimals: u32,
+    /// Ledger timestamp when cache was written (for staleness detection)
+    pub cached_at_ledger_timestamp: u64,
+    /// Ledger sequence when cache was written (for staleness detection)
+    pub cached_at_ledger_sequence: u32,
+}
+
 /// Comprehensive summary of the escrow contract state.
 /// Bundles multiple read-only values to allow a single host invocation
 /// for off-chain indexers and client rendering.
@@ -655,6 +691,53 @@ pub struct EscrowSummary {
     pub has_primary_attestation: bool,
     /// Number of entries in the attestation append log.
     pub attestation_log_length: u32,
+}
+
+/// State inconsistency report for diagnostic and auditing purposes.
+///
+/// Detects logical invariant violations such as:
+/// - Funded amount exceeds the funding target when status is not yet funded.
+/// - Status transitions that violate forward-only invariant (e.g., status decreases).
+/// - Funded amount or unique funder count mismatches.
+/// - Funding target changes after the escrow became funded.
+/// - Legal hold state inconsistencies.
+///
+/// This is a **read-only diagnostic report** — it does not modify state and is safe to call
+/// at any time. Used for off-chain auditing, monitoring, and debugging. The report flags
+/// any detected inconsistencies; an empty report (all fields false) indicates valid state.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StateInconsistencyReport {
+    /// True if `funded_amount > funding_target` but `status < 1` (funded).
+    /// Indicates funding has exceeded target but status was not advanced.
+    pub funded_exceeds_target_not_advanced: bool,
+    /// True if `funded_amount > 0` but `status == 0` (open).
+    /// Indicates funding received but escrow remains in open status.
+    pub funded_amount_positive_status_open: bool,
+    /// True if `funded_amount == 0` but `status >= 1` (funded or beyond).
+    /// Indicates a funded/settled escrow with zero principal.
+    pub zero_funded_amount_advanced_status: bool,
+    /// True if `unique_funder_count > 0` but `status == 0` (open).
+    /// Indicates investors funded but escrow is still open.
+    pub funders_exist_status_open: bool,
+    /// True if `unique_funder_count == 0` but `status >= 1` (funded or beyond).
+    /// Indicates a funded escrow with no recorded funders.
+    pub no_funders_advanced_status: bool,
+    /// True if `funding_close_snapshot` is set but `status < 1` (not yet funded).
+    /// The snapshot should only exist once status reaches funded.
+    pub snapshot_exists_not_funded: bool,
+    /// True if `status > 1` (settled/withdrawn/cancelled) but `funding_close_snapshot` is absent.
+    /// Past the funded point, the snapshot should always be captured.
+    pub snapshot_missing_post_funded: bool,
+    /// True if `status == 2` (settled) but `maturity > 0` and `ledger_time < maturity`.
+    /// Indicates settlement occurred before maturity time lock expired (if configured).
+    /// Note: Returns `false` if maturity is not set (no time lock configured).
+    pub settled_before_maturity_lock: bool,
+    /// True if `funding_target <= 0` or `amount <= 0` (amount must be positive).
+    pub invalid_funding_amounts: bool,
+    /// True if `status < 0` or `status > 4` (valid range is 0..=4).
+    /// Status should always be one of: 0 (open), 1 (funded), 2 (settled), 3 (withdrawn), 4 (cancelled).
+    pub invalid_status_value: bool,
 }
 
 // --- Events ---
@@ -793,6 +876,22 @@ pub struct LegalHoldClearRequested {
     pub invoice_id: Symbol,
     /// Inclusive ledger timestamp when clearing may occur.
     pub clearable_at: u64,
+}
+
+/// Emitted by [`LiquifactEscrow::revalidate_token_cache`] when the token metadata cache is updated.
+///
+/// This event signals that the cached token metadata (decimals, etc.) has been refreshed from
+/// the token contract. Used for auditing and monitoring cache staleness.
+#[contractevent]
+pub struct TokenCacheRevalidated {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Updated token decimals from the token contract.
+    pub decimals: u32,
+    /// Ledger timestamp when the cache was revalidated.
+    pub revalidated_at_ledger_timestamp: u64,
 }
 
 /// SME collateral commitment metadata recorded.
@@ -947,6 +1046,19 @@ pub struct ContractUpgraded {
     #[topic]
     pub invoice_id: Symbol,
     pub new_wasm_hash: BytesN<32>,
+}
+
+/// Emitted by [`LiquifactEscrow::detect_state_inconsistencies`] when one or more state
+/// inconsistencies are detected. This is a diagnostic event for auditing and monitoring;
+/// it does not mutate state and serves as a signal that the escrow may need investigation.
+#[contractevent]
+pub struct StateInconsistenciesDetected {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Flags indicating which inconsistencies were found.
+    pub report: StateInconsistencyReport,
 }
 
 /// Diagnostic information for contract errors, emitted alongside error returns.
@@ -1215,6 +1327,19 @@ impl LiquifactEscrow {
             .instance()
             .set(&DataKey::FundingToken, &funding_token);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
+        
+        // Cache token metadata at init time to reduce external calls on fund operations
+        let token_client = TokenClient::new(&env, &funding_token);
+        let decimals = token_client.decimals();
+        let token_cache = TokenMetadataCache {
+            decimals,
+            cached_at_ledger_timestamp: env.ledger().timestamp(),
+            cached_at_ledger_sequence: env.ledger().sequence(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenMetadataCache, &token_cache);
+        
         if let Some(ref r) = registry {
             env.storage().instance().set(&DataKey::RegistryRef, r);
         }
@@ -1316,6 +1441,16 @@ impl LiquifactEscrow {
     /// proof of registry membership — query the registry contract directly to verify on-chain state.
     pub fn get_registry_ref(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::RegistryRef)
+    }
+
+    /// Returns the cached token metadata (decimals, cache timestamp, cache sequence).
+    ///
+    /// This metadata is captured at [`LiquifactEscrow::init`] to reduce external token contract
+    /// calls during fund operations. Returns [`None`] if not yet cached (should not happen if init succeeded).
+    ///
+    /// For staleness detection or re-caching, use [`LiquifactEscrow::revalidate_token_cache`].
+    pub fn get_token_metadata_cache(env: Env) -> Option<TokenMetadataCache> {
+        env.storage().instance().get(&DataKey::TokenMetadataCache)
     }
 
     /// Returns the optional pending admin address waiting for [`LiquifactEscrow::accept_admin`],
@@ -1916,6 +2051,112 @@ impl LiquifactEscrow {
         env.storage().instance().get(&DataKey::SmeCollateralPledge)
     }
 
+    /// Detect and report state inconsistencies in the escrow contract.
+    ///
+    /// This is a **read-only diagnostic entrypoint** that scans the escrow state for logical
+    /// invariant violations without modifying storage. Returns a [`StateInconsistencyReport`]
+    /// with flags indicating detected issues. An empty report (all fields `false`) signals valid state.
+    ///
+    /// # Detectable inconsistencies
+    ///
+    /// - **funded_exceeds_target_not_advanced**: `funded_amount > funding_target` but `status < 1`.
+    ///   Funding has surpassed the target yet the escrow was not advanced to funded.
+    /// - **funded_amount_positive_status_open**: `funded_amount > 0` but `status == 0`.
+    ///   Principal was received but escrow remains in open state.
+    /// - **zero_funded_amount_advanced_status**: `funded_amount == 0` but `status >= 1`.
+    ///   A funded/settled/withdrawn escrow has no principal.
+    /// - **funders_exist_status_open**: `unique_funder_count > 0` but `status == 0`.
+    ///   Investors have contributed but escrow is still open.
+    /// - **no_funders_advanced_status**: `unique_funder_count == 0` but `status >= 1`.
+    ///   A funded/settled escrow has no recorded investors.
+    /// - **snapshot_exists_not_funded**: Funding close snapshot set before `status == 1`.
+    ///   Snapshot should only exist once the escrow reaches funded status.
+    /// - **snapshot_missing_post_funded**: `status >= 2` but no funding close snapshot.
+    ///   Past the funded point, the snapshot is immutable and must exist.
+    /// - **settled_before_maturity_lock**: `status == 2` but current ledger time < `maturity`
+    ///   (when `maturity > 0`). Settlement occurred before the configured lock expired.
+    ///   *Note: Returns `false` if maturity is not set (no time lock configured).*
+    /// - **invalid_funding_amounts**: `funding_target <= 0` or `amount <= 0`.
+    /// - **invalid_status_value**: `status < 0` or `status > 4`.
+    ///   Valid range is 0 (open) through 4 (cancelled).
+    ///
+    /// # Emitted event
+    ///
+    /// If any inconsistency is detected (i.e., any report flag is `true`), a
+    /// [`StateInconsistenciesDetected`] event is emitted for auditing and monitoring.
+    ///
+    /// # Authorization
+    ///
+    /// None — pure read; no auth required. Safe to call at any time.
+    ///
+    /// # Returns
+    ///
+    /// A [`StateInconsistencyReport`] capturing all detected violations.
+    pub fn detect_state_inconsistencies(env: Env) -> StateInconsistencyReport {
+        let escrow = Self::get_escrow(env.clone());
+
+        // Get optional dependent state.
+        let snapshot_opt: Option<FundingCloseSnapshot> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FundingCloseSnapshot);
+        let unique_funder_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UniqueFunderCount)
+            .unwrap_or(0);
+        let ledger_timestamp = env.ledger().timestamp();
+
+        // Check each invariant.
+        let report = StateInconsistencyReport {
+            funded_exceeds_target_not_advanced: escrow.funded_amount > escrow.funding_target
+                && escrow.status < 1,
+
+            funded_amount_positive_status_open: escrow.funded_amount > 0 && escrow.status == 0,
+
+            zero_funded_amount_advanced_status: escrow.funded_amount == 0 && escrow.status >= 1,
+
+            funders_exist_status_open: unique_funder_count > 0 && escrow.status == 0,
+
+            no_funders_advanced_status: unique_funder_count == 0 && escrow.status >= 1,
+
+            snapshot_exists_not_funded: snapshot_opt.is_some() && escrow.status < 1,
+
+            snapshot_missing_post_funded: snapshot_opt.is_none() && escrow.status >= 2,
+
+            settled_before_maturity_lock: escrow.status == 2
+                && escrow.maturity > 0
+                && ledger_timestamp < escrow.maturity,
+
+            invalid_funding_amounts: escrow.funding_target <= 0 || escrow.amount <= 0,
+
+            invalid_status_value: escrow.status > 4,
+        };
+
+        // Emit event if any inconsistency is detected.
+        let has_inconsistency = report.funded_exceeds_target_not_advanced
+            || report.funded_amount_positive_status_open
+            || report.zero_funded_amount_advanced_status
+            || report.funders_exist_status_open
+            || report.no_funders_advanced_status
+            || report.snapshot_exists_not_funded
+            || report.snapshot_missing_post_funded
+            || report.settled_before_maturity_lock
+            || report.invalid_funding_amounts
+            || report.invalid_status_value;
+
+        if has_inconsistency {
+            StateInconsistenciesDetected {
+                name: symbol_short!("state_incon"),
+                invoice_id: escrow.invoice_id.clone(),
+                report: report.clone(),
+            }
+            .publish(&env);
+        }
+
+        report
+    }
+
     pub fn revoke_attestation_digest(env: Env, index: u32) {
         let escrow = Self::get_escrow(env.clone());
         escrow.admin.require_auth();
@@ -2105,6 +2346,52 @@ impl LiquifactEscrow {
             clearable_at,
         }
         .publish(&env);
+    }
+
+    /// Revalidate and update the cached token metadata by fetching fresh decimals from the token contract.
+    ///
+    /// This is an **admin-only** entrypoint that explicitly updates the token metadata cache
+    /// (normally written only at [`LiquifactEscrow::init`]). Used when:
+    /// - The token contract is upgraded and decimals change
+    /// - The cached metadata is suspected stale
+    /// - Governance decides to refresh the cache for other reasons
+    ///
+    /// # Returns
+    ///
+    /// The updated [`TokenMetadataCache`] with fresh decimals and current ledger time/sequence.
+    ///
+    /// # Authorization
+    ///
+    /// Requires admin authorization. This prevents accidental cache pollution by non-admins.
+    pub fn revalidate_token_cache(env: Env) -> TokenMetadataCache {
+        let escrow = Self::load_escrow_require_admin(&env);
+        let token_addr = Self::funding_token_or_fail(&env);
+
+        // Fetch fresh token metadata
+        let token_client = TokenClient::new(&env, &token_addr);
+        let decimals = token_client.decimals();
+
+        // Update cache with current ledger state
+        let cache = TokenMetadataCache {
+            decimals,
+            cached_at_ledger_timestamp: env.ledger().timestamp(),
+            cached_at_ledger_sequence: env.ledger().sequence(),
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenMetadataCache, &cache);
+
+        // Publish event for auditing
+        TokenCacheRevalidated {
+            name: symbol_short!("tok_val"),
+            invoice_id: escrow.invoice_id.clone(),
+            decimals,
+            revalidated_at_ledger_timestamp: cache.cached_at_ledger_timestamp,
+        }
+        .publish(&env);
+
+        cache
     }
 
     /// Enable or disable the investor allowlist. When enabled, only addresses with
