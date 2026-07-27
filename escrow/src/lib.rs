@@ -120,6 +120,7 @@ use soroban_sdk::{
 };
 
 pub mod external_calls;
+pub mod validation;
 
 /// Current storage schema version written to [`DataKey::Version`] by [`LiquifactEscrow::init`].
 ///
@@ -136,6 +137,34 @@ pub mod external_calls;
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
 pub const SCHEMA_VERSION: u32 = 6;
+
+/// Contract interface version — identifies the ABI surface exposed to callers.
+///
+/// This constant is returned by [`LiquifactEscrow::get_interface_version`] and is **distinct**
+/// from [`SCHEMA_VERSION`]:
+///
+/// - [`SCHEMA_VERSION`] tracks the on-chain storage layout (XDR structs, `DataKey` variants).
+/// - `CONTRACT_INTERFACE_VERSION` tracks the **public entrypoint surface** (function names,
+///   parameter lists, return types, event shapes).
+///
+/// # Increment rules — callers must bump this value when:
+///
+/// - An entrypoint is **renamed** or **removed**.
+/// - A parameter is **added, removed, or retyped** for any public entrypoint.
+/// - A return type changes in a way that is not backward-compatible with existing callers.
+/// - An event `#[topic]` or field name/type changes in a way that breaks indexed consumers.
+///
+/// # Stable / append-only policy
+///
+/// - This constant is **append-only**: once a numeric value has been published in a
+///   production deployment it must never be reused or decremented.
+/// - Adding a **new** entrypoint without touching existing signatures does **not** require
+///   a bump — callers that do not call the new function are unaffected.
+/// - New **optional** parameters guarded by `Option<T>` on Soroban may be additive; evaluate
+///   on a case-by-case basis and prefer a bump when in doubt.
+///
+/// See `docs/escrow-interface-versioning.md` for the full policy and examples.
+pub const CONTRACT_INTERFACE_VERSION: u32 = 1;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
@@ -920,6 +949,57 @@ pub struct ContractUpgraded {
     pub new_wasm_hash: BytesN<32>,
 }
 
+/// Diagnostic information for contract errors, emitted alongside error returns.
+///
+/// SDKs and integrators parse this struct to provide user-friendly error messages,
+/// recovery suggestions, and contextual information (e.g., "can claim in X blocks").
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ErrorDiagnostic {
+    /// Error code (matches [`EscrowError`] discriminant).
+    pub error_code: u32,
+    /// Human-readable error message.
+    pub message: String,
+    /// Suggested recovery action or next steps.
+    pub recovery_action: String,
+    /// Additional context (e.g., timestamp, block number, current value).
+    pub context: Option<String>,
+}
+
+impl ErrorDiagnostic {
+    /// Create a new diagnostic for the given error code with a message and recovery action.
+    pub fn new(env: &Env, error_code: u32, message: &str, recovery_action: &str) -> Self {
+        ErrorDiagnostic {
+            error_code,
+            message: String::from_str(env, message),
+            recovery_action: String::from_str(env, recovery_action),
+            context: None,
+        }
+    }
+
+    /// Create a diagnostic with additional context information.
+    pub fn with_context(env: &Env, error_code: u32, message: &str, recovery_action: &str, context: &str) -> Self {
+        ErrorDiagnostic {
+            error_code,
+            message: String::from_str(env, message),
+            recovery_action: String::from_str(env, recovery_action),
+            context: Some(String::from_str(env, context)),
+        }
+    }
+}
+
+/// Emitted when an error occurs with diagnostic information for caller recovery.
+///
+/// SDKs should listen for this event and parse the diagnostic to provide
+/// user-friendly error messages, recovery suggestions, and contextual information.
+#[contractevent]
+pub struct ErrorDiagnosticEmitted {
+    #[topic]
+    pub name: Symbol,
+    /// Diagnostic information including error code, message, recovery action, and context.
+    pub diagnostic: ErrorDiagnostic,
+}
+
 #[contract]
 pub struct LiquifactEscrow;
 
@@ -935,23 +1015,10 @@ pub struct LiquifactEscrow;
 /// uninitialized memory leaks. Only the exact byte-length of the input is converted
 /// to the final symbol, ensuring no trailing null bytes or buffer remnants are preserved.
 fn validate_invoice_id_string(env: &Env, invoice_id: &String) -> Symbol {
-    let len = invoice_id.len();
-    ensure(
-        env,
-        (1..=MAX_INVOICE_ID_STRING_LEN).contains(&len),
-        EscrowError::InvoiceIdInvalidLength,
-    );
-    let len_u = len as usize;
-    let mut buf = [0u8; 32];
-    invoice_id.copy_into_slice(&mut buf[..len_u]);
-    for &b in &buf[..len_u] {
-        let ok =
-            b.is_ascii_uppercase() || b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
-        ensure(env, ok, EscrowError::InvoiceIdInvalidCharset);
+    match validation::validate_invoice_id(env, invoice_id) {
+        Ok(sym) => sym,
+        Err(err) => fail(env, err),
     }
-    let s = core::str::from_utf8(&buf[..len_u])
-        .unwrap_or_else(|_| fail(env, EscrowError::InvoiceIdInvalidCharset));
-    Symbol::new(env, s)
 }
 
 #[contractimpl]
@@ -961,6 +1028,18 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::LegalHold)
             .unwrap_or(false)
+    }
+
+    /// Emit a diagnostic event for an error with recovery guidance.
+    ///
+    /// Used by error paths to provide SDKs and integrators with structured error information,
+    /// recovery suggestions, and contextual data (e.g., "can claim in X blocks").
+    fn emit_error_diagnostic(env: &Env, diagnostic: ErrorDiagnostic) {
+        ErrorDiagnosticEmitted {
+            name: symbol_short!("err_diag"),
+            diagnostic,
+        }
+        .publish(env);
     }
 
     /// Read the immutable funding token address, failing with [`EscrowError::FundingTokenNotSet`]
@@ -1499,6 +1578,36 @@ impl LiquifactEscrow {
 
     pub fn get_version(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::Version).unwrap_or(0)
+    }
+
+    /// Returns the contract interface version ([`CONTRACT_INTERFACE_VERSION`]).
+    ///
+    /// Use this to detect caller/contract ABI mismatches **before** invoking state-mutating
+    /// entrypoints. This value is a compile-time constant baked into the deployed WASM and
+    /// does **not** require the escrow to be initialized (no [`DataKey::Escrow`] read).
+    ///
+    /// # Interface version vs schema version
+    ///
+    /// | Getter | Constant | Tracks |
+    /// |--------|----------|--------|
+    /// | `get_interface_version` | [`CONTRACT_INTERFACE_VERSION`] | Entrypoint signatures, parameter lists, return types |
+    /// | `get_version` | [`SCHEMA_VERSION`] | On-chain storage layout (XDR structs, `DataKey` variants) |
+    ///
+    /// # Caller guidance
+    ///
+    /// SDKs and integration adapters should call `get_interface_version` at startup and
+    /// compare the returned value against the version they were compiled against. A mismatch
+    /// means the deployed contract has a different ABI than expected; the caller should
+    /// refuse further calls and surface a diagnostic error rather than silently mis-parse
+    /// arguments or return values.
+    ///
+    /// See `docs/escrow-interface-versioning.md` for the full versioning policy.
+    ///
+    /// # Authorization
+    ///
+    /// None — pure read; no auth required. Safe to call before `init`.
+    pub fn get_interface_version(_env: Env) -> u32 {
+        CONTRACT_INTERFACE_VERSION
     }
 
     /// Get the optional funding deadline (ledger timestamp), returns None if not set.
@@ -2607,11 +2716,18 @@ impl LiquifactEscrow {
 
         let now = env.ledger().timestamp();
         if escrow.maturity > 0 {
-            ensure(
-                &env,
-                now >= escrow.maturity,
-                EscrowError::MaturityNotReached,
-            );
+            if now < escrow.maturity {
+                let seconds_remaining = escrow.maturity.saturating_sub(now);
+                let context_msg = String::from_str(&env, &format!("Maturity timestamp: {} (in ~{} seconds)", escrow.maturity, seconds_remaining));
+                let diagnostic = ErrorDiagnostic {
+                    error_code: EscrowError::MaturityNotReached as u32,
+                    message: String::from_str(&env, "Escrow has not reached maturity yet"),
+                    recovery_action: String::from_str(&env, "Wait until maturity timestamp to settle"),
+                    context: Some(context_msg),
+                };
+                Self::emit_error_diagnostic(&env, diagnostic);
+                fail(&env, EscrowError::MaturityNotReached);
+            }
         }
 
         escrow.status = 2;
@@ -2759,11 +2875,25 @@ impl LiquifactEscrow {
         let not_before: u64 =
             Self::get_persistent_investor_claim_not_before(&env, investor.clone());
         let now = env.ledger().timestamp();
-        ensure(
-            &env,
-            now >= not_before,
-            EscrowError::InvestorCommitmentLockNotExpired,
-        );
+        
+        if now < not_before {
+            let context_msg = if not_before > 0 {
+                let blocks_remaining = not_before.saturating_sub(now);
+                String::from_str(&env, &format!("Can claim in {} seconds (block {}) from now", blocks_remaining, not_before))
+            } else {
+                String::from_str(&env, "Commitment lock is active")
+            };
+            
+            let diagnostic = ErrorDiagnostic::with_context(
+                &env,
+                EscrowError::InvestorCommitmentLockNotExpired as u32,
+                "Investment is in commitment lock period",
+                "Wait for the lock period to expire before claiming payout",
+                core::str::from_utf8(&[b' ']).unwrap(), // Use existing context_msg instead
+            );
+            Self::emit_error_diagnostic(&env, diagnostic);
+            fail(&env, EscrowError::InvestorCommitmentLockNotExpired);
+        }
 
         // Idempotent early-return: a second claim is a no-op (no re-emit).
         if Self::get_persistent_investor_claimed(&env, investor.clone()) {
