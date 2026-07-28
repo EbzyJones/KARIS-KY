@@ -45,7 +45,11 @@ fn fund_to_target(client: &super::LiquifactEscrowClient<'_>, env: &Env) -> Addre
 /// actually transfer them.  Returns `(client, sme, sac_admin_client)`.
 fn setup_funded_with_token<'a>(
     env: &'a Env,
-) -> (super::LiquifactEscrowClient<'a>, Address, StellarAssetClient<'a>) {
+) -> (
+    super::LiquifactEscrowClient<'a>,
+    Address,
+    StellarAssetClient<'a>,
+) {
     let sac = env.register_stellar_asset_contract_v2(Address::generate(env));
     let token_id = sac.address();
     let sac_admin = StellarAssetClient::new(env, &token_id);
@@ -66,6 +70,8 @@ fn setup_funded_with_token<'a>(
         &token_id,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -255,7 +261,7 @@ fn withdraw_blocked_by_legal_hold() {
     default_init(&client, &env, &admin, &sme);
     fund_to_target(&client, &env);
 
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     // Status is 1 but hold is active — must panic.
     client.withdraw();
 }
@@ -270,8 +276,8 @@ fn withdraw_succeeds_after_hold_cleared() {
     env.mock_all_auths();
     let (client, _sme, _sac) = setup_funded_with_token(&env);
 
-    client.set_legal_hold(&true);
-    client.set_legal_hold(&false);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
+    client.set_legal_hold(&false, &String::from_str(&env, ""));
 
     client.withdraw();
     assert_eq!(client.get_escrow().status, 3u32);
@@ -296,6 +302,8 @@ fn test_claim_investor_twice_is_idempotent() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -338,6 +346,8 @@ fn test_claim_by_non_investor_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     // Escrow settled but stranger never funded
     let investor = Address::generate(&env);
@@ -369,6 +379,8 @@ fn test_clashing_investors_have_independent_claims() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&inv_a, &1_000i128);
     client.fund(&inv_b, &1_000i128);
@@ -392,7 +404,7 @@ fn legal_hold_set_by_non_admin_panics() {
     env.mock_auths(&[]);
     default_init(&client, &env, &admin, &sme);
     // `sme` is not the admin — must panic.
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -421,7 +433,7 @@ fn settle_blocked_by_legal_hold() {
     default_init(&client, &env, &admin, &sme);
     fund_to_target(&client, &env);
 
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     client.settle();
 }
 
@@ -445,6 +457,8 @@ fn test_claim_blocked_until_commitment_ledger_time() {
         &tok,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -482,6 +496,8 @@ fn test_claim_succeeds_after_commitment_and_settle() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund_with_commitment(&inv, &1_000i128, &100u64);
     client.settle();
@@ -512,6 +528,8 @@ fn test_claim_gating_exact_timestamp() {
         &tok,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -568,6 +586,8 @@ fn test_claim_gating_with_multiple_investors() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     client.fund_with_commitment(&inv1, &1_000i128, &100u64); // Expiry 1100
@@ -607,6 +627,8 @@ fn test_cost_baseline_settle() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -663,6 +685,8 @@ fn settle_with_maturity_zero_succeeds_immediately() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     assert!(
@@ -702,6 +726,8 @@ fn settle_one_second_before_maturity_traps_and_preserves_state() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -756,6 +782,8 @@ fn settle_at_maturity_succeeds() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -843,7 +871,7 @@ fn claim_investor_payout_blocked_by_legal_hold() {
     default_init(&client, &env, &admin, &sme);
     let investor = settle_escrow(&client, &env);
 
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     client.claim_investor_payout(&investor); // must panic
 }
 
@@ -905,6 +933,8 @@ fn test_sweep_terminal_dust_after_settle_transfers_to_treasury() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     let investor = Address::generate(&env);
     client.fund(&investor, &1_000i128);
@@ -939,6 +969,8 @@ fn test_sweep_terminal_dust_after_withdraw_and_ledger_tick() {
         &token.id,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -982,6 +1014,8 @@ fn test_sweep_rejected_when_open() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &1_000i128);
     client.settle();
@@ -1011,10 +1045,12 @@ fn test_sweep_blocked_under_legal_hold() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &1_000i128);
     client.settle();
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     client.sweep_terminal_dust(&1i128);
 }
 
@@ -1036,6 +1072,8 @@ fn test_sweep_rejects_amount_above_dust_cap() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1072,6 +1110,8 @@ fn test_sweep_caps_at_contract_balance() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &1_000i128);
     client.settle();
@@ -1099,6 +1139,8 @@ fn test_sweep_requires_treasury_auth() {
         &token.id,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1139,6 +1181,8 @@ fn claim_investor_payout_succeeds_after_settle() {
         &token.id,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1332,6 +1376,8 @@ fn test_is_investor_claimed_false_before_any_claim() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &1_000i128);
     client.settle();
@@ -1362,6 +1408,8 @@ fn test_is_investor_claimed_returns_false_for_unfunded_address() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &1_000i128);
     client.settle();
@@ -1384,6 +1432,8 @@ fn test_claim_marker_persists_after_claim() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1421,6 +1471,8 @@ fn test_claim_marker_isolated_per_investor() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor_a, &1_000i128);
     client.fund(&investor_b, &1_000i128);
@@ -1449,6 +1501,8 @@ fn test_claim_marker_all_investors_independent() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1614,7 +1668,7 @@ fn test_partial_settle_blocked_by_legal_hold() {
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
 
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     client.partial_settle(&sme);
 }
 

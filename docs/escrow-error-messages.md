@@ -39,10 +39,13 @@ Codes are grouped by domain so SDKs can map coarse categories without parsing va
 | Legal-hold clear (two-phase) | 150–152 | Delayed compliance-hold lift workflow | 150, 152 |
 | Beneficiary rotation | 160–162 | Governed SME address rotation | 160, 162 |
 | Admin handover / funding deadline | 163–164 | `accept_admin` and post-deadline funding | 163, 164 |
+| Clone escrow | 170–171 | Clone settled escrow to create new instances | 170, 171 |
 
 See also [`docs/escrow-legal-hold.md`](escrow-legal-hold.md),
-[`docs/ESCROW_BENEFICIARY_ROTATION.md`](ESCROW_BENEFICIARY_ROTATION.md), and
-[`docs/adr/ADR-006-dust-sweep-and-token-safety.md`](adr/ADR-006-dust-sweep-and-token-safety.md).
+[`docs/ESCROW_BENEFICIARY_ROTATION.md`](ESCROW_BENEFICIARY_ROTATION.md),
+[`docs/escrow-state-snapshots.md`](escrow-state-snapshots.md),
+[`docs/adr/ADR-006-dust-sweep-and-token-safety.md`](adr/ADR-006-dust-sweep-and-token-safety.md), and
+[`docs/adr/ADR-008-state-snapshots.md`](adr/ADR-008-state-snapshots.md).
 
 ## Canonical Reference Table
 
@@ -132,6 +135,8 @@ See also [`docs/escrow-legal-hold.md`](escrow-legal-hold.md),
 | 162 | `NewSmeSameAsCurrent` | `rotate_beneficiary` | `new_sme == current sme_address` | Pass a different beneficiary | typed |
 | 163 | `NoPendingAdmin` | `accept_admin` | no pending admin nomination stored | Call `propose_admin` first | typed |
 | 164 | `FundingDeadlinePassed` | `init`, `fund`, `fund_with_commitment`, `fund_batch` | `funding_deadline` configured and `ledger.timestamp()` past deadline | Funding window closed; do not retry deposits | typed |
+| 170 | `CloneNotSettled` | `clone_settled_escrow` | template escrow status `!= 2` (settled) | Use a settled escrow as template | typed |
+| 171 | `CloneAmountNotPositive` | `clone_settled_escrow` | `new_amount <= 0` | Pass a positive invoice amount for the clone | typed |
 
 ### Legacy panic strings (migration aid)
 
