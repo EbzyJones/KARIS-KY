@@ -23,6 +23,27 @@ cargo build
 cargo test
 ```
 
+### Local development (one-command)
+
+```bash
+source scripts/local-env.sh
+```
+
+This sets up a complete local Soroban environment — validator, identities,
+test token, and deployed contract — ready for development. See
+[scripts/local-env.sh](scripts/local-env.sh) for details.
+
+### TypeScript SDK
+
+```bash
+cd sdk-ts
+npm install
+npm run build
+npm run example
+```
+
+See [`sdk-ts/`](sdk-ts/) for the typed client wrapper, contract types, and example usage.
+
 ---
 
 ## Schema version changelog (`DataKey::Version`)
@@ -150,7 +171,7 @@ cargo clippy --all-targets -- -D warnings
 
 | Entrypoint | Description |
 |------------|-------------|
-| `init` | Create an invoice escrow; binds funding token, treasury, optional registry. |
+| `init` | Create an invoice escrow; binds funding token, treasury, optional registry. See [parameter reference](docs/escrow-init-parameters.md). |
 | `fund` | Record investor principal; marks escrow funded when target is met. |
 | `fund_with_commitment` | First deposit with optional lock period; selects tiered yield. |
 | `settle` | Mark a funded escrow as settled (SME auth required; maturity enforced). |
@@ -164,6 +185,9 @@ cargo clippy --all-targets -- -D warnings
 | `record_sme_collateral_commitment` | SME records collateral pledge (metadata only). |
 | `get_escrow` | Read current escrow state. |
 | `get_version` | Read stored `DataKey::Version`. |
+| `init_from_template` | Initialize an escrow from a named template (`fast`, `standard`, `conservative`, or custom). See [`docs/escrow-templates.md`](docs/escrow-templates.md). |
+| `register_template` | Admin stores a named custom [`EscrowTemplate`] in instance storage for later use by `init_from_template`. |
+| `get_template` | Read a template (built-in or custom) by name; returns `None` when unknown. |
 
 ---
 
@@ -292,6 +316,21 @@ cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only -p kari
 - After any lockfile update, re-run the full CI command set above before merge.
 - Dependency policy, cadence, and emergency workflow are documented in
   [`docs/escrow-dependency-policy.md`](docs/escrow-dependency-policy.md).
+
+---
+
+## Developer Resources
+
+| Resource | Description |
+|----------|-------------|
+| [Init Parameter Reference](docs/escrow-init-parameters.md) | Every init parameter, valid ranges, conservative vs. aggressive examples, gas costs |
+| [Local Environment Script](scripts/local-env.sh) | One-command local Soroban dev environment setup |
+| [Deployer Script](scripts/deploy.sh) | Config-driven contract deployment with .env support |
+| [TypeScript SDK](sdk-ts/) | Typed client wrapper, contract types, error codes, examples |
+| [Contract Spec](sdk-ts/spec.json) | Machine-readable ABI spec for SDK consumption |
+| [CLI Simulation Recipes](docs/escrow-sim-stellar-cli.md) | All entrypoint invocations via Stellar CLI |
+| [Demo Series](docs/demos/README.md) | Step-by-step lifecycle walkthrough |
+| [Error Code Reference](docs/escrow-error-messages.md) | Stable typed error codes and recovery actions |
 
 ---
 

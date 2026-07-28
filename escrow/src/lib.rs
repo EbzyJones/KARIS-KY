@@ -120,6 +120,7 @@ use soroban_sdk::{
 };
 
 pub mod external_calls;
+pub mod validation;
 
 /// Current storage schema version written to [`DataKey::Version`] by [`LiquifactEscrow::init`].
 ///
@@ -133,9 +134,38 @@ pub mod external_calls;
 /// | 4 | Added `PrimaryAttestationHash`, `AttestationAppendLog` | Additive keys — no `migrate` call required |
 /// | 5 | Added `YieldTierTable`, `RegistryRef`, `Treasury`; `fund_with_commitment` | **Redeploy required** if `InvoiceEscrow` XDR changed |
 /// | 6 | Per-investor keys moved to **persistent** storage (see ADR-007) | **Redeploy required** — no `migrate` path (addresses not enumerable) |
+/// | 7 | Added `SettlementNotifierContract`, `CreatedAt`, status 5 (archived), `archive_escrow`, `notify_settlement`, `get_registry_listing` | Additive keys + new entrypoints — **redeploy required** for new status codes |
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
+
+/// Contract interface version — identifies the ABI surface exposed to callers.
+///
+/// This constant is returned by [`LiquifactEscrow::get_interface_version`] and is **distinct**
+/// from [`SCHEMA_VERSION`]:
+///
+/// - [`SCHEMA_VERSION`] tracks the on-chain storage layout (XDR structs, `DataKey` variants).
+/// - `CONTRACT_INTERFACE_VERSION` tracks the **public entrypoint surface** (function names,
+///   parameter lists, return types, event shapes).
+///
+/// # Increment rules — callers must bump this value when:
+///
+/// - An entrypoint is **renamed** or **removed**.
+/// - A parameter is **added, removed, or retyped** for any public entrypoint.
+/// - A return type changes in a way that is not backward-compatible with existing callers.
+/// - An event `#[topic]` or field name/type changes in a way that breaks indexed consumers.
+///
+/// # Stable / append-only policy
+///
+/// - This constant is **append-only**: once a numeric value has been published in a
+///   production deployment it must never be reused or decremented.
+/// - Adding a **new** entrypoint without touching existing signatures does **not** require
+///   a bump — callers that do not call the new function are unaffected.
+/// - New **optional** parameters guarded by `Option<T>` on Soroban may be additive; evaluate
+///   on a case-by-case basis and prefer a bump when in doubt.
+///
+/// See `docs/escrow-interface-versioning.md` for the full policy and examples.
+pub const CONTRACT_INTERFACE_VERSION: u32 = 2;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
@@ -148,6 +178,12 @@ pub const MAX_INVESTOR_ALLOWLIST_BATCH: u32 = 32;
 /// Upper bound on [`LiquifactEscrow::fund_batch`] entries to keep storage/CPU bounded.
 /// Mirrors the spirit of `MAX_ATTESTATION_APPEND_ENTRIES` to limit per-call work.
 pub const MAX_FUND_BATCH: u32 = 50;
+
+/// Maximum number of investor addresses returned per [`LiquifactEscrow::list_investors`] call.
+///
+/// Caps per-call storage read cost and prevents unbounded response sizes in UI/dashboard
+/// tooling. Callers should page through results using `offset` and `limit`.
+pub const MAX_INVESTOR_PAGE_SIZE: u32 = 1_000;
 
 /// Upper bound on [`LiquifactEscrow::sweep_terminal_dust`] per call (base units of the funding token).
 ///
@@ -365,6 +401,10 @@ pub enum EscrowError {
     /// Beneficiary rotation was attempted while the escrow was not in a
     /// pre-settlement state (`status` must be 0 = open or 1 = funded).
     RotationNotOpen = 161,
+    /// [`LiquifactEscrow::claim_investor_payout`] detected yield slippage exceeding configured threshold.
+    YieldSlippageDetected = 162,
+    /// Yield slippage threshold is out of valid range (0..=10_000 bps).
+    YieldSlippageThresholdOutOfRange = 163,
     /// The proposed new SME address is identical to the current beneficiary.
     NewSmeSameAsCurrent = 162,
 
@@ -537,7 +577,7 @@ pub struct InvoiceEscrow {
     pub funded_amount: i128,
     pub yield_bps: i64,
     pub maturity: u64,
-    /// 0 = open, 1 = funded, 2 = settled, 3 = withdrawn (SME pulled liquidity), 4 = cancelled (admin-gated; investors may refund)
+    /// 0 = open, 1 = funded, 2 = settled, 3 = withdrawn (SME pulled liquidity), 4 = cancelled (admin-gated; investors may refund), 5 = archived (admin-gated; read-only terminal)
     pub status: u32,
 }
 
@@ -667,6 +707,25 @@ pub struct EscrowSummary {
     pub has_primary_attestation: bool,
     /// Number of entries in the attestation append log.
     pub attestation_log_length: u32,
+}
+
+/// Metadata about the deployed contract version, including upgrade recommendations.
+///
+/// Returned by [`LiquifactEscrow::get_version_metadata`] for off-chain operators and
+/// dashboards to determine whether to upgrade a running contract instance.
+#[contracttype]
+#[derive(Debug, PartialEq)]
+pub struct ContractVersionMetadata {
+    /// Current schema version (matches [`SCHEMA_VERSION`] when deployed).
+    pub version: u32,
+    /// Minimum version that can be migrated to this version without redeploy.
+    /// Set to [`SCHEMA_VERSION`] itself when no migration path exists.
+    pub min_compatible_version: u32,
+    /// `true` if the operator should consider upgrading (major version gap, deprecated schema).
+    ///
+    /// Currently always `false` since schema version 6 has no migration path from earlier versions.
+    /// Operators must evaluate upgrade necessity based on version and `min_compatible_version`.
+    pub upgrade_recommended: bool,
 }
 
 // --- Events ---
@@ -852,6 +911,24 @@ pub struct InvestorPayoutClaimed {
 }
 
 #[contractevent]
+pub struct YieldSlippageWarning {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub investor: Address,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Expected yield (in basis points) based on configured `yield_bps`.
+    pub expected_yield_bps: i64,
+    /// Actual effective yield (in basis points) determined at settlement.
+    pub actual_yield_bps: i64,
+    /// Configured slippage threshold (in basis points).
+    pub slippage_threshold_bps: i64,
+    /// Computed deviation (absolute difference) in basis points.
+    pub deviation_bps: i64,
+}
+
+#[contractevent]
 pub struct FundingCancelled {
     #[topic]
     pub name: Symbol,
@@ -878,6 +955,16 @@ pub struct TreasuryDustSwept {
     pub invoice_id: Symbol,
     pub token: Address,
     pub amount: i128,
+}
+
+#[contractevent]
+pub struct AssetCustodyVerified {
+    #[topic]
+    pub name: Symbol,
+    pub invoice_id: Symbol,
+    pub recorded_funded_amount: i128,
+    pub contract_balance: i128,
+    pub discrepancy: i128,
 }
 
 #[contractevent]
@@ -990,23 +1077,10 @@ pub struct LiquifactEscrow;
 /// uninitialized memory leaks. Only the exact byte-length of the input is converted
 /// to the final symbol, ensuring no trailing null bytes or buffer remnants are preserved.
 fn validate_invoice_id_string(env: &Env, invoice_id: &String) -> Symbol {
-    let len = invoice_id.len();
-    ensure(
-        env,
-        (1..=MAX_INVOICE_ID_STRING_LEN).contains(&len),
-        EscrowError::InvoiceIdInvalidLength,
-    );
-    let len_u = len as usize;
-    let mut buf = [0u8; 32];
-    invoice_id.copy_into_slice(&mut buf[..len_u]);
-    for &b in &buf[..len_u] {
-        let ok =
-            b.is_ascii_uppercase() || b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
-        ensure(env, ok, EscrowError::InvoiceIdInvalidCharset);
+    match validation::validate_invoice_id(env, invoice_id) {
+        Ok(sym) => sym,
+        Err(err) => fail(env, err),
     }
-    let s = core::str::from_utf8(&buf[..len_u])
-        .unwrap_or_else(|_| fail(env, EscrowError::InvoiceIdInvalidCharset));
-    Symbol::new(env, s)
 }
 
 #[contractimpl]
@@ -1016,6 +1090,18 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::LegalHold)
             .unwrap_or(false)
+    }
+
+    /// Emit a diagnostic event for an error with recovery guidance.
+    ///
+    /// Used by error paths to provide SDKs and integrators with structured error information,
+    /// recovery suggestions, and contextual data (e.g., "can claim in X blocks").
+    fn emit_error_diagnostic(env: &Env, diagnostic: ErrorDiagnostic) {
+        ErrorDiagnosticEmitted {
+            name: symbol_short!("err_diag"),
+            diagnostic,
+        }
+        .publish(env);
     }
 
     /// Read the immutable funding token address, failing with [`EscrowError::FundingTokenNotSet`]
@@ -1139,6 +1225,8 @@ impl LiquifactEscrow {
         max_per_investor: Option<i128>,
         legal_hold_clear_delay: Option<u64>,
         funding_deadline: Option<u64>,
+        yield_slippage_threshold: Option<i64>,
+        settlement_notifier_contract: Option<Address>,
     ) -> InvoiceEscrow {
         admin.require_auth();
 
@@ -1217,6 +1305,8 @@ impl LiquifactEscrow {
         env.storage()
             .instance()
             .set(&DataKey::UniqueFunderCount, &0u32);
+        // Initialize the investor-list count alongside the funder count.
+        env.storage().instance().set(&DataKey::InvestorCount, &0u32);
 
         if let Some(cap) = max_per_investor {
             ensure(&env, cap > 0, EscrowError::MaxPerInvestorNotPositive);
@@ -1238,6 +1328,31 @@ impl LiquifactEscrow {
                 .instance()
                 .set(&DataKey::LegalHoldClearDelay, &delay);
         }
+
+        // Validate and store yield slippage threshold
+        let threshold = yield_slippage_threshold.unwrap_or(0);
+        if threshold > 0 {
+            ensure(
+                &env,
+                (0..=10_000).contains(&threshold),
+                EscrowError::YieldSlippageThresholdOutOfRange,
+            );
+            env.storage()
+                .instance()
+                .set(&DataKey::YieldSlippageThreshold, &threshold);
+        }
+
+        // Store optional settlement notifier contract address
+        if let Some(ref notifier) = settlement_notifier_contract {
+            env.storage()
+                .instance()
+                .set(&DataKey::SettlementNotifierContract, notifier);
+        }
+
+        // Store creation timestamp for registry listings
+        env.storage()
+            .instance()
+            .set(&DataKey::CreatedAt, &env.ledger().timestamp());
 
         EscrowInitialized {
             name: symbol_short!("escrow_ii"),
@@ -1280,10 +1395,59 @@ impl LiquifactEscrow {
         env.storage().instance().get(&DataKey::RegistryRef)
     }
 
+    /// Returns the optional settlement notifier contract address stored at
+    /// [`DataKey::SettlementNotifierContract`], or [`None`] when no notifier was configured
+    /// at [`LiquifactEscrow::init`].
+    pub fn get_settlement_notifier_contract(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SettlementNotifierContract)
+    }
+
+    /// Returns the ledger timestamp when [`LiquifactEscrow::init`] was called.
+    /// Returns `0` for escrows that predate this storage key.
+    pub fn get_created_at(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::CreatedAt).unwrap_or(0)
+    }
+
     /// Returns the optional pending admin address waiting for [`LiquifactEscrow::accept_admin`],
     /// or [`None`] when no admin handover is in progress.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+    /// Compare the escrow contract's current funding-token balance to the recorded `funded_amount`.
+    ///
+    /// Returns a signed discrepancy equal to `contract_balance - recorded_funded_amount`.
+    /// Positive values indicate the contract holds more than the recorded funded amount;
+    /// negative values indicate a shortfall.
+    ///
+    /// # Authorization
+    /// Requires the current admin to authorize the call. This makes the entrypoint suitable for
+    /// manual audits and for off-chain schedulers or external triggers that reconcile custody.
+    pub fn verify_asset_custody(env: Env) -> i128 {
+        let escrow = Self::load_escrow_require_admin(&env);
+        let token_addr = Self::funding_token_or_fail(&env);
+        let this = env.current_contract_address();
+
+        let contract_balance = TokenClient::new(&env, &token_addr).balance(&this);
+        let recorded_funded_amount = escrow.funded_amount;
+        let discrepancy = if contract_balance >= recorded_funded_amount {
+            contract_balance - recorded_funded_amount
+        } else {
+            -(recorded_funded_amount - contract_balance)
+        };
+
+        AssetCustodyVerified {
+            name: symbol_short!("cust_ver"),
+            invoice_id: escrow.invoice_id.clone(),
+            recorded_funded_amount,
+            contract_balance,
+            discrepancy,
+        }
+        .publish(&env);
+
+        discrepancy
     }
 
     /// Return whether this escrow has a configured maturity time lock.
@@ -1348,7 +1512,7 @@ impl LiquifactEscrow {
         let escrow = Self::get_escrow(env.clone());
         ensure(
             &env,
-            escrow.status == 2 || escrow.status == 3 || escrow.status == 4,
+            escrow.status == 2 || escrow.status == 3 || escrow.status == 4 || escrow.status == 5,
             EscrowError::DustSweepNotTerminal,
         );
 
@@ -1407,6 +1571,50 @@ impl LiquifactEscrow {
         .publish(&env);
 
         sweep_amt
+    }
+
+    /// Archive a terminal escrow to mark it as closed and reduce active monitoring.
+    ///
+    /// Transitions the escrow to status `5` (archived). Only permitted from terminal states:
+    /// `2` (settled), `3` (withdrawn), `4` (cancelled), or `5` (already archived — no-op).
+    /// Open (`0`) or funded (`1`) states are rejected.
+    ///
+    /// # Authorization
+    /// Requires admin authorization. Read-only operations continue to work on archived escrows.
+    /// Archived escrows remain accessible but should be excluded from active-monitoring queries
+    /// by off-chain indexers.
+    ///
+    /// # Errors
+    /// Emits [`EscrowError::ArchiveNotTerminal`] if the escrow is not in a terminal state.
+    /// Emits [`EscrowError::EscrowAlreadyArchived`] if already status `5`.
+    pub fn archive_escrow(env: Env) -> InvoiceEscrow {
+        let mut escrow = Self::load_escrow_require_admin(&env);
+
+        // Idempotent no-op: already archived
+        if escrow.status == 5 {
+            return escrow;
+        }
+
+        ensure(
+            &env,
+            escrow.status == 2 || escrow.status == 3 || escrow.status == 4,
+            EscrowError::ArchiveNotTerminal,
+        );
+
+        let prior_status = escrow.status;
+        escrow.status = 5;
+
+        env.storage().instance().set(&DataKey::Escrow, &escrow);
+
+        EscrowArchived {
+            name: symbol_short!("esc_arch"),
+            invoice_id: escrow.invoice_id.clone(),
+            prior_status,
+            archived_at_ledger_timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        escrow
     }
 
     pub fn get_escrow(env: Env) -> InvoiceEscrow {
@@ -1506,6 +1714,36 @@ impl LiquifactEscrow {
 
     pub fn get_version(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::Version).unwrap_or(0)
+    }
+
+    /// Returns the contract interface version ([`CONTRACT_INTERFACE_VERSION`]).
+    ///
+    /// Use this to detect caller/contract ABI mismatches **before** invoking state-mutating
+    /// entrypoints. This value is a compile-time constant baked into the deployed WASM and
+    /// does **not** require the escrow to be initialized (no [`DataKey::Escrow`] read).
+    ///
+    /// # Interface version vs schema version
+    ///
+    /// | Getter | Constant | Tracks |
+    /// |--------|----------|--------|
+    /// | `get_interface_version` | [`CONTRACT_INTERFACE_VERSION`] | Entrypoint signatures, parameter lists, return types |
+    /// | `get_version` | [`SCHEMA_VERSION`] | On-chain storage layout (XDR structs, `DataKey` variants) |
+    ///
+    /// # Caller guidance
+    ///
+    /// SDKs and integration adapters should call `get_interface_version` at startup and
+    /// compare the returned value against the version they were compiled against. A mismatch
+    /// means the deployed contract has a different ABI than expected; the caller should
+    /// refuse further calls and surface a diagnostic error rather than silently mis-parse
+    /// arguments or return values.
+    ///
+    /// See `docs/escrow-interface-versioning.md` for the full versioning policy.
+    ///
+    /// # Authorization
+    ///
+    /// None — pure read; no auth required. Safe to call before `init`.
+    pub fn get_interface_version(_env: Env) -> u32 {
+        CONTRACT_INTERFACE_VERSION
     }
 
     /// Get the optional funding deadline (ledger timestamp), returns None if not set.
@@ -1615,6 +1853,29 @@ impl LiquifactEscrow {
             sme_collateral_commitment,
             has_primary_attestation: primary_attestation_hash.is_some(),
             attestation_log_length: attestation_append_log.len(),
+        }
+    }
+
+    /// Returns discovery metadata for this escrow, suitable for registry contracts
+    /// and off-chain indexers.
+    ///
+    /// Bundles the escrow's own address, invoice identifier, SME, creation timestamp,
+    /// current status, and funding target into a single read call. This is the canonical
+    /// on-chain source for registry listings.
+    ///
+    /// # Returns
+    /// [`RegistryListing`] with escrow metadata. `created_at` is `0` for escrows that
+    /// predate the [`DataKey::CreatedAt`] storage key.
+    pub fn get_registry_listing(env: Env) -> RegistryListing {
+        let escrow = Self::get_escrow(env.clone());
+        let created_at = Self::get_created_at(env.clone());
+        RegistryListing {
+            escrow_address: env.current_contract_address(),
+            invoice_id: escrow.invoice_id,
+            sme_address: escrow.sme_address,
+            created_at,
+            status: escrow.status,
+            funding_target: escrow.funding_target,
         }
     }
 
@@ -1775,6 +2036,37 @@ impl LiquifactEscrow {
     /// Earliest ledger timestamp for [`LiquifactEscrow::claim_investor_payout`]; `0` if not gated.
     pub fn get_investor_claim_not_before(env: Env, investor: Address) -> u64 {
         Self::get_persistent_investor_claim_not_before(&env, investor)
+    }
+
+    /// Retrieve the configured yield slippage detection threshold (in basis points).
+    /// Returns `0` if slippage detection is disabled (no threshold configured).
+    ///
+    /// When the absolute difference between actual and expected yield exceeds this threshold,
+    /// a [`YieldSlippageWarning`] is emitted during [`LiquifactEscrow::claim_investor_payout`].
+    pub fn get_yield_slippage_threshold(env: Env) -> i64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::YieldSlippageThreshold)
+            .unwrap_or(0)
+    }
+
+    /// Compute expected and actual yield for an investor, and the resulting slippage deviation.
+    ///
+    /// Returns:
+    /// - `expected_yield_bps`: escrow base yield (from [`InvoiceEscrow::yield_bps`])
+    /// - `actual_yield_bps`: investor's effective yield (from [`DataKey::InvestorEffectiveYield`] or base)
+    /// - `deviation_bps`: absolute difference in basis points
+    ///
+    /// Useful for off-chain tools to preview whether a claim would trigger a slippage warning.
+    pub fn get_investor_yield_slippage(env: Env, investor: Address) -> (i64, i64, i64) {
+        // env.clone(): env is used again after this call for the InvestorEffectiveYield read.
+        let escrow = Self::get_escrow(env.clone());
+        let actual_yield_bps = Self::get_persistent_investor_effective_yield(&env, investor.clone())
+            .unwrap_or(escrow.yield_bps);
+        let expected_yield_bps = escrow.yield_bps;
+        let deviation_bps = (actual_yield_bps - expected_yield_bps).abs();
+
+        (expected_yield_bps, actual_yield_bps, deviation_bps)
     }
 
     /// Retrieve the currently recorded SME collateral commitment metadata from storage.
@@ -2293,11 +2585,7 @@ impl LiquifactEscrow {
         let n = entries.len();
 
         ensure(&env, n > 0, EscrowError::FundingBatchEmpty);
-        ensure(
-            &env,
-            n <= MAX_FUND_BATCH,
-            EscrowError::FundingBatchTooLarge,
-        );
+        ensure(&env, n <= MAX_FUND_BATCH, EscrowError::FundingBatchTooLarge);
 
         let mut escrow = Self::get_escrow(env.clone());
 
@@ -2489,6 +2777,20 @@ impl LiquifactEscrow {
             env.storage()
                 .instance()
                 .set(&DataKey::UniqueFunderCount, &(cur_funder_count + 1));
+            // Maintain ordered investor index for list_investors pagination.
+            // Read InvestorCount (may differ from UniqueFunderCount on pre-v6 instances
+            // that did not initialize it; default to 0 so the first index is always 0).
+            let investor_count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::InvestorCount)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::InvestorIndex(investor_count), &investor.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::InvestorCount, &(investor_count + 1));
         }
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
@@ -2569,6 +2871,56 @@ impl LiquifactEscrow {
         escrow
     }
 
+    /// Retry / standalone settlement notification. Invokes the configured
+    /// [`DataKey::SettlementNotifierContract`] with the current settlement details.
+    ///
+    /// Use this entrypoint when:
+    /// - The inline notifier call in [`LiquifactEscrow::settle`] reverted (and settlement
+    ///   was retried without a notifier).
+    /// - An off-chain relayer or indexer wants to push settlement data to an external system.
+    ///
+    /// # Authorization
+    /// Open to any caller — the notifier itself enforces its own access control.
+    ///
+    /// # Errors
+    /// Emits [`EscrowError::SettlementNotifierNotSet`] when no notifier was configured at init.
+    /// Emits [`EscrowError::InvestorClaimNotSettled`] (127) when escrow status is not `2` (settled).
+    pub fn notify_settlement(env: Env) {
+        let escrow = Self::get_escrow(env.clone());
+
+        ensure(
+            &env,
+            escrow.status == 2,
+            EscrowError::InvestorClaimNotSettled,
+        );
+
+        let notifier: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SettlementNotifierContract)
+            .unwrap_or_else(|| fail(&env, EscrowError::SettlementNotifierNotSet));
+
+        let now = env.ledger().timestamp();
+        let args = soroban_sdk::vec![
+            &env,
+            escrow.invoice_id.clone(),
+            escrow.funded_amount,
+            escrow.yield_bps,
+            now
+        ];
+        env.invoke_contract(¬ifier, &symbol_short!("on_settle"), args);
+
+        SettlementNotifierInvoked {
+            name: symbol_short!("notify_ok"),
+            invoice_id: escrow.invoice_id.clone(),
+            notifier_contract: notifier,
+            funded_amount: escrow.funded_amount,
+            yield_bps: escrow.yield_bps,
+            settled_at_ledger_timestamp: now,
+        }
+        .publish(&env);
+    }
+
     pub fn settle(env: Env) -> InvoiceEscrow {
         ensure(
             &env,
@@ -2583,11 +2935,18 @@ impl LiquifactEscrow {
 
         let now = env.ledger().timestamp();
         if escrow.maturity > 0 {
-            ensure(
-                &env,
-                now >= escrow.maturity,
-                EscrowError::MaturityNotReached,
-            );
+            if now < escrow.maturity {
+                let seconds_remaining = escrow.maturity.saturating_sub(now);
+                let context_msg = String::from_str(&env, &format!("Maturity timestamp: {} (in ~{} seconds)", escrow.maturity, seconds_remaining));
+                let diagnostic = ErrorDiagnostic {
+                    error_code: EscrowError::MaturityNotReached as u32,
+                    message: String::from_str(&env, "Escrow has not reached maturity yet"),
+                    recovery_action: String::from_str(&env, "Wait until maturity timestamp to settle"),
+                    context: Some(context_msg),
+                };
+                Self::emit_error_diagnostic(&env, diagnostic);
+                fail(&env, EscrowError::MaturityNotReached);
+            }
         }
 
         escrow.status = 2;
@@ -2603,6 +2962,11 @@ impl LiquifactEscrow {
             settled_at_ledger_timestamp: now,
         }
         .publish(&env);
+
+        // Settlement always succeeds. The settlement notifier (if configured) is
+        // invoked separately via `notify_settlement()` by an off-chain relayer or
+        // indexer watching for `EscrowSettled`. This guarantees graceful failure:
+        // a broken notifier does not block settlement finalization.
 
         escrow
     }
@@ -2735,11 +3099,25 @@ impl LiquifactEscrow {
         let not_before: u64 =
             Self::get_persistent_investor_claim_not_before(&env, investor.clone());
         let now = env.ledger().timestamp();
-        ensure(
-            &env,
-            now >= not_before,
-            EscrowError::InvestorCommitmentLockNotExpired,
-        );
+        
+        if now < not_before {
+            let context_msg = if not_before > 0 {
+                let blocks_remaining = not_before.saturating_sub(now);
+                String::from_str(&env, &format!("Can claim in {} seconds (block {}) from now", blocks_remaining, not_before))
+            } else {
+                String::from_str(&env, "Commitment lock is active")
+            };
+            
+            let diagnostic = ErrorDiagnostic::with_context(
+                &env,
+                EscrowError::InvestorCommitmentLockNotExpired as u32,
+                "Investment is in commitment lock period",
+                "Wait for the lock period to expire before claiming payout",
+                core::str::from_utf8(&[b' ']).unwrap(), // Use existing context_msg instead
+            );
+            Self::emit_error_diagnostic(&env, diagnostic);
+            fail(&env, EscrowError::InvestorCommitmentLockNotExpired);
+        }
 
         // Idempotent early-return: a second claim is a no-op (no re-emit).
         if Self::get_persistent_investor_claimed(&env, investor.clone()) {
@@ -2748,6 +3126,9 @@ impl LiquifactEscrow {
 
         // Mark before emit — prevents re-emission on any re-entrant path.
         Self::set_persistent_investor_claimed(&env, investor.clone(), true);
+
+        // Real-time slippage detection: compare expected vs actual yield
+        Self::detect_yield_slippage(&env, investor.clone(), &escrow);
 
         InvestorPayoutClaimed {
             name: symbol_short!("inv_claim"),
@@ -2837,6 +3218,61 @@ impl LiquifactEscrow {
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
             .checked_div(total_principal)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
+    }
+
+    /// Real-time slippage detection during investor claim.
+    ///
+    /// Compares expected yield (escrow base) vs. actual yield (investor's effective yield)
+    /// and emits a warning event if the deviation exceeds the configured threshold.
+    ///
+    /// # Detection logic
+    ///
+    /// - **Expected yield**: escrow's [`InvoiceEscrow::yield_bps`]
+    /// - **Actual yield**: investor's [`DataKey::InvestorEffectiveYield`] (or falls back to base)
+    /// - **Deviation**: absolute difference between actual and expected (in basis points)
+    /// - **Threshold**: stored in [`DataKey::YieldSlippageThreshold`] (0 = disabled)
+    ///
+    /// When `deviation > threshold`, emits [`YieldSlippageWarning`] for admin review.
+    ///
+    /// # Authorization
+    ///
+    /// None — pure read-only check; called internally during claim finalization.
+    fn detect_yield_slippage(env: &Env, investor: Address, escrow: &InvoiceEscrow) {
+        // Fetch configured slippage threshold; 0 means disabled
+        let threshold_bps: i64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldSlippageThreshold)
+            .unwrap_or(0);
+
+        if threshold_bps == 0 {
+            // Slippage detection is disabled
+            return;
+        }
+
+        // Resolve actual yield: investor-specific tier (set at first deposit) or escrow base.
+        let actual_yield_bps: i64 =
+            Self::get_persistent_investor_effective_yield(&env, investor.clone())
+                .unwrap_or(escrow.yield_bps);
+
+        let expected_yield_bps = escrow.yield_bps;
+
+        // Compute deviation (absolute difference in basis points)
+        let deviation_bps = (actual_yield_bps - expected_yield_bps).abs();
+
+        // Emit warning if deviation exceeds threshold
+        if deviation_bps > threshold_bps {
+            YieldSlippageWarning {
+                name: symbol_short!("yield_slip"),
+                investor,
+                invoice_id: escrow.invoice_id.clone(),
+                expected_yield_bps,
+                actual_yield_bps,
+                slippage_threshold_bps: threshold_bps,
+                deviation_bps,
+            }
+            .publish(&env);
+        }
     }
 
     pub fn update_maturity(env: Env, new_maturity: u64) -> InvoiceEscrow {
