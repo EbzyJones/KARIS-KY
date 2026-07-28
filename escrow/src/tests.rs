@@ -44,6 +44,7 @@ pub(crate) fn assert_contract_error<T, E>(
 // modules stay assertion-focused and each test still owns a fresh Env.
 mod admin;
 mod attestations;
+mod batch_claim;
 mod cap_validation;
 mod chaos;
 mod coverage;
