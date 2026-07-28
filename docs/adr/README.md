@@ -11,5 +11,9 @@ Key design decisions for the karis-ky escrow contract.
 | [ADR-005](ADR-005-tiered-yield.md) | Optional Tiered Yield and Commitment Locks | Accepted |
 | [ADR-006](ADR-006-dust-sweep-and-token-safety.md) | Treasury Dust Sweep and Token Safety | Accepted |
 | [ADR-007](ADR-007-storage-key-evolution.md) | Storage Key Evolution and Additive-Key Policy | Accepted |
+| [ADR-008](ADR-008-backup-restore-rejection.md) | On-Chain Backup / Restore — Decision and Safe Alternatives | Accepted |
+| [ADR-009](ADR-009-per-investor-persistent-storage.md) | Per-Investor Keys in Persistent Storage — TTL, Footprint, and Migration | Accepted |
+
+> **Reading order for v5 → v6:** Read [ADR-007](ADR-007-storage-key-evolution.md) (policy, `Rule 5`) first for the high-level additive-key policy; then read [ADR-009](ADR-009-per-investor-persistent-storage.md) for the dedicated rationale, TTL/footprint tradeoffs, and the operator-facing v5 → v6 redeploy plan.
 
 Each ADR links directly to the relevant sections of [`escrow/src/lib.rs`](../../escrow/src/lib.rs).
