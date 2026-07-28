@@ -1201,6 +1201,85 @@ pub struct StateSnapshotReverted {
     pub new_escrow_state: InvoiceEscrow,
 }
 
+/// Filter parameters for [`LiquifactEscrow::query_attestation_logs`].
+///
+/// All fields are optional; omitted filters match everything (pass-through).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditLogFilter {
+    /// Return only entries whose timestamp >= this value (inclusive).
+    /// `None` ⇒ no lower bound on timestamp.
+    pub after_timestamp: Option<u64>,
+    /// Return only entries whose tag starts with this prefix (case-sensitive).
+    /// `None` ⇒ no tag filter.
+    pub tag_prefix: Option<Symbol>,
+}
+
+/// A single entry returned by [`LiquifactEscrow::query_attestation_logs`].
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AttestationLogEntry {
+    /// The 32-byte attestation digest.
+    pub digest: BytesN<32>,
+    /// Zero-based index in the append log.
+    pub index: u32,
+    /// Ledger timestamp when this entry was appended (0 if absent).
+    pub timestamp: u64,
+    /// Optional tag stored with this entry (absent ⇒ empty symbol).
+    pub tag: Symbol,
+    /// Whether this index has been revoked.
+    pub revoked: bool,
+}
+
+/// Paginated result from [`LiquifactEscrow::query_attestation_logs`].
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditLogPage {
+    /// Matching entries for the current page (after filtering & pagination).
+    pub entries: Vec<AttestationLogEntry>,
+    /// Total number of matching entries (before pagination) so callers can compute pages.
+    pub total_count: u32,
+}
+
+/// Complete escrow state snapshot for archival/analysis.
+///
+/// Returned by [`LiquifactEscrow::export_escrow_snapshot`] for compliance and audit reporting.
+/// All investor records are collected from persistent storage; only the current set of known
+/// keys is scanned — the contract cannot enumerate investor addresses on-chain, so callers
+/// should combine this snapshot with off-chain indexer data for a full investor list.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EscrowSnapshot {
+    /// Full escrow state.
+    pub escrow: InvoiceEscrow,
+    /// Stored schema version.
+    pub schema_version: u32,
+    /// Active legal hold flag.
+    pub legal_hold: bool,
+    /// Funding close snapshot (if escrow reached funded status).
+    pub funding_close_snapshot: EscrowCloseSnapshot,
+    /// Count of unique funder addresses.
+    pub unique_funder_count: u32,
+    /// Whether the allowlist gate is active.
+    pub is_allowlist_active: bool,
+    /// SME collateral commitment metadata (if recorded).
+    pub sme_collateral_commitment: CollateralCommitmentSnapshot,
+    /// Primary attestation hash (if bound).
+    pub primary_attestation_hash: Option<BytesN<32>>,
+    /// Current length of the attestation append log.
+    pub attestation_log_length: u32,
+    /// Sanctions provider address (if configured).
+    pub sanctions_provider: Option<Address>,
+    /// Funding token address.
+    pub funding_token: Address,
+    /// Treasury address.
+    pub treasury: Address,
+    /// Optional registry hint.
+    pub registry: Option<Address>,
+    /// Version history tuples of (version, timestamp).
+    pub version_history: Vec<(u32, u64)>,
+}
+
 #[contract]
 pub struct LiquifactEscrow;
 
@@ -1474,6 +1553,22 @@ impl LiquifactEscrow {
         env.storage()
             .instance()
             .set(&DataKey::Version, &SCHEMA_VERSION);
+
+        // Record version history for audit trail
+        let now_ts = env.ledger().timestamp();
+        let mut vh: Vec<(u32, u64)> = Vec::new(&env);
+        vh.push_back((SCHEMA_VERSION, now_ts));
+        env.storage()
+            .instance()
+            .set(&DataKey::VersionHistory, &vh);
+
+        // Store sanctions provider if configured
+        if let Some(ref sp) = sanctions_provider {
+            env.storage()
+                .instance()
+                .set(&DataKey::SanctionsProvider, sp);
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::FundingToken, &funding_token);
@@ -2223,9 +2318,13 @@ impl LiquifactEscrow {
     /// Append a digest to a bounded on-chain log (see [`MAX_ATTESTATION_APPEND_ENTRIES`]) for **versioned**
     /// or incremental attestation updates. Does not replace [`LiquifactEscrow::bind_primary_attestation_hash`].
     ///
+    /// An optional `tag` (Soroban [`Symbol`]) may be provided for filtering via
+    /// [`LiquifactEscrow::query_attestation_logs`]; pass an empty symbol for no tag.
+    /// The ledger timestamp is automatically recorded for time-based queries.
+    ///
     /// # Errors
     /// Emits typed [`EscrowError`] codes when the escrow is uninitialized or the append log is full.
-    pub fn append_attestation_digest(env: Env, digest: BytesN<32>) {
+    pub fn append_attestation_digest(env: Env, digest: BytesN<32>, tag: Symbol) {
         let escrow = Self::load_escrow_require_admin(&env);
 
         // Auto-migrate: if an old Vec-based log exists but no count has been set,
@@ -2285,6 +2384,19 @@ impl LiquifactEscrow {
         env.storage()
             .instance()
             .set(&DataKey::AttestationAppendLogCount, &(count + 1));
+
+        // Store the ledger timestamp for this entry (enables time-based queries)
+        let ts = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::AttestationTimestamp(idx), &ts);
+
+        // Store the tag if non-empty (enables tag-based queries)
+        if !tag.is_empty() {
+            env.storage()
+                .instance()
+                .set(&DataKey::AttestationTag(idx), &tag);
+        }
 
         AttestationDigestAppended {
             name: symbol_short!("att_app"),
@@ -2433,6 +2545,35 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::YieldSlippageThreshold)
             .unwrap_or(0)
+    }
+
+    /// Returns the optional sanctions list provider contract address ([`DataKey::SanctionsProvider`]),
+    /// or [`None`] when no provider was configured at init.
+    pub fn get_sanctions_provider(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::SanctionsProvider)
+    }
+
+    /// Cross-contract sanctions screening: if a sanctions provider is configured,
+    /// calls `is_sanctioned(addr)` on it and fails with [`EscrowError::AddressOnSanctionsList`]
+    /// when the address is blocked.
+    ///
+    /// When no provider is set, this is a no-op (all addresses allowed).
+    fn check_sanctions(env: &Env, address: &Address) {
+        let Some(provider) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::SanctionsProvider)
+        else {
+            return; // No provider configured — pass through
+        };
+        // Cross-contract call: provider.is_sanctioned(address) -> bool
+        // Returns true if the address is on the sanctions list.
+        let sanctioned: bool = env.invoke_contract(
+            &provider,
+            &symbol_short!("is_sanctioned"),
+            soroban_sdk::vec![env, address.clone()],
+        );
+        ensure(env, !sanctioned, EscrowError::AddressOnSanctionsList);
     }
 
     /// Compute expected and actual yield for an investor, and the resulting slippage deviation.
@@ -3195,8 +3336,225 @@ impl LiquifactEscrow {
             // To add one: implement the transformation here, call
             //   env.storage().instance().set(&DataKey::Version, &NEW_VERSION);
             // and return NEW_VERSION before reaching this typed error.
+            //
+            // When a migration path IS implemented, also record the version change:
+            //   let mut vh: Vec<(u32, u64)> = env.storage().instance()
+            //       .get(&DataKey::VersionHistory).unwrap_or_else(|| Vec::new(&env));
+            //   vh.push_back((NEW_VERSION, env.ledger().timestamp()));
+            //   env.storage().instance().set(&DataKey::VersionHistory, &vh);
             fail(&env, EscrowError::NoMigrationPath)
         }
+    }
+
+    /// Query the attestation append log with optional filters and pagination.
+    ///
+    /// Returns a paginated page of [`AttestationLogEntry`] entries matching the given
+    /// [`AuditLogFilter`]. Pass an empty filter to retrieve all entries unfiltered.
+    ///
+    /// # Filtering
+    /// - `after_timestamp`: Only entries with `timestamp >= after_timestamp` (inclusive).
+    /// - `tag_prefix`: Only entries whose tag starts with this prefix (case-sensitive
+    ///   Soroban [`Symbol`] prefix match).
+    ///
+    /// # Pagination
+    /// - `limit`: Maximum entries per page (clamped to the available matching entries).
+    /// - `offset`: Number of matching entries to skip before returning results.
+    ///
+    /// # Performance
+    /// Optimized for recent-logs queries: entries are scanned in append order (oldest first)
+    /// and filtered in Wasm memory. Callers should use `after_timestamp` to prune scans.
+    pub fn query_attestation_logs(
+        env: Env,
+        filters: AuditLogFilter,
+        limit: u32,
+        offset: u32,
+    ) -> AuditLogPage {
+        let log: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AttestationAppendLog)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let log_len = log.len();
+        let mut all_matches: Vec<AttestationLogEntry> = Vec::new(&env);
+
+        for i in 0..log_len {
+            let digest = log.get(i).unwrap();
+
+            // Read timestamp (default 0)
+            let ts: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::AttestationTimestamp(i))
+                .unwrap_or(0);
+
+            // Read tag (default empty symbol)
+            let tag: Symbol = env
+                .storage()
+                .instance()
+                .get(&DataKey::AttestationTag(i))
+                .unwrap_or_else(|| symbol_short!(""));
+
+            // Read revocation status
+            let revoked: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::AttestationRevoked(i))
+                .unwrap_or(false);
+
+            // Apply filter: after_timestamp
+            if let Some(after) = filters.after_timestamp {
+                if ts < after {
+                    continue;
+                }
+            }
+
+            // Apply filter: tag_prefix
+            if let Some(ref prefix) = filters.tag_prefix {
+                if !tag.to_string().starts_with(&prefix.to_string()) {
+                    continue;
+                }
+            }
+
+            all_matches.push_back(AttestationLogEntry {
+                digest,
+                index: i,
+                timestamp: ts,
+                tag,
+                revoked,
+            });
+        }
+
+        let total_count = all_matches.len();
+
+        // Apply pagination: skip `offset` entries, take up to `limit`
+        let mut page: Vec<AttestationLogEntry> = Vec::new(&env);
+        let start = offset.min(total_count);
+        let end = (offset.saturating_add(limit)).min(total_count);
+        for j in start..end {
+            page.push_back(all_matches.get(j).unwrap());
+        }
+
+        AuditLogPage {
+            entries: page,
+            total_count,
+        }
+    }
+
+    /// Export the complete escrow state as a structured snapshot for archival, analysis,
+    /// compliance, and audit reporting.
+    ///
+    /// Returns an [`EscrowSnapshot`] containing all instance-storage state: escrow, version,
+    /// legal hold, funding close snapshot, funder count, allowlist status, SME collateral,
+    /// attestation metadata, sanctions provider, funding token, treasury, registry, and
+    /// version history.
+    ///
+    /// The snapshot **does not** include per-investor records (contributions, claimed flags,
+    /// allowlist entries) because Soroban cannot enumerate persistent storage keys on-chain.
+    /// Combine this snapshot with off-chain indexer data for a full investor list.
+    pub fn export_escrow_snapshot(env: Env) -> EscrowSnapshot {
+        let escrow = Self::get_escrow(env.clone());
+        let schema_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(0);
+        let legal_hold: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::LegalHold)
+            .unwrap_or(false);
+
+        let fcs_opt: Option<FundingCloseSnapshot> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FundingCloseSnapshot);
+        let funding_close_snapshot = match fcs_opt {
+            Some(s) => EscrowCloseSnapshot::Some(s),
+            None => EscrowCloseSnapshot::None,
+        };
+
+        let unique_funder_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UniqueFunderCount)
+            .unwrap_or(0);
+
+        let is_allowlist_active: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowlistActive)
+            .unwrap_or(false);
+
+        let sme_cc_opt: Option<SmeCollateralCommitment> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SmeCollateralPledge);
+        let sme_collateral_commitment = match sme_cc_opt {
+            Some(c) => CollateralCommitmentSnapshot::Some(c),
+            None => CollateralCommitmentSnapshot::None,
+        };
+
+        let primary_attestation_hash: Option<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PrimaryAttestationHash);
+
+        let attestation_log_length: u32 = env
+            .storage()
+            .instance()
+            .get::<DataKey, Vec<BytesN<32>>>(&DataKey::AttestationAppendLog)
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        let sanctions_provider: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SanctionsProvider);
+
+        let funding_token = Self::funding_token_or_fail(&env);
+        let treasury = Self::treasury_or_fail(&env);
+        let registry: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RegistryRef);
+
+        let version_history: Vec<(u32, u64)> = env
+            .storage()
+            .instance()
+            .get(&DataKey::VersionHistory)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        EscrowSnapshot {
+            escrow,
+            schema_version,
+            legal_hold,
+            funding_close_snapshot,
+            unique_funder_count,
+            is_allowlist_active,
+            sme_collateral_commitment,
+            primary_attestation_hash,
+            attestation_log_length,
+            sanctions_provider,
+            funding_token,
+            treasury,
+            registry,
+            version_history,
+        }
+    }
+
+    /// Returns the version history audit trail as a vector of `(version, ledger_timestamp)` tuples.
+    ///
+    /// Each tuple records when a schema version was first written to this instance — on
+    /// [`LiquifactEscrow::init`] and on each successful [`LiquifactEscrow::migrate`].
+    /// This helps operators track deployment lineage and audit upgrade events.
+    ///
+    /// Returns an empty vector if no history has been recorded (escrow not initialized).
+    pub fn get_version_history(env: Env) -> Vec<(u32, u64)> {
+        env.storage()
+            .instance()
+            .get(&DataKey::VersionHistory)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Replaces the deployed contract WASM with the binary identified by `new_wasm_hash`.
@@ -3362,6 +3720,9 @@ impl LiquifactEscrow {
                 EscrowError::InvestorNotAllowlisted,
             );
         }
+
+        // Sanctions screening: check investor against configured sanctions provider
+        Self::check_sanctions(&env, &investor);
 
         let prev: i128 = Self::get_persistent_investor_contribution(&env, investor.clone());
         let new_contribution: i128 = prev
@@ -3667,6 +4028,9 @@ impl LiquifactEscrow {
 
         // env.clone(): env is used again after this call for ledger timestamp, storage set, and publish.
         let mut escrow = Self::load_escrow_require_sme(&env);
+
+        // Sanctions screening: check SME address against configured sanctions provider
+        Self::check_sanctions(&env, &escrow.sme_address);
 
         ensure(&env, escrow.status == 1, EscrowError::SettlementNotFunded);
 

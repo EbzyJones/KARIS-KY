@@ -1355,7 +1355,7 @@ fn auth_audit_append_attestation_requires_admin() {
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
     env.mock_auths(&[]);
-    client.append_attestation_digest(&soroban_sdk::BytesN::from_array(&env, &[0u8; 32]));
+    client.append_attestation_digest(&symbol_short!(""), &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]));
 }
 
 #[test]
