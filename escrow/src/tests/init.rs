@@ -757,6 +757,9 @@ fn test_init_escrow_initialized_event_includes_bound_refs() {
             treasury,
             registry: Some(registry),
             has_maturity_lock: true,
+            yield_token: None,
+            oracle_contract: None,
+            nft_contract: None,
         }
         .to_xdr(&env, &contract_id)]
     );
@@ -804,6 +807,9 @@ fn test_init_escrow_initialized_event_registry_none() {
             treasury,
             registry: None,
             has_maturity_lock: false,
+            yield_token: None,
+            oracle_contract: None,
+            nft_contract: None,
         }
         .to_xdr(&env, &contract_id)]
     );

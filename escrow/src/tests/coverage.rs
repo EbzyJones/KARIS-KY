@@ -689,10 +689,11 @@ fn typed_error_codes_cover_range_boundaries() {
         &None,
         &None,
         &None,
-    ,
-    &None,
-    &None,
-);
+        &None, // yield_slippage_threshold
+        &None, // yield_token
+        &None, // oracle_contract
+        &None, // nft_contract
+    );
     rot_token.stellar.mint(&rot_terminal.address, &100);
     rot_terminal.fund(&investor, &100);
     rot_terminal.settle();

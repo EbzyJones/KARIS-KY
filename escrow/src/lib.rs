@@ -751,74 +751,23 @@ pub struct EscrowSummary {
     pub has_primary_attestation: bool,
     /// Number of entries in the attestation append log.
     pub attestation_log_length: u32,
-    /// Reason for the active legal hold, if any (max 256 bytes). Absent when no hold.
-    pub legal_hold_reason: Option<String>,
+    /// Optional yield-bearing token address (None when unconfigured).
+    pub yield_token: Option<Address>,
+    /// Optional oracle contract address (None when unconfigured).
+    pub oracle_contract: Option<Address>,
+    /// Optional NFT contract address (None when unconfigured).
+    pub nft_contract: Option<Address>,
+    /// Settlement NFT metadata if minted (None when no NFT contract is configured or not yet settled).
+    pub settlement_nft: Option<SettlementNftMetadata>,
 }
 
-/// Structured compliance report for regulatory submissions.
-/// Generated on-demand by [`LiquifactEscrow::generate_compliance_report`].
+/// Custom option-like enum to represent the settlement NFT metadata.
+/// Models standard option semantics as a contracttype.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub struct ComplianceReport {
-    /// Invoice identifier for this escrow.
-    pub invoice_id: Symbol,
-    /// Escrow creation ledger timestamp (when init was called).
-    pub created_at_ledger_timestamp: u64,
-    /// Escrow creation ledger sequence number.
-    pub created_at_ledger_sequence: u32,
-    /// Current escrow status (0=open, 1=funded, 2=settled, 3=withdrawn, 4=cancelled).
-    pub status: u32,
-    /// Original invoice amount (funding target at init).
-    pub amount: i128,
-    /// Total principal funded by investors.
-    pub funded_amount: i128,
-    /// Configured base yield in basis points.
-    pub yield_bps: i64,
-    /// Maturity timestamp (0 if no maturity lock).
-    pub maturity: u64,
-    /// Count of unique investors who contributed.
-    pub investor_count: u32,
-    /// True when a legal hold is currently active.
-    pub legal_hold_active: bool,
-    /// Reason for legal hold, if any (max 256 bytes).
-    pub legal_hold_reason: Option<String>,
-    /// Funding close snapshot timestamp (when escrow became fully funded), if applicable.
-    pub funded_at_ledger_timestamp: Option<u64>,
-    /// Settlement timestamp, if settled.
-    pub settled_at_ledger_timestamp: Option<u64>,
-    /// Admin address.
-    pub admin: Address,
-    /// SME (beneficiary) address.
-    pub sme_address: Address,
-    /// Number of investors who have claimed their payout.
-    pub investors_claimed: u32,
-}
-
-/// Dashboard-ready health score for the escrow.
-///
-/// Computed read-only from storage. Can be called by any address.
-///
-/// # Fields
-/// - `funding_progress_percent`: 0–100 percentage of funding target met (capped at 100 if overfunded).
-/// - `days_to_maturity`: signed delta in days between maturity timestamp and current ledger time.
-///   Negative means maturity has already passed. 0 when `maturity == 0` (no lock).
-/// - `unique_investor_count`: number of distinct investor addresses with non-zero contributions.
-/// - `average_contribution_size`: `funded_amount / unique_investor_count`; 0 when no investors.
-/// - `estimated_yield_payout`: coupon = `funded_amount × yield_bps / 10_000`; off‑chain pro‑rata
-///   per investor requires the funding‑close snapshot.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EscrowHealthMetrics {
-    /// 0–100: how close the escrow is to the funding target (floor, capped at 100).
-    pub funding_progress_percent: u32,
-    /// Signed ledger‑time delta in whole days.
-    pub days_to_maturity: i64,
-    /// Number of distinct investors.
-    pub unique_investor_count: u32,
-    /// `funded_amount / unique_investor_count`; 0 when there are no investors.
-    pub average_contribution_size: i128,
-    /// `funded_amount × yield_bps / 10_000` (floor); rough total coupon estimate.
-    pub estimated_yield_payout: i128,
+pub enum SettlementNftSnapshot {
+    None,
+    Some(SettlementNftMetadata),
 }
 
 // --- Events ---
@@ -836,6 +785,12 @@ pub struct EscrowInitialized {
     pub registry: Option<Address>,
     /// False when `escrow.maturity == 0`, which means `settle` has no maturity time lock.
     pub has_maturity_lock: bool,
+    /// Optional yield-bearing token; equals [`DataKey::YieldToken`] (`None` when unset).
+    pub yield_token: Option<Address>,
+    /// Optional oracle contract; equals [`DataKey::OracleContract`] (`None` when unset).
+    pub oracle_contract: Option<Address>,
+    /// Optional NFT contract; equals [`DataKey::NftContract`] (`None` when unset).
+    pub nft_contract: Option<Address>,
 }
 
 #[contractevent]
@@ -1190,6 +1145,75 @@ pub struct FundingResumedEvent {
     pub max_funding_rate: u64,
 }
 
+/// Emitted when a yield-bearing token is configured at init.
+/// Indexers use this to track yield-wrapped escrows and reconcile
+/// base-token → yield-token wrapping events.
+#[contractevent]
+pub struct YieldTokenBound {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// The yield-bearing token contract (e.g., aUSDC).
+    pub yield_token: Address,
+    /// The base funding token that gets wrapped.
+    pub base_token: Address,
+}
+
+/// Emitted during settlement when yield token is unwrapped back to base token.
+/// Carries the invoice id, yield token, and the yield earned during the funding period.
+#[contractevent]
+pub struct YieldUnwrapped {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// The yield-bearing token contract that was unwrapped.
+    pub yield_token: Address,
+    /// The base funding token received after unwrapping.
+    pub base_token: Address,
+    /// Raw yield earned (difference between unwrapped and wrapped amounts).
+    pub yield_earned: i128,
+    /// Ledger timestamp at which the unwrap occurred.
+    pub unwrapped_at_ledger_timestamp: u64,
+}
+
+/// Emitted when settlement verifies an invoice payment via an external oracle.
+/// Carries the oracle contract id and the verification result.
+#[contractevent]
+pub struct OracleSettlementVerified {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// The oracle contract used for verification.
+    pub oracle_contract: Address,
+    /// Whether the oracle verified the invoice payment successfully.
+    pub verified: bool,
+    /// Ledger timestamp at which verification occurred.
+    pub verified_at_ledger_timestamp: u64,
+}
+
+/// Emitted during settlement when an NFT is minted representing the settled invoice.
+/// The NFT can be used as collateral or proof of settlement by the SME.
+#[contractevent]
+pub struct SettlementNftMinted {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// The NFT contract that minted the token.
+    pub nft_contract: Address,
+    /// The SME address that receives the NFT.
+    pub sme_address: Address,
+    /// Settlement date (ledger timestamp).
+    pub settlement_date: u64,
+    /// Yield paid in basis points at settlement.
+    pub yield_paid_bps: i64,
+    /// ID of the minted NFT token, queryable by third-party contracts.
+    pub nft_token_id: Symbol,
+}
+
 /// Diagnostic information for contract errors, emitted alongside error returns.
 ///
 /// SDKs and integrators parse this struct to provide user-friendly error messages,
@@ -1438,6 +1462,18 @@ pub struct EscrowSnapshot {
     pub registry: Option<Address>,
     /// Version history tuples of (version, timestamp).
     pub version_history: Vec<(u32, u64)>,
+}
+
+/// Metadata record stored when a settlement NFT is minted.
+/// Queryable by third-party contracts to verify invoice settlement.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettlementNftMetadata {
+    pub invoice_id: Symbol,
+    pub settlement_date: u64,
+    pub yield_paid_bps: i64,
+    pub nft_contract: Address,
+    pub sme_address: Address,
 }
 
 #[contract]
@@ -1867,6 +1903,9 @@ impl LiquifactEscrow {
             treasury: Self::get_treasury(env.clone()),
             registry: Self::get_registry_ref(env.clone()),
             has_maturity_lock: Self::has_maturity_lock(env.clone()),
+            yield_token: Self::get_yield_token(env.clone()),
+            oracle_contract: Self::get_oracle_contract(env.clone()),
+            nft_contract: Self::get_nft_contract(env.clone()),
         }
         .publish(&env);
 
@@ -2487,19 +2526,10 @@ impl LiquifactEscrow {
         let schema_version = Self::get_version(env.clone());
         let sme_collateral_commitment = Self::get_sme_collateral_commitment(env.clone());
         let primary_attestation_hash = Self::get_primary_attestation_hash(env.clone());
-        let attestation_log_length = env
-            .storage()
-            .instance()
-            .get::<DataKey, u32>(&DataKey::AttestationAppendLogCount)
-            .unwrap_or_else(|| {
-                // Legacy fallback for old Vec-based log.
-                let legacy: Vec<BytesN<32>> = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::AttestationAppendLog)
-                    .unwrap_or_else(|| Vec::new(&env));
-                legacy.len()
-            });
+        let attestation_append_log = Self::get_attestation_append_log(env.clone());
+        let yield_token = Self::get_yield_token(env.clone());
+        let oracle_contract = Self::get_oracle_contract(env.clone());
+        let nft_contract = Self::get_nft_contract(env.clone());
 
         let funding_close_snapshot = match funding_close_snapshot_opt {
             Some(snap) => EscrowCloseSnapshot::Some(snap),
@@ -2522,7 +2552,13 @@ impl LiquifactEscrow {
             sme_collateral_commitment,
             has_primary_attestation: primary_attestation_hash.is_some(),
             attestation_log_length: attestation_append_log.len(),
-            legal_hold_reason,
+            yield_token,
+            oracle_contract,
+            nft_contract,
+            settlement_nft: env
+                .storage()
+                .instance()
+                .get(&DataKey::SettlementNft),
         }
     }
 
@@ -4509,13 +4545,15 @@ impl LiquifactEscrow {
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
+        let settled_at = now;
+
         EscrowSettled {
             name: symbol_short!("escrow_sd"),
             invoice_id: escrow.invoice_id.clone(),
             funded_amount: escrow.funded_amount,
             yield_bps: escrow.yield_bps,
             maturity: escrow.maturity,
-            settled_at_ledger_timestamp: now,
+            settled_at_ledger_timestamp: settled_at,
         }
         .publish(&env);
 

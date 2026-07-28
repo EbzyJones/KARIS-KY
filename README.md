@@ -14,6 +14,11 @@ tokenized invoices until settlement and is maintained under the `karis-ky` proje
 
 For local development and CI, Rust alone is sufficient.
 
+### SDK Examples
+
+Common integration patterns are demonstrated in [`examples/basic_workflow.rs`](examples/basic_workflow.rs):
+init, fund, settle, claim, tiered yield, oracle settlement, and NFT minting workflows.
+
 ---
 
 ## Quick start
