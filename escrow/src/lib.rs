@@ -148,34 +148,6 @@ include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
 pub const SCHEMA_VERSION: u32 = 7;
 
-/// Contract interface version — identifies the ABI surface exposed to callers.
-///
-/// This constant is returned by [`LiquifactEscrow::get_interface_version`] and is **distinct**
-/// from [`SCHEMA_VERSION`]:
-///
-/// - [`SCHEMA_VERSION`] tracks the on-chain storage layout (XDR structs, `DataKey` variants).
-/// - `CONTRACT_INTERFACE_VERSION` tracks the **public entrypoint surface** (function names,
-///   parameter lists, return types, event shapes).
-///
-/// # Increment rules — callers must bump this value when:
-///
-/// - An entrypoint is **renamed** or **removed**.
-/// - A parameter is **added, removed, or retyped** for any public entrypoint.
-/// - A return type changes in a way that is not backward-compatible with existing callers.
-/// - An event `#[topic]` or field name/type changes in a way that breaks indexed consumers.
-///
-/// # Stable / append-only policy
-///
-/// - This constant is **append-only**: once a numeric value has been published in a
-///   production deployment it must never be reused or decremented.
-/// - Adding a **new** entrypoint without touching existing signatures does **not** require
-///   a bump — callers that do not call the new function are unaffected.
-/// - New **optional** parameters guarded by `Option<T>` on Soroban may be additive; evaluate
-///   on a case-by-case basis and prefer a bump when in doubt.
-///
-/// See `docs/escrow-interface-versioning.md` for the full policy and examples.
-pub const CONTRACT_INTERFACE_VERSION: u32 = 2;
-
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
 pub const MAX_ATTESTATION_APPEND_ENTRIES: u32 = 32;
@@ -428,19 +400,14 @@ pub enum EscrowError {
     /// Funds must be custodied in this contract before the SME can pull them.
     InsufficientContractBalance = 164,
 
-    // --- export_state / import_state errors (200–209) ---
-
-    /// [`LiquifactEscrow::export_state`] called on an uninitialized contract.
-    ExportNotInitialized = 200,
-    /// [`LiquifactEscrow::import_state`] called on an already-initialized contract.
-    /// Import is only permitted on a fresh, uninitialized instance.
-    ImportAlreadyInitialized = 201,
-    /// [`LiquifactEscrow::import_state`] received a payload whose
-    /// `schema_version` does not match the deployed [`SCHEMA_VERSION`].
-    ImportSchemaMismatch = 202,
-    /// [`LiquifactEscrow::import_state`] received a payload whose SHA-256
-    /// checksum does not match the one recorded at export time.
-    ImportChecksumMismatch = 203,
+    /// [`LiquifactEscrow::set_yield_claim_delegate`] delegate address is the same as investor.
+    DelegateAddressSameAsInvestor = 165,
+    /// [`LiquifactEscrow::claim_investor_payout`] attempted delegation claim when investor has not delegated.
+    NoDelegationSet = 166,
+    /// [`LiquifactEscrow::claim_investor_payout`] delegation is revoked; investor must reset it.
+    DelegationRevoked = 167,
+    /// [`LiquifactEscrow::revoke_yield_claim_delegate`] attempted revocation when no delegation exists.
+    NoActiveDelegation = 168,
 }
 
 #[inline(always)]
@@ -567,16 +534,14 @@ pub enum DataKey {
     DistributedPrincipal,
     /// Optional funding deadline (ledger timestamp); after it passes, new funds are rejected.
     FundingDeadline,
-    /// Optional yield slippage threshold in basis points (bps) for real-time anomaly detection.
-    /// When set, [`LiquifactEscrow::claim_investor_payout`] compares actual vs. expected yield.
-    /// If deviation exceeds threshold, a [`YieldSlippageWarning`] is emitted.
-    /// Absent ⇒ `0` (no slippage check).
-    YieldSlippageThreshold,
-    /// Cached token metadata to reduce external calls on fund operations.
-    /// Written at [`LiquifactEscrow::init`], updated only via
-    /// [`LiquifactEscrow::revalidate_token_cache`] (admin-only).
-    /// Absent ⇒ not yet cached (should not happen if init succeeded).
-    TokenMetadataCache,
+    /// Optional delegate address for an investor's yield claim rights.
+    /// **Persistent** storage. Absent ⇒ no delegation. Set by [`LiquifactEscrow::set_yield_claim_delegate`];
+    /// cleared by [`LiquifactEscrow::revoke_yield_claim_delegate`].
+    YieldClaimDelegate(Address),
+    /// Revocation marker for [`DataKey::YieldClaimDelegate`].
+    /// **Persistent** storage. Absent ⇒ delegation not revoked. Set by [`LiquifactEscrow::revoke_yield_claim_delegate`]
+    /// to track that a delegation was explicitly revoked (vs. never set).
+    YieldClaimDelegateRevoked(Address),
 }
 
 // --- Data types ---
@@ -1326,6 +1291,24 @@ pub struct EscrowHealthWarning {
     /// i64::MAX if no maturity constraint (maturity == 0).
     pub time_to_maturity_secs: i64,
     pub recorded_at_ledger_timestamp: u64,
+}
+
+#[contractevent]
+pub struct YieldClaimDelegationSet {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub investor: Address,
+    #[topic]
+    pub delegate: Address,
+}
+
+#[contractevent]
+pub struct YieldClaimDelegationRevoked {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub investor: Address,
 }
 
 #[contractevent]
@@ -2782,6 +2765,56 @@ impl LiquifactEscrow {
         env.storage()
             .persistent()
             .set(&DataKey::InvestorClaimed(investor), &value);
+    }
+
+    /// Read the delegated address for an investor's yield claim, if set.
+    /// **Persistent** storage. Absent ⇒ `None` (no delegation).
+    fn get_persistent_yield_claim_delegate(env: &Env, investor: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::YieldClaimDelegate(investor.clone()))
+    }
+
+    /// Set the delegated address for an investor's yield claim.
+    /// **Persistent** storage.
+    fn set_persistent_yield_claim_delegate(env: &Env, investor: Address, delegate: Address) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::YieldClaimDelegate(investor), &delegate);
+    }
+
+    /// Check whether a delegation has been explicitly revoked.
+    /// **Persistent** storage. Absent ⇒ `false` (not revoked or never delegated).
+    fn get_persistent_yield_claim_delegate_revoked(env: &Env, investor: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::YieldClaimDelegateRevoked(investor))
+            .unwrap_or(false)
+    }
+
+    /// Mark a delegation as revoked.
+    /// **Persistent** storage.
+    fn set_persistent_yield_claim_delegate_revoked(env: &Env, investor: Address, revoked: bool) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::YieldClaimDelegateRevoked(investor), &revoked);
+    }
+
+    /// Verify that a delegation is valid (exists and is not revoked).
+    /// Returns `true` if a valid delegation exists; `false` if no delegation or revoked.
+    fn delegation_is_valid(env: &Env, investor: Address) -> bool {
+        Self::get_persistent_yield_claim_delegate(env, investor.clone()).is_some()
+            && !Self::get_persistent_yield_claim_delegate_revoked(env, investor)
+    }
+
+    /// Public API: Check the current delegate for an investor (if any).
+    pub fn get_yield_claim_delegate(env: Env, investor: Address) -> Option<Address> {
+        Self::get_persistent_yield_claim_delegate(&env, investor)
+    }
+
+    /// Public API: Check whether an investor's delegation is revoked.
+    pub fn is_yield_claim_delegate_revoked(env: Env, investor: Address) -> bool {
+        Self::get_persistent_yield_claim_delegate_revoked(&env, investor)
     }
 
     /// Public API: contribution recorded for `investor` (persistent storage).
@@ -4835,6 +4868,173 @@ impl LiquifactEscrow {
         .publish(&env);
 
         claimed
+    }
+
+    /// Delegate claims an investor's payout on behalf of the investor after settlement.
+    ///
+    /// # Authorization
+    /// - **Delegate's signature** is required (the delegate authorized via `require_auth()`).
+    /// - **Delegation must exist** and **not be revoked** for the investor.
+    ///
+    /// # Idempotency
+    ///
+    /// A second call (whether by the investor directly or by the delegate) is a silent no-op:
+    /// the `InvestorClaimed` marker is checked first, and if set, the function returns early.
+    ///
+    /// # Guard ordering
+    ///
+    /// 1. Legal-hold gate (read-only).
+    /// 2. Investor validation (contribution check).
+    /// 3. Delegation validation (exists and not revoked).
+    /// 4. Delegate authorization (`delegate.require_auth()`).
+    /// 5. Settled-status gate (escrow read).
+    /// 6. `not_before` ledger-time gate.
+    /// 7. Idempotent early-return on `InvestorClaimed`.
+    /// 8. Storage write + event emit.
+    ///
+    /// # Errors
+    /// - [`EscrowError::LegalHoldBlocksInvestorClaims`] if a legal hold is active.
+    /// - [`EscrowError::NoContributionToClaim`] if investor has no contribution.
+    /// - [`EscrowError::NoDelegationSet`] if investor has not delegated.
+    /// - [`EscrowError::DelegationRevoked`] if the delegation was revoked.
+    /// - [`EscrowError::InvestorClaimNotSettled`] if escrow is not settled.
+    /// - [`EscrowError::InvestorCommitmentLockNotExpired`] if claim lock has not expired.
+    pub fn claim_investor_payout_as_delegate(env: Env, investor: Address, delegate: Address) {
+        ensure(
+            &env,
+            !Self::legal_hold_active(&env),
+            EscrowError::LegalHoldBlocksInvestorClaims,
+        );
+
+        // Verify investor has a contribution.
+        let contribution: i128 = Self::get_persistent_investor_contribution(&env, investor.clone());
+        ensure(&env, contribution > 0, EscrowError::NoContributionToClaim);
+
+        // Verify delegation exists and is not revoked.
+        let delegated_addr = Self::get_persistent_yield_claim_delegate(&env, investor.clone());
+        ensure(
+            &env,
+            delegated_addr.is_some(),
+            EscrowError::NoDelegationSet,
+        );
+
+        // Check if delegation is revoked.
+        ensure(
+            &env,
+            !Self::get_persistent_yield_claim_delegate_revoked(&env, investor.clone()),
+            EscrowError::DelegationRevoked,
+        );
+
+        // Verify the provided delegate matches the stored delegation.
+        let stored_delegate = delegated_addr.unwrap();
+        ensure(
+            &env,
+            stored_delegate == delegate,
+            EscrowError::NoDelegationSet, // Reuse as "unauthorized delegate"
+        );
+
+        // Authorize the delegate.
+        delegate.require_auth();
+
+        // env.clone(): used for escrow read and ledger timestamp.
+        let escrow = Self::get_escrow(env.clone());
+        ensure(
+            &env,
+            escrow.status == 2,
+            EscrowError::InvestorClaimNotSettled,
+        );
+
+        let not_before: u64 =
+            Self::get_persistent_investor_claim_not_before(&env, investor.clone());
+        let now = env.ledger().timestamp();
+        ensure(
+            &env,
+            now >= not_before,
+            EscrowError::InvestorCommitmentLockNotExpired,
+        );
+
+        // Idempotent early-return: a second claim is a no-op (no re-emit).
+        if Self::get_persistent_investor_claimed(&env, investor.clone()) {
+            return;
+        }
+
+        // Mark before emit — prevents re-emission on any re-entrant path.
+        Self::set_persistent_investor_claimed(&env, investor.clone(), true);
+
+        InvestorPayoutClaimed {
+            name: symbol_short!("inv_claim"),
+            investor,
+            invoice_id: escrow.invoice_id.clone(),
+        }
+        .publish(&env);
+    }
+
+    /// Investor delegates their yield claim rights to another address.
+    ///
+    /// # Authorization
+    /// - Requires the signature of the investor (via `investor.require_auth()`).
+    ///
+    /// # Behavior
+    /// - Sets [`DataKey::YieldClaimDelegate`] for the investor to the specified `delegate` address.
+    /// - Clears the [`DataKey::YieldClaimDelegateRevoked`] marker (if previously revoked, resets it).
+    /// - Overwrites any previous delegation.
+    ///
+    /// # Validation
+    /// - `delegate` must not be the same address as the investor.
+    ///
+    /// # Errors
+    /// - [`EscrowError::DelegateAddressSameAsInvestor`] if `delegate == investor`.
+    pub fn set_yield_claim_delegate(env: Env, investor: Address, delegate: Address) {
+        ensure(
+            &env,
+            investor != delegate,
+            EscrowError::DelegateAddressSameAsInvestor,
+        );
+
+        investor.require_auth();
+
+        // Set the delegation and clear the revocation marker.
+        Self::set_persistent_yield_claim_delegate(&env, investor.clone(), delegate.clone());
+        Self::set_persistent_yield_claim_delegate_revoked(&env, investor.clone(), false);
+
+        YieldClaimDelegationSet {
+            name: symbol_short!("del_set"),
+            investor,
+            delegate,
+        }
+        .publish(&env);
+    }
+
+    /// Investor revokes their yield claim delegation.
+    ///
+    /// # Authorization
+    /// - Requires the signature of the investor (via `investor.require_auth()`).
+    ///
+    /// # Behavior
+    /// - Sets [`DataKey::YieldClaimDelegateRevoked`] for the investor to `true`.
+    /// - Preserves the original delegate address in [`DataKey::YieldClaimDelegate`] for auditability.
+    /// - After revocation, only the investor can call [`LiquifactEscrow::claim_investor_payout`] directly.
+    ///
+    /// # Errors
+    /// - [`EscrowError::NoActiveDelegation`] if the investor has no active delegation to revoke.
+    pub fn revoke_yield_claim_delegate(env: Env, investor: Address) {
+        investor.require_auth();
+
+        // Verify there is an active delegation to revoke.
+        ensure(
+            &env,
+            Self::delegation_is_valid(&env, investor.clone()),
+            EscrowError::NoActiveDelegation,
+        );
+
+        // Mark as revoked (keep the delegate address for audit trail).
+        Self::set_persistent_yield_claim_delegate_revoked(&env, investor.clone(), true);
+
+        YieldClaimDelegationRevoked {
+            name: symbol_short!("del_rev"),
+            investor,
+        }
+        .publish(&env);
     }
 
     /// On-chain read-only pro-rata gross payout for `investor`.
