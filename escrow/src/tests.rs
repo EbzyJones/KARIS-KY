@@ -45,10 +45,12 @@ pub(crate) fn assert_contract_error<T, E>(
 mod admin;
 mod attestations;
 mod cap_validation;
+mod chaos;
 mod coverage;
 mod delta_snapshots;
 mod external_calls;
 mod external_calls_mocked;
+mod validation;
 mod funding;
 mod health_warnings;
 mod init;
@@ -56,6 +58,7 @@ mod integration;
 mod legal_hold;
 mod properties;
 mod settlement;
+mod snapshots;
 
 /// Registers a new escrow contract instance and returns its contract id.
 pub fn deploy_id(env: &Env) -> Address {
@@ -135,7 +138,8 @@ pub fn default_init(client: &LiquifactEscrowClient<'_>, env: &Env, admin: &Addre
         &None,
         &None,
         &None,
-        &None, // No funding deadline
+        &None, // No yield slippage threshold
+        &None, // No settlement notifier
     );
 }
 
@@ -180,7 +184,8 @@ pub fn init_and_fund_with_real_token<'a>(
         &None,
         &None,
         &None,
-        &None,
+        &None, // No yield slippage threshold
+        &None, // No settlement notifier
     );
 
     let investor = Address::generate(env);
