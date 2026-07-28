@@ -9,8 +9,8 @@
 #[allow(unused_imports)]
 use super::{
     AttestationDigestRevoked, CollateralRecordedEvt, DataKey, EscrowError, EscrowFunded,
-    EscrowInitialized, FundingTargetUpdated, LiquifactEscrow, LiquifactEscrowClient,
-    MaxUniqueInvestorsCapLowered, YieldTier, MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT,
+    EscrowHealthWarning, EscrowInitialized, FundingTargetUpdated, LiquifactEscrow, LiquifactEscrowClient,
+    MaxUniqueInvestorsCapLowered, SnapshotDelta, YieldTier, MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT,
     MAX_FUND_BATCH, SCHEMA_VERSION,
 };
 use soroban_sdk::{
@@ -46,9 +46,11 @@ mod admin;
 mod attestations;
 mod cap_validation;
 mod coverage;
+mod delta_snapshots;
 mod external_calls;
 mod external_calls_mocked;
 mod funding;
+mod health_warnings;
 mod init;
 mod integration;
 mod legal_hold;
