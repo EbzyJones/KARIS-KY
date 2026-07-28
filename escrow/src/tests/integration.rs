@@ -902,12 +902,14 @@ fn withdraw_transfers_funded_amount_to_sme() {
     env.mock_all_auths();
 
     let target = 50_000_000i128;
-    let (client, escrow_id, token, sme) =
-        setup_withdraw_with_token(&env, target, "WD_BAL001");
+    let (client, escrow_id, token, sme) = setup_withdraw_with_token(&env, target, "WD_BAL001");
 
     let sme_before = token.balance(&sme);
     let contract_before = token.balance(&escrow_id);
-    assert_eq!(contract_before, target, "escrow must hold exactly funded_amount before withdraw");
+    assert_eq!(
+        contract_before, target,
+        "escrow must hold exactly funded_amount before withdraw"
+    );
 
     client.withdraw();
 
@@ -923,7 +925,11 @@ fn withdraw_transfers_funded_amount_to_sme() {
         contract_after, 0,
         "escrow contract balance must be zero after disbursement"
     );
-    assert_eq!(client.get_escrow().status, 3u32, "status must be 3 after withdraw");
+    assert_eq!(
+        client.get_escrow().status,
+        3u32,
+        "status must be 3 after withdraw"
+    );
 }
 
 /// `withdraw` increments `DistributedPrincipal` by `funded_amount`.
@@ -933,8 +939,7 @@ fn withdraw_updates_distributed_principal() {
     env.mock_all_auths();
 
     let target = 20_000_000i128;
-    let (client, _escrow_id, _token, _sme) =
-        setup_withdraw_with_token(&env, target, "WD_DP001");
+    let (client, _escrow_id, _token, _sme) = setup_withdraw_with_token(&env, target, "WD_DP001");
 
     client.withdraw();
 
@@ -1074,8 +1079,7 @@ fn withdraw_event_includes_recipient() {
     env.mock_all_auths();
 
     let target = 5_000_000i128;
-    let (client, escrow_id, _token, sme) =
-        setup_withdraw_with_token(&env, target, "WD_EV001");
+    let (client, escrow_id, _token, sme) = setup_withdraw_with_token(&env, target, "WD_EV001");
 
     client.withdraw();
 
@@ -1090,9 +1094,9 @@ fn withdraw_event_includes_recipient() {
     .to_xdr(&env, &escrow_id);
 
     let all_events = env.events().all().filter_by_contract(&escrow_id);
-    let found = all_events
-        .events()
-        .iter()
-        .any(|e| *e == expected_xdr);
-    assert!(found, "SmeWithdrew event with correct recipient and amount must be emitted");
+    let found = all_events.events().iter().any(|e| *e == expected_xdr);
+    assert!(
+        found,
+        "SmeWithdrew event with correct recipient and amount must be emitted"
+    );
 }
