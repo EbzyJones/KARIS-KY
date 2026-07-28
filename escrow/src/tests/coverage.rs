@@ -2,7 +2,10 @@ use super::{
     free_addresses, install_stellar_asset_token, setup, MAX_ATTESTATION_APPEND_ENTRIES,
     SCHEMA_VERSION,
 };
-use crate::{CollateralCommitmentSnapshot, DataKey, EscrowCloseSnapshot, EscrowError, YieldTier};
+use crate::{
+    CollateralCommitmentSnapshot, DataKey, EscrowCloseSnapshot, EscrowError, EscrowHealthMetrics,
+    YieldTier, FundReceived, AdminChanged, LegalHoldSet, EscrowPaused,
+};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     Address, BytesN, Env, Error, InvokeError, Vec as SorobanVec,
@@ -209,8 +212,12 @@ fn escrow_error_discriminants_match_canonical_table() {
         (EscrowError::NewSmeSameAsCurrent, 162),
         (EscrowError::FundingDeadlinePassed, 164),
         (EscrowError::NoPendingAdmin, 163),
+        (EscrowError::InvestorStillInLockIn, 165),
+        (EscrowError::ConcentrationLimitExceeded, 166),
+        (EscrowError::ConcentrationInvalidRange, 167),
+        (EscrowError::LegalHoldReasonTooLong, 168),
     ];
-    assert_eq!(TABLE.len(), 84);
+    assert_eq!(TABLE.len(), 88);
     for (variant, code) in TABLE {
         assert_eq!(*variant as u32, *code, "discriminant drift for code {code}");
     }
@@ -403,7 +410,7 @@ fn typed_error_codes_cover_range_boundaries() {
         EscrowError::PrimaryAttestationAlreadyBound,
     );
     for i in 0u8..MAX_ATTESTATION_APPEND_ENTRIES as u8 {
-        attest_client.append_attestation_digest(&BytesN::from_array(&env, &[i; 32]));
+        attest_client.append_attestation_digest(&symbol_short!(""), &BytesN::from_array(&env, &[i; 32]));
     }
     assert_contract_error(
         attest_client.try_append_attestation_digest(&BytesN::from_array(&env, &[0xFF; 32])),
@@ -622,12 +629,12 @@ fn typed_error_codes_cover_range_boundaries() {
     );
     lh_client.set_legal_hold(&true);
     assert_contract_error(
-        lh_client.try_set_legal_hold(&false),
+        lh_client.try_set_legal_hold(&false, &String::from_str(&env, "")),
         EscrowError::LegalHoldClearRequestMissing,
     );
     lh_client.request_clear_legal_hold();
     assert_contract_error(
-        lh_client.try_set_legal_hold(&false),
+        lh_client.try_set_legal_hold(&false, &String::from_str(&env, "")),
         EscrowError::LegalHoldClearNotReady,
     );
 
@@ -962,7 +969,7 @@ fn test_fund_during_legal_hold() {
         &None,
     );
 
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     let investor = Address::generate(&env);
     client.fund(&investor, &10);
 }
@@ -1100,7 +1107,7 @@ fn test_all_getters() {
     assert_eq!(client.get_funding_token(), funding_token);
     assert_eq!(client.get_treasury(), treasury);
     assert_eq!(client.get_registry_ref(), Some(registry));
-    assert_eq!(client.get_version(), 6);
+    assert_eq!(client.get_version(), 7);
     assert!(!client.get_legal_hold());
     assert_eq!(client.get_min_contribution_floor(), 10);
     assert_eq!(client.get_max_unique_investors_cap(), Some(5));
@@ -1142,7 +1149,7 @@ fn test_attestations_happy_path() {
     client.bind_primary_attestation_hash(&hash1);
     assert_eq!(client.get_primary_attestation_hash(), Some(hash1.clone()));
 
-    client.append_attestation_digest(&hash2);
+    client.append_attestation_digest(&symbol_short!(""), &hash2);
     let log = client.get_attestation_append_log();
     assert_eq!(log.len(), 1);
     assert_eq!(log.get(0).unwrap(), hash2);
@@ -1695,7 +1702,7 @@ fn test_clear_legal_hold_convenience() {
         &None,
     );
 
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(client.get_legal_hold());
     client.clear_legal_hold();
     assert!(!client.get_legal_hold());
@@ -2235,7 +2242,7 @@ fn test_get_escrow_summary_happy_path() {
     assert_eq!(summary.funding_close_snapshot, EscrowCloseSnapshot::None);
     assert_eq!(summary.unique_funder_count, 0);
     assert!(!summary.is_allowlist_active);
-    assert_eq!(summary.schema_version, 6);
+    assert_eq!(summary.schema_version, 7);
     assert_eq!(
         summary.sme_collateral_commitment,
         CollateralCommitmentSnapshot::None
@@ -2278,7 +2285,7 @@ fn test_get_escrow_summary_after_state_changes() {
     client.set_investor_allowlisted(&investor, &true);
     // Fund enough to trigger funded status and capture snapshot
     client.fund(&investor, &1000);
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
 
     let summary = client.get_escrow_summary();
 
@@ -2377,8 +2384,8 @@ fn test_get_escrow_summary_with_collateral_and_attestations() {
     // Append several attestation digests
     let hash2 = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
     let hash3 = soroban_sdk::BytesN::from_array(&env, &[3u8; 32]);
-    client.append_attestation_digest(&hash2);
-    client.append_attestation_digest(&hash3);
+    client.append_attestation_digest(&symbol_short!(""), &hash2);
+    client.append_attestation_digest(&symbol_short!(""), &hash3);
 
     let summary = client.get_escrow_summary();
 
@@ -2639,7 +2646,7 @@ fn test_is_settleable_blocked_by_legal_hold() {
     let (client, admin, sme) = setup(&env);
     init_settleable_test(&env, &client, &admin, &sme, 0);
     fund_to_target_stl(&env, &client);
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(!client.is_settleable());
 }
 
@@ -2686,7 +2693,7 @@ fn test_is_settleable_funded_maturity_zero_hold_active_returns_false() {
     let (client, admin, sme) = setup(&env);
     init_settleable_test(&env, &client, &admin, &sme, 0);
     fund_to_target_stl(&env, &client);
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(
         !client.is_settleable(),
         "hold must block settleability even when maturity is 0"

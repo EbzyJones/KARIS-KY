@@ -9,8 +9,8 @@
 #[allow(unused_imports)]
 use super::{
     AttestationDigestRevoked, CollateralRecordedEvt, DataKey, EscrowError, EscrowFunded,
-    EscrowInitialized, FundingTargetUpdated, LiquifactEscrow, LiquifactEscrowClient,
-    MaxUniqueInvestorsCapLowered, YieldSlippageWarning, YieldTier, MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT,
+    EscrowHealthWarning, EscrowInitialized, FundingTargetUpdated, LiquifactEscrow, LiquifactEscrowClient,
+    MaxUniqueInvestorsCapLowered, SnapshotDelta, YieldTier, MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT,
     MAX_FUND_BATCH, SCHEMA_VERSION,
 };
 use soroban_sdk::{
@@ -44,17 +44,24 @@ pub(crate) fn assert_contract_error<T, E>(
 // modules stay assertion-focused and each test still owns a fresh Env.
 mod admin;
 mod attestations;
+mod batch_claim;
 mod cap_validation;
+mod chaos;
 mod coverage;
+mod e2e;
 mod external_calls;
 mod external_calls_mocked;
 mod validation;
 mod funding;
+mod health_and_events;
 mod init;
 mod integration;
 mod legal_hold;
 mod properties;
+mod regressions;
 mod settlement;
+mod state_inconsistency;
+mod token_cache;
 mod yield_slippage;
 
 /// Registers a new escrow contract instance and returns its contract id.
@@ -178,6 +185,9 @@ pub fn init_and_fund_with_real_token<'a>(
         &treasury,
         &None,
         &None,
+        &None,
+        &None,
+        &None,        &None,
         &None,
         &None,
         &None,

@@ -65,11 +65,11 @@ fn test_legal_hold_midflow_blocks_and_resumes_with_ordered_events() {
     // capture it for auth mock setup.
 
     // --- Phase 1: enable hold, see it reflected ---
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(client.get_legal_hold());
 
     // --- Phase 2: clear hold ---
-    client.set_legal_hold(&false);
+    client.set_legal_hold(&false, &String::from_str(&env, ""));
     assert!(!client.get_legal_hold());
 
     // --- Phase 3: fund (hold is off) ---
@@ -77,11 +77,11 @@ fn test_legal_hold_midflow_blocks_and_resumes_with_ordered_events() {
     assert_eq!(client.get_escrow().funded_amount, 100_000_000);
 
     // --- Phase 4: enable hold mid-stream (post-fund, pre-settle) ---
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(client.get_legal_hold());
 
     // --- Phase 5: clear hold, settle ---
-    client.set_legal_hold(&false);
+    client.set_legal_hold(&false, &String::from_str(&env, ""));
     assert!(!client.get_legal_hold());
 
     // --- Phase 6: settle ---
@@ -89,11 +89,11 @@ fn test_legal_hold_midflow_blocks_and_resumes_with_ordered_events() {
     assert_eq!(client.get_escrow().status, 2);
 
     // --- Phase 7: enable hold again after settlement ---
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(client.get_legal_hold());
 
     // --- Phase 8: clear hold for cleanup ---
-    client.set_legal_hold(&false);
+    client.set_legal_hold(&false, &String::from_str(&env, ""));
     assert!(!client.get_legal_hold());
 
     // --- Event verification ---
@@ -765,7 +765,7 @@ fn test_legal_hold_midflow_blocks_then_resumes_with_ordered_events() {
     assert_eq!(open_state.status, 0);
 
     // Hold on: next funding + settle attempts must be blocked.
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(client.get_legal_hold());
 
     let fund_blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -902,12 +902,14 @@ fn withdraw_transfers_funded_amount_to_sme() {
     env.mock_all_auths();
 
     let target = 50_000_000i128;
-    let (client, escrow_id, token, sme) =
-        setup_withdraw_with_token(&env, target, "WD_BAL001");
+    let (client, escrow_id, token, sme) = setup_withdraw_with_token(&env, target, "WD_BAL001");
 
     let sme_before = token.balance(&sme);
     let contract_before = token.balance(&escrow_id);
-    assert_eq!(contract_before, target, "escrow must hold exactly funded_amount before withdraw");
+    assert_eq!(
+        contract_before, target,
+        "escrow must hold exactly funded_amount before withdraw"
+    );
 
     client.withdraw();
 
@@ -923,7 +925,11 @@ fn withdraw_transfers_funded_amount_to_sme() {
         contract_after, 0,
         "escrow contract balance must be zero after disbursement"
     );
-    assert_eq!(client.get_escrow().status, 3u32, "status must be 3 after withdraw");
+    assert_eq!(
+        client.get_escrow().status,
+        3u32,
+        "status must be 3 after withdraw"
+    );
 }
 
 /// `withdraw` increments `DistributedPrincipal` by `funded_amount`.
@@ -933,8 +939,7 @@ fn withdraw_updates_distributed_principal() {
     env.mock_all_auths();
 
     let target = 20_000_000i128;
-    let (client, _escrow_id, _token, _sme) =
-        setup_withdraw_with_token(&env, target, "WD_DP001");
+    let (client, _escrow_id, _token, _sme) = setup_withdraw_with_token(&env, target, "WD_DP001");
 
     client.withdraw();
 
@@ -958,7 +963,7 @@ fn withdraw_blocked_by_legal_hold_integration() {
     let (client, _escrow_id, _token, _sme) =
         setup_withdraw_with_token(&env, 10_000_000i128, "WD_LH001");
 
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     client.withdraw(); // must panic: LegalHoldBlocksWithdrawal
 }
 
@@ -1074,8 +1079,7 @@ fn withdraw_event_includes_recipient() {
     env.mock_all_auths();
 
     let target = 5_000_000i128;
-    let (client, escrow_id, _token, sme) =
-        setup_withdraw_with_token(&env, target, "WD_EV001");
+    let (client, escrow_id, _token, sme) = setup_withdraw_with_token(&env, target, "WD_EV001");
 
     client.withdraw();
 
@@ -1090,9 +1094,9 @@ fn withdraw_event_includes_recipient() {
     .to_xdr(&env, &escrow_id);
 
     let all_events = env.events().all().filter_by_contract(&escrow_id);
-    let found = all_events
-        .events()
-        .iter()
-        .any(|e| *e == expected_xdr);
-    assert!(found, "SmeWithdrew event with correct recipient and amount must be emitted");
+    let found = all_events.events().iter().any(|e| *e == expected_xdr);
+    assert!(
+        found,
+        "SmeWithdrew event with correct recipient and amount must be emitted"
+    );
 }

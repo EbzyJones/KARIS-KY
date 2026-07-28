@@ -39,10 +39,13 @@ Codes are grouped by domain so SDKs can map coarse categories without parsing va
 | Legal-hold clear (two-phase) | 150–152 | Delayed compliance-hold lift workflow | 150, 152 |
 | Beneficiary rotation | 160–162 | Governed SME address rotation | 160, 162 |
 | Admin handover / funding deadline | 163–164 | `accept_admin` and post-deadline funding | 163, 164 |
+| State snapshots | 170–172 | Named state snapshots for recovery and rollback | 170, 172 |
 
 See also [`docs/escrow-legal-hold.md`](escrow-legal-hold.md),
-[`docs/ESCROW_BENEFICIARY_ROTATION.md`](ESCROW_BENEFICIARY_ROTATION.md), and
-[`docs/adr/ADR-006-dust-sweep-and-token-safety.md`](adr/ADR-006-dust-sweep-and-token-safety.md).
+[`docs/ESCROW_BENEFICIARY_ROTATION.md`](ESCROW_BENEFICIARY_ROTATION.md),
+[`docs/escrow-state-snapshots.md`](escrow-state-snapshots.md),
+[`docs/adr/ADR-006-dust-sweep-and-token-safety.md`](adr/ADR-006-dust-sweep-and-token-safety.md), and
+[`docs/adr/ADR-008-state-snapshots.md`](adr/ADR-008-state-snapshots.md).
 
 ## Canonical Reference Table
 
@@ -132,6 +135,9 @@ See also [`docs/escrow-legal-hold.md`](escrow-legal-hold.md),
 | 162 | `NewSmeSameAsCurrent` | `rotate_beneficiary` | `new_sme == current sme_address` | Pass a different beneficiary | typed |
 | 163 | `NoPendingAdmin` | `accept_admin` | no pending admin nomination stored | Call `propose_admin` first | typed |
 | 164 | `FundingDeadlinePassed` | `init`, `fund`, `fund_with_commitment`, `fund_batch` | `funding_deadline` configured and `ledger.timestamp()` past deadline | Funding window closed; do not retry deposits | typed |
+| 170 | `InvalidSnapshotName` | `create_state_snapshot`, `revert_to_snapshot` | snapshot name is empty, too long (>32 chars), or contains disallowed characters | Use 1–32 alphanumeric + `_` | typed |
+| 171 | `SnapshotStorageCapacityReached` | `create_state_snapshot` | number of snapshots already at [`MAX_STATE_SNAPSHOTS = 16`] | Delete or archive unused snapshots | typed |
+| 172 | `SnapshotNotFound` | `revert_to_snapshot` | snapshot name does not exist | Check snapshot name spelling; verify snapshot was created | typed |
 
 ### Legacy panic strings (migration aid)
 
