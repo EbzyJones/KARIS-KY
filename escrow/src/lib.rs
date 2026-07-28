@@ -398,12 +398,7 @@ pub enum EscrowError {
     NoPendingAdmin = 163,
     /// The contract's funding-token balance is less than `funded_amount` at withdraw time.
     /// Funds must be custodied in this contract before the SME can pull them.
-    InsufficientContractBalance = 164,
-
-    /// [`LiquifactEscrow::clone_settled_escrow`] called on escrow that is not settled.
-    CloneNotSettled = 170,
-    /// [`LiquifactEscrow::clone_settled_escrow`] received a non-positive invoice amount.
-    CloneAmountNotPositive = 171,
+    InsufficientContractBalance = 165,
 }
 
 #[inline(always)]
@@ -5669,356 +5664,224 @@ impl LiquifactEscrow {
             .unwrap_or(0)
     }
 
-    // -----------------------------------------------------------------------
-    // State export / import
-    // -----------------------------------------------------------------------
+    // ============================================================================
+    // Simulation Entrypoints (Dry-Run, Non-State-Changing)
+    // ============================================================================
+    //
+    // These entrypoints allow wallets and UIs to preview the outcome of state-changing
+    // operations without actually committing the changes to the ledger. They are read-only
+    // and do not require authorization from the investor or SME.
+    //
+    // **Important:** Simulation results may differ from actual results if:
+    // - Ledger state changes between simulation and invocation (e.g., new funding, maturity reached)
+    // - Legal holds are activated or cleared
+    // - Token balances or contract state are modified
+    //
+    // Simulations are for preview purposes only and must not be relied upon for
+    // correctness guarantees.
 
-    /// Serialize all enumerable instance-storage state into an [`EscrowStateExport`]
-    /// for disaster-recovery or network-migration purposes.
+    /// **Dry-run:** Preview the escrow state after a funding deposit (without persisting).
     ///
-    /// # ⚠️ Security warnings
+    /// Returns the escrow state that would result from calling [`LiquifactEscrow::fund`]
+    /// with the same `investor` and `amount`, performing all guard checks but NOT modifying
+    /// storage, transferring tokens, or emitting events.
     ///
-    /// - **Admin only.** The export contains sensitive configuration (admin address,
-    ///   treasury, funding token, attestations). Treat it with the same confidentiality
-    ///   as the admin signing key.
-    /// - **Not a complete backup.** Per-investor persistent-storage keys
-    ///   (`InvestorContribution`, `InvestorEffectiveYield`, `InvestorClaimNotBefore`,
-    ///   `InvestorClaimed`, `InvestorAllowlisted`, `InvestorRefunded`) are **not**
-    ///   enumerable and are therefore **absent** from the export. Operators must
-    ///   recover per-investor state separately using the read-only view entrypoints.
-    ///   See `docs/escrow-state-export-import.md`.
-    /// - **Replay risk.** The export is a plain data struct — importing it on a
-    ///   different contract instance effectively clones the escrow state. Ensure the
-    ///   target instance is on the correct network and belongs to a trusted deployment.
-    /// - **Checksum is not a signature.** The SHA-256 checksum detects accidental
-    ///   corruption but does not prevent a malicious actor with admin key access from
-    ///   crafting a modified export with a matching checksum. Use governance controls
-    ///   (multisig admin) to protect import authority.
+    /// # Parameters
+    /// - `investor`: The address that would fund
+    /// - `amount`: The funding amount (in base units)
     ///
-    /// # Checksum
-    ///
-    /// The `checksum` field is SHA-256 over the following concatenation
-    /// (all values big-endian, no delimiters):
-    ///
-    /// ```text
-    /// version(4 bytes) || funded_amount(16 bytes) || funding_target(16 bytes)
-    ///   || yield_bps(8 bytes) || status(4 bytes) || maturity(8 bytes)
-    ///   || exported_at(8 bytes)
-    /// ```
-    ///
-    /// This is a lightweight integrity check over the most critical numeric fields.
-    /// It prevents accidental truncation or byte-flip corruption from going undetected
-    /// at import time. It is not a cryptographic commitment over the full export.
-    ///
-    /// # Authorization
-    /// Requires current [`InvoiceEscrow::admin`] auth.
+    /// # Returns
+    /// The resulting [`InvoiceEscrow`] state if the funding were to succeed.
     ///
     /// # Errors
-    /// - [`EscrowError::ExportNotInitialized`] if the escrow has not been initialized.
-    pub fn export_state(env: Env) -> EscrowStateExport {
-        // Auth before read so the escrow snapshot is covered by the auth guard.
-        let escrow = Self::load_escrow_require_admin(&env);
+    /// Emits the same typed [`EscrowError`] codes as [`LiquifactEscrow::fund`]:
+    /// - Non-positive amount, legal hold, closed/settled escrow, allowlist rejection,
+    ///   capacity exhaustion, overflow guards, funding deadline, etc.
+    ///
+    /// # Differences from [`LiquifactEscrow::fund`]
+    /// - No `require_auth()` — accessible by any caller
+    /// - No storage writes (contribution tracking unchanged)
+    /// - No token transfers
+    /// - No event emission
+    /// - Returns the projected escrow state for inspection
+    ///
+    /// # Use Cases
+    /// - Wallet UI preview before user confirmation
+    /// - Off-chain script to validate funding feasibility
+    /// - Test coverage without state mutations
+    pub fn simulate_fund(env: Env, investor: Address, amount: i128) -> InvoiceEscrow {
+        // Guard checks (same as fund_impl)
+        ensure(&env, amount > 0, EscrowError::FundingAmountNotPositive);
 
-        let exported_at = env.ledger().timestamp();
-        let version: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or(0);
-
-        let funding_token = Self::funding_token_or_fail(&env);
-        let treasury = Self::treasury_or_fail(&env);
-        let registry = Self::get_registry_ref(env.clone());
-
-        let yield_tiers: Option<Vec<YieldTier>> =
-            env.storage().instance().get(&DataKey::YieldTierTable);
-
-        let funding_close_snapshot: Option<FundingCloseSnapshot> =
-            env.storage().instance().get(&DataKey::FundingCloseSnapshot);
-
-        let min_contribution_floor: i128 = env
+        let floor: i128 = env
             .storage()
             .instance()
             .get(&DataKey::MinContributionFloor)
             .unwrap_or(0);
+        if floor > 0 {
+            ensure(
+                &env,
+                amount >= floor,
+                EscrowError::FundingBelowMinContribution,
+            );
+        }
 
-        let max_unique_investors_cap: Option<u32> =
-            env.storage().instance().get(&DataKey::MaxUniqueInvestorsCap);
+        let mut escrow = Self::get_escrow(env.clone());
 
-        let max_per_investor_cap: Option<i128> =
-            env.storage().instance().get(&DataKey::MaxPerInvestorCap);
+        ensure(
+            &env,
+            !Self::legal_hold_active(&env),
+            EscrowError::LegalHoldBlocksFunding,
+        );
+        ensure(
+            &env,
+            escrow.status == 0,
+            EscrowError::EscrowNotOpenForFunding,
+        );
 
-        let unique_funder_count: u32 = env
+        // Check funding deadline
+        if let Some(deadline) = env.storage().instance().get(&DataKey::FundingDeadline) {
+            ensure(
+                &env,
+                env.ledger().timestamp() <= deadline,
+                EscrowError::FundingDeadlinePassed,
+            );
+        }
+
+        if Self::is_allowlist_active(env.clone()) {
+            ensure(
+                &env,
+                Self::is_investor_allowlisted(env.clone(), investor.clone()),
+                EscrowError::InvestorNotAllowlisted,
+            );
+        }
+
+        let prev: i128 = Self::get_persistent_investor_contribution(&env, investor.clone());
+        let new_contribution: i128 = prev
+            .checked_add(amount)
+            .unwrap_or_else(|| fail(&env, EscrowError::InvestorContributionOverflow));
+
+        if let Some(cap) = env
             .storage()
             .instance()
-            .get(&DataKey::UniqueFunderCount)
-            .unwrap_or(0);
+            .get::<DataKey, i128>(&DataKey::MaxPerInvestorCap)
+        {
+            ensure(
+                &env,
+                new_contribution <= cap,
+                EscrowError::InvestorContributionExceedsCap,
+            );
+        }
 
-        let legal_hold: bool = Self::legal_hold_active(&env);
-        let legal_hold_clear_delay: u64 = Self::get_legal_hold_clear_delay(env.clone());
-        let legal_hold_clearable_at: Option<u64> =
-            env.storage().instance().get(&DataKey::LegalHoldClearableAt);
-
-        let allowlist_active: bool = Self::is_allowlist_active(env.clone());
-        let primary_attestation_hash: Option<BytesN<32>> =
-            Self::get_primary_attestation_hash(env.clone());
-        let attestation_log: Vec<BytesN<32>> = Self::get_attestation_append_log(env.clone());
-        let collateral: Option<SmeCollateralCommitment> =
-            Self::get_sme_collateral_commitment(env.clone());
-
-        let distributed_principal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::DistributedPrincipal)
-            .unwrap_or(0);
-
-        let funding_deadline: Option<u64> = Self::get_funding_deadline(env.clone());
-        let pending_admin: Option<Address> = Self::get_pending_admin(env.clone());
-
-        // Compute integrity checksum over key numeric fields.
-        // Layout (big-endian, no separators):
-        //   version(4) | funded_amount(16) | funding_target(16) | yield_bps(8)
-        //   | status(4) | maturity(8) | exported_at(8)
-        // Total: 64 bytes.
-        let checksum: BytesN<32> = {
-            let mut buf = [0u8; 64];
-            buf[0..4].copy_from_slice(&version.to_be_bytes());
-            buf[4..20].copy_from_slice(&escrow.funded_amount.to_be_bytes());
-            buf[20..36].copy_from_slice(&escrow.funding_target.to_be_bytes());
-            buf[36..44].copy_from_slice(&escrow.yield_bps.to_be_bytes());
-            buf[44..48].copy_from_slice(&escrow.status.to_be_bytes());
-            buf[48..56].copy_from_slice(&escrow.maturity.to_be_bytes());
-            buf[56..64].copy_from_slice(&exported_at.to_be_bytes());
-
-            let bytes = Bytes::from_slice(&env, &buf);
-            env.crypto().sha256(&bytes).into()
+        let cur_funder_count: u32 = if prev == 0 {
+            env.storage()
+                .instance()
+                .get(&DataKey::UniqueFunderCount)
+                .unwrap_or(0)
+        } else {
+            0
         };
 
-        StateExportedEvt {
-            name: symbol_short!("st_exp"),
-            invoice_id: escrow.invoice_id.clone(),
-            exported_at,
-            checksum: checksum.clone(),
-        }
-        .publish(&env);
-
-        EscrowStateExport {
-            schema_version: version,
-            exported_at,
-            escrow,
-            funding_token,
-            treasury,
-            registry,
-            yield_tiers,
-            funding_close_snapshot,
-            min_contribution_floor,
-            max_unique_investors_cap,
-            max_per_investor_cap,
-            unique_funder_count,
-            legal_hold,
-            legal_hold_clear_delay,
-            legal_hold_clearable_at,
-            allowlist_active,
-            primary_attestation_hash,
-            attestation_log,
-            collateral,
-            distributed_principal,
-            funding_deadline,
-            pending_admin,
-            checksum,
-        }
-    }
-
-    /// Restore instance-storage state from a previously exported [`EscrowStateExport`].
-    ///
-    /// # ⚠️ DANGER — Read before calling
-    ///
-    /// This entrypoint **unconditionally overwrites** all instance-storage keys on the
-    /// target contract. It is intended **exclusively** for:
-    ///
-    /// 1. **Disaster recovery** — restoring a contract whose ledger was lost or archived.
-    /// 2. **Network migration** — moving an escrow from one Soroban deployment to another
-    ///    (e.g. testnet → mainnet) with the same logical state.
-    ///
-    /// **Never call this in production as a routine operation.** Misuse can:
-    /// - Silently corrupt investor contributions if per-investor state has drifted.
-    /// - Reset a funded or settled escrow to an earlier status.
-    /// - Break the funding-close snapshot immutability invariant.
-    ///
-    /// # Per-investor state — your responsibility
-    ///
-    /// This entrypoint writes only the instance-storage subset of the export (the
-    /// `EscrowStateExport` struct). Per-investor persistent keys
-    /// (`InvestorContribution`, `InvestorEffectiveYield`, `InvestorClaimNotBefore`,
-    /// `InvestorClaimed`, `InvestorAllowlisted`, `InvestorRefunded`) are **not**
-    /// included in the export and must be re-imported separately. Call the source
-    /// contract's read entrypoints for each known investor address and write via a
-    /// privileged migration helper. See `docs/escrow-state-export-import.md`.
-    ///
-    /// # Preconditions (enforced with typed errors)
-    ///
-    /// | Condition | Error |
-    /// |-----------|-------|
-    /// | Target must not be initialized yet | [`EscrowError::ImportAlreadyInitialized`] |
-    /// | `export.schema_version` must equal [`SCHEMA_VERSION`] | [`EscrowError::ImportSchemaMismatch`] |
-    /// | Recomputed checksum must match `export.checksum` | [`EscrowError::ImportChecksumMismatch`] |
-    ///
-    /// # Authorization
-    /// Requires auth from the **admin address embedded in the export** (`export.escrow.admin`).
-    /// The target contract does not have a stored admin yet — the export admin authorizes the
-    /// bootstrap to prevent an unauthorized party from importing state with a different admin.
-    ///
-    /// # Errors
-    /// Emits typed [`EscrowError`] codes for the precondition violations above.
-    pub fn import_state(env: Env, export: EscrowStateExport) {
-        // Reject if the target instance already has state — import is bootstrap-only.
-        ensure(
-            &env,
-            !env.storage().instance().has(&DataKey::Escrow),
-            EscrowError::ImportAlreadyInitialized,
-        );
-
-        // Authorize as the admin embedded in the export before touching anything.
-        // This prevents an attacker who somehow obtains an export from transplanting
-        // it onto a contract they do not control.
-        export.escrow.admin.require_auth();
-
-        // Version gate: reject if the export was produced by a different schema version.
-        ensure(
-            &env,
-            export.schema_version == SCHEMA_VERSION,
-            EscrowError::ImportSchemaMismatch,
-        );
-
-        // Checksum verification: recompute over the same fields as export_state and
-        // compare against the embedded checksum before writing any storage.
-        let expected_checksum: BytesN<32> = {
-            let mut buf = [0u8; 64];
-            buf[0..4].copy_from_slice(&export.schema_version.to_be_bytes());
-            buf[4..20].copy_from_slice(&export.escrow.funded_amount.to_be_bytes());
-            buf[20..36].copy_from_slice(&export.escrow.funding_target.to_be_bytes());
-            buf[36..44].copy_from_slice(&export.escrow.yield_bps.to_be_bytes());
-            buf[44..48].copy_from_slice(&export.escrow.status.to_be_bytes());
-            buf[48..56].copy_from_slice(&export.escrow.maturity.to_be_bytes());
-            buf[56..64].copy_from_slice(&export.exported_at.to_be_bytes());
-
-            let bytes = Bytes::from_slice(&env, &buf);
-            env.crypto().sha256(&bytes).into()
-        };
-        ensure(
-            &env,
-            expected_checksum == export.checksum,
-            EscrowError::ImportChecksumMismatch,
-        );
-
-        // --- Write all instance-storage keys from the export ---
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Escrow, &export.escrow);
-        env.storage()
-            .instance()
-            .set(&DataKey::Version, &export.schema_version);
-        env.storage()
-            .instance()
-            .set(&DataKey::FundingToken, &export.funding_token);
-        env.storage()
-            .instance()
-            .set(&DataKey::Treasury, &export.treasury);
-
-        if let Some(ref r) = export.registry {
-            env.storage().instance().set(&DataKey::RegistryRef, r);
-        }
-        if let Some(ref tiers) = export.yield_tiers {
-            if !tiers.is_empty() {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::YieldTierTable, tiers);
+        if prev == 0 {
+            if let Some(cap) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u32>(&DataKey::MaxUniqueInvestorsCap)
+            {
+                ensure(
+                    &env,
+                    cur_funder_count < cap,
+                    EscrowError::UniqueInvestorCapReached,
+                );
             }
         }
-        if let Some(ref snap) = export.funding_close_snapshot {
-            env.storage()
-                .instance()
-                .set(&DataKey::FundingCloseSnapshot, snap);
+
+        // Update funded_amount in the projected state (no storage write)
+        escrow.funded_amount = escrow
+            .funded_amount
+            .checked_add(amount)
+            .unwrap_or_else(|| fail(&env, EscrowError::FundedAmountOverflow));
+
+        // Transition to funded if target reached
+        if escrow.funded_amount >= escrow.funding_target && escrow.status == 0 {
+            escrow.status = 1;
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::MinContributionFloor, &export.min_contribution_floor);
+        escrow
+    }
 
-        if let Some(cap) = export.max_unique_investors_cap {
-            env.storage()
-                .instance()
-                .set(&DataKey::MaxUniqueInvestorsCap, &cap);
-        }
-        if let Some(cap) = export.max_per_investor_cap {
-            env.storage()
-                .instance()
-                .set(&DataKey::MaxPerInvestorCap, &cap);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::UniqueFunderCount, &export.unique_funder_count);
-        env.storage()
-            .instance()
-            .set(&DataKey::LegalHold, &export.legal_hold);
-
-        if export.legal_hold_clear_delay > 0 {
-            env.storage()
-                .instance()
-                .set(&DataKey::LegalHoldClearDelay, &export.legal_hold_clear_delay);
-        }
-        if let Some(ts) = export.legal_hold_clearable_at {
-            env.storage()
-                .instance()
-                .set(&DataKey::LegalHoldClearableAt, &ts);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::AllowlistActive, &export.allowlist_active);
-
-        if let Some(ref hash) = export.primary_attestation_hash {
-            env.storage()
-                .instance()
-                .set(&DataKey::PrimaryAttestationHash, hash);
-        }
-        if !export.attestation_log.is_empty() {
-            env.storage()
-                .instance()
-                .set(&DataKey::AttestationAppendLog, &export.attestation_log);
-        }
-        if let Some(ref collateral) = export.collateral {
-            env.storage()
-                .instance()
-                .set(&DataKey::SmeCollateralPledge, collateral);
-        }
-
-        env.storage().instance().set(
-            &DataKey::DistributedPrincipal,
-            &export.distributed_principal,
+    /// **Dry-run:** Preview the escrow state after settlement (without persisting).
+    ///
+    /// Returns the escrow state that would result from calling [`LiquifactEscrow::settle`]
+    /// with the SME's authority, performing all guard checks but NOT modifying storage
+    /// or emitting events.
+    ///
+    /// # Returns
+    /// The resulting [`InvoiceEscrow`] state if settlement were to succeed (status → 2).
+    ///
+    /// # Errors
+    /// Emits the same typed [`EscrowError`] codes as [`LiquifactEscrow::settle`]:
+    /// - Legal hold active, escrow not funded, maturity not reached
+    ///
+    /// # Differences from [`LiquifactEscrow::settle`]
+    /// - No `require_auth()` from SME
+    /// - No storage write
+    /// - No event emission
+    /// - Returns the projected escrow state
+    ///
+    /// # Use Cases
+    /// - UI verification of settlement readiness (maturity check, funding status)
+    /// - Off-chain automation (check if settlement would succeed before invoking)
+    pub fn simulate_settle(env: Env) -> InvoiceEscrow {
+        ensure(
+            &env,
+            !Self::legal_hold_active(&env),
+            EscrowError::LegalHoldBlocksSettlement,
         );
 
-        if let Some(deadline) = export.funding_deadline {
-            env.storage()
-                .instance()
-                .set(&DataKey::FundingDeadline, &deadline);
+        let mut escrow = Self::get_escrow(env.clone());
+
+        ensure(&env, escrow.status == 1, EscrowError::SettlementNotFunded);
+
+        let now = env.ledger().timestamp();
+        if escrow.maturity > 0 {
+            ensure(
+                &env,
+                now >= escrow.maturity,
+                EscrowError::MaturityNotReached,
+            );
         }
 
-        if let Some(ref pending) = export.pending_admin {
-            env.storage()
-                .instance()
-                .set(&DataKey::PendingAdmin, pending);
-        }
+        escrow.status = 2;
+        escrow
+    }
 
-        StateImportedEvt {
-            name: symbol_short!("st_imp"),
-            invoice_id: export.escrow.invoice_id.clone(),
-            schema_version: export.schema_version,
-            checksum: export.checksum,
-        }
-        .publish(&env);
+    /// **Dry-run:** Preview the investor payout after settlement (without persisting).
+    ///
+    /// Returns the pro-rata gross payout that an investor would receive via
+    /// [`LiquifactEscrow::claim_investor_payout`], based on the current
+    /// [`FundingCloseSnapshot`] and investor contribution.
+    ///
+    /// This is equivalent to reading the result of [`LiquifactEscrow::compute_investor_payout`]
+    /// and is included here for API symmetry.
+    ///
+    /// # Parameters
+    /// - `investor`: The investor address to compute payout for
+    ///
+    /// # Returns
+    /// The gross payout amount (principal + accrued yield), or `0` if:
+    /// - The investor has no contribution
+    /// - The escrow has not yet reached funded status (no snapshot)
+    ///
+    /// # Errors
+    /// Emits [`EscrowError::ComputePayoutArithmeticOverflow`] if payout computation
+    /// overflows during multiplication or division (extremely unlikely with realistic values).
+    ///
+    /// # Use Cases
+    /// - Wallet UI to show expected settlement payout before claiming
+    /// - Off-chain script to compute investor distributions
+    pub fn simulate_claim_investor_payout(env: Env, investor: Address) -> i128 {
+        Self::compute_investor_payout(env, investor)
     }
 }
 
