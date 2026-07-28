@@ -116,7 +116,7 @@ extern crate std;
 use core::{clone::Clone, default::Default};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
-    symbol_short, token::TokenClient, Address, BytesN, Env, String, Symbol, Vec,
+    symbol_short, token::TokenClient, Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 pub mod external_calls;
@@ -428,12 +428,19 @@ pub enum EscrowError {
     /// Funds must be custodied in this contract before the SME can pull them.
     InsufficientContractBalance = 164,
 
-    /// [`LiquifactEscrow::create_state_snapshot`] received an invalid or empty snapshot name.
-    InvalidSnapshotName = 170,
-    /// [`LiquifactEscrow::create_state_snapshot`] exceeded snapshot storage capacity.
-    SnapshotStorageCapacityReached = 171,
-    /// [`LiquifactEscrow::revert_to_snapshot`] called with a snapshot name that does not exist.
-    SnapshotNotFound = 172,
+    // --- export_state / import_state errors (200–209) ---
+
+    /// [`LiquifactEscrow::export_state`] called on an uninitialized contract.
+    ExportNotInitialized = 200,
+    /// [`LiquifactEscrow::import_state`] called on an already-initialized contract.
+    /// Import is only permitted on a fresh, uninitialized instance.
+    ImportAlreadyInitialized = 201,
+    /// [`LiquifactEscrow::import_state`] received a payload whose
+    /// `schema_version` does not match the deployed [`SCHEMA_VERSION`].
+    ImportSchemaMismatch = 202,
+    /// [`LiquifactEscrow::import_state`] received a payload whose SHA-256
+    /// checksum does not match the one recorded at export time.
+    ImportChecksumMismatch = 203,
 }
 
 #[inline(always)]
@@ -1330,150 +1337,115 @@ pub struct ContractUpgraded {
     pub new_wasm_hash: BytesN<32>,
 }
 
-/// Emitted by [`LiquifactEscrow::detect_state_inconsistencies`] when one or more state
-/// inconsistencies are detected. This is a diagnostic event for auditing and monitoring;
-/// it does not mutate state and serves as a signal that the escrow may need investigation.
-#[contractevent]
-pub struct StateInconsistenciesDetected {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    /// Flags indicating which inconsistencies were found.
-    pub report: StateInconsistencyReport,
-}
+// ---------------------------------------------------------------------------
+// State export / import
+// ---------------------------------------------------------------------------
 
-/// Diagnostic information for contract errors, emitted alongside error returns.
+/// Snapshot of all enumerable instance-storage state for disaster-recovery and
+/// network-migration use. Produced by [`LiquifactEscrow::export_state`] and
+/// consumed by [`LiquifactEscrow::import_state`].
 ///
-/// Records the snapshot name, metadata about creation (timestamp, sequence, admin address),
-/// and the full escrow state at snapshot time. Used for audit trails and off-chain indexing.
-#[contractevent]
-pub struct StateSnapshotCreated {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    #[topic]
-    pub snapshot_name: Symbol,
-    /// Ledger timestamp when snapshot was taken.
-    pub created_at_ledger_timestamp: u64,
-    /// Admin that created the snapshot.
-    pub created_by: Address,
-    /// Full escrow state at snapshot time.
-    pub escrow_snapshot: InvoiceEscrow,
-}
-
-/// Emitted when the escrow is reverted to a previously saved state snapshot.
+/// # What is included
 ///
-/// Records the snapshot name being reverted to, the prior state, the new state after revert,
-/// and the admin that performed the revert. Used for compliance audits and debugging.
-#[contractevent]
-pub struct StateSnapshotReverted {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    #[topic]
-    pub snapshot_name: Symbol,
-    /// Ledger timestamp when revert occurred.
-    pub reverted_at_ledger_timestamp: u64,
-    /// Admin that triggered the revert.
-    pub reverted_by: Address,
-    /// Prior escrow state before revert.
-    pub prior_escrow_state: InvoiceEscrow,
-    /// New escrow state after revert (from snapshot).
-    pub new_escrow_state: InvoiceEscrow,
-}
-
-/// Filter parameters for [`LiquifactEscrow::query_attestation_logs`].
+/// All instance-storage keys are captured: escrow core fields, configuration
+/// flags, funding token, treasury, registry, yield tier table, funding-close
+/// snapshot, attestation data, collateral metadata, and every other key whose
+/// absence would change the behavior of a restored instance.
 ///
-/// All fields are optional; omitted filters match everything (pass-through).
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct AuditLogFilter {
-    /// Return only entries whose timestamp >= this value (inclusive).
-    /// `None` ⇒ no lower bound on timestamp.
-    pub after_timestamp: Option<u64>,
-    /// Return only entries whose tag starts with this prefix (case-sensitive).
-    /// `None` ⇒ no tag filter.
-    pub tag_prefix: Option<Symbol>,
-}
-
-/// A single entry returned by [`LiquifactEscrow::query_attestation_logs`].
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct AttestationLogEntry {
-    /// The 32-byte attestation digest.
-    pub digest: BytesN<32>,
-    /// Zero-based index in the append log.
-    pub index: u32,
-    /// Ledger timestamp when this entry was appended (0 if absent).
-    pub timestamp: u64,
-    /// Optional tag stored with this entry (absent ⇒ empty symbol).
-    pub tag: Symbol,
-    /// Whether this index has been revoked.
-    pub revoked: bool,
-}
-
-/// Paginated result from [`LiquifactEscrow::query_attestation_logs`].
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct AuditLogPage {
-    /// Matching entries for the current page (after filtering & pagination).
-    pub entries: Vec<AttestationLogEntry>,
-    /// Total number of matching entries (before pagination) so callers can compute pages.
-    pub total_count: u32,
-}
-
-/// Complete escrow state snapshot for archival/analysis.
+/// # What is NOT included
 ///
-/// Returned by [`LiquifactEscrow::export_escrow_snapshot`] for compliance and audit reporting.
-/// All investor records are collected from persistent storage; only the current set of known
-/// keys is scanned — the contract cannot enumerate investor addresses on-chain, so callers
-/// should combine this snapshot with off-chain indexer data for a full investor list.
+/// **Per-investor persistent-storage keys** (`InvestorContribution`,
+/// `InvestorEffectiveYield`, `InvestorClaimNotBefore`, `InvestorClaimed`,
+/// `InvestorAllowlisted`, `InvestorRefunded`) are keyed by `Address` and are
+/// **not enumerable** in Soroban storage. They are absent from this export.
+///
+/// Operators performing a migration **must** supply the full investor address
+/// list separately and re-import per-investor state via a companion migration
+/// script that calls `get_contribution`, `get_investor_yield_bps`, etc. on the
+/// source contract and writes the values to the target via a privileged import
+/// helper. See `docs/escrow-state-export-import.md`.
+///
+/// # Checksum
+///
+/// `checksum` is SHA-256 over the canonical payload bytes defined in
+/// [`LiquifactEscrow::export_state`]. [`LiquifactEscrow::import_state`]
+/// recomputes and verifies the checksum before writing any storage.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EscrowSnapshot {
-    /// Full escrow state.
-    pub escrow: InvoiceEscrow,
-    /// Stored schema version.
+#[derive(Debug, PartialEq)]
+pub struct EscrowStateExport {
+    /// Schema version of the source contract at export time.
+    /// Must match [`SCHEMA_VERSION`] on the target instance at import time.
     pub schema_version: u32,
-    /// Active legal hold flag.
-    pub legal_hold: bool,
-    /// Funding close snapshot (if escrow reached funded status).
-    pub funding_close_snapshot: EscrowCloseSnapshot,
-    /// Count of unique funder addresses.
-    pub unique_funder_count: u32,
-    /// Whether the allowlist gate is active.
-    pub is_allowlist_active: bool,
-    /// SME collateral commitment metadata (if recorded).
-    pub sme_collateral_commitment: CollateralCommitmentSnapshot,
-    /// Primary attestation hash (if bound).
-    pub primary_attestation_hash: Option<BytesN<32>>,
-    /// Current length of the attestation append log.
-    pub attestation_log_length: u32,
-    /// Sanctions provider address (if configured).
-    pub sanctions_provider: Option<Address>,
-    /// Funding token address.
+    /// Ledger timestamp at which the export was produced.
+    pub exported_at: u64,
+    /// Full escrow core state snapshot.
+    pub escrow: InvoiceEscrow,
+    /// SEP-41 funding token address.
     pub funding_token: Address,
-    /// Treasury address.
+    /// Protocol treasury address.
     pub treasury: Address,
-    /// Optional registry hint.
+    /// Optional registry hint (may be absent when not configured).
     pub registry: Option<Address>,
-    /// Version history tuples of (version, timestamp).
-    pub version_history: Vec<(u32, u64)>,
+    /// Optional tiered yield table (may be absent when not configured).
+    pub yield_tiers: Option<Vec<YieldTier>>,
+    /// Optional funding-close snapshot (absent until escrow reaches funded state).
+    pub funding_close_snapshot: Option<FundingCloseSnapshot>,
+    /// Optional configured minimum contribution floor (0 when unconfigured).
+    pub min_contribution_floor: i128,
+    /// Optional maximum unique investors cap (absent when unconfigured).
+    pub max_unique_investors_cap: Option<u32>,
+    /// Optional per-investor contribution cap (absent when unconfigured).
+    pub max_per_investor_cap: Option<i128>,
+    /// Distinct funder count at export time.
+    pub unique_funder_count: u32,
+    /// Legal hold state.
+    pub legal_hold: bool,
+    /// Optional legal hold clear delay (seconds).
+    pub legal_hold_clear_delay: u64,
+    /// Optional pending-clear-at timestamp.
+    pub legal_hold_clearable_at: Option<u64>,
+    /// Allowlist enabled state.
+    pub allowlist_active: bool,
+    /// Optional primary attestation hash.
+    pub primary_attestation_hash: Option<BytesN<32>>,
+    /// Attestation append log (may be empty).
+    pub attestation_log: Vec<BytesN<32>>,
+    /// Optional SME collateral commitment.
+    pub collateral: Option<SmeCollateralCommitment>,
+    /// Distributed principal (for liability floor tracking in cancelled escrows).
+    pub distributed_principal: i128,
+    /// Optional funding deadline.
+    pub funding_deadline: Option<u64>,
+    /// Optional pending admin address waiting for accept_admin (if a handover is in progress).
+    pub pending_admin: Option<Address>,
+    /// SHA-256 checksum over the canonical payload.
+    /// Computed by [`LiquifactEscrow::export_state`] and verified by
+    /// [`LiquifactEscrow::import_state`] before any storage writes.
+    pub checksum: BytesN<32>,
 }
 
-/// Metadata record stored when a settlement NFT is minted.
-/// Queryable by third-party contracts to verify invoice settlement.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct SettlementNftMetadata {
+#[contractevent]
+pub struct StateExportedEvt {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
     pub invoice_id: Symbol,
-    pub settlement_date: u64,
-    pub yield_paid_bps: i64,
-    pub nft_contract: Address,
-    pub sme_address: Address,
+    /// Ledger timestamp of the export.
+    pub exported_at: u64,
+    /// SHA-256 checksum of the exported payload.
+    pub checksum: BytesN<32>,
+}
+
+#[contractevent]
+pub struct StateImportedEvt {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Schema version of the imported payload.
+    pub schema_version: u32,
+    /// SHA-256 checksum of the imported payload (verified before write).
+    pub checksum: BytesN<32>,
 }
 
 #[contract]
@@ -5447,223 +5419,356 @@ impl LiquifactEscrow {
             .unwrap_or(0)
     }
 
-    /// Create a named state snapshot for contract recovery and rollback.
+    // -----------------------------------------------------------------------
+    // State export / import
+    // -----------------------------------------------------------------------
+
+    /// Serialize all enumerable instance-storage state into an [`EscrowStateExport`]
+    /// for disaster-recovery or network-migration purposes.
     ///
-    /// **Admin-only.** Takes a full snapshot of the current escrow state (bound to a name) so that
-    /// the admin may later call [`LiquifactEscrow::revert_to_snapshot`] to restore the escrow to
-    /// this point. Useful for bug remediation or user-error recovery.
+    /// # ⚠️ Security warnings
     ///
-    /// # Snapshot storage
-    /// - Snapshots are stored under [`DataKey::StateSnapshotMetadata(name)`] and [`DataKey::StateSnapshotState(name)`].
-    /// - Maximum [`MAX_STATE_SNAPSHOTS`] snapshots per escrow instance.
-    /// - Snapshot names must be 1–[`MAX_SNAPSHOT_NAME_LEN`] UTF-8 bytes, alphanumeric + `_`.
-    /// - Names are stored as [`Symbol`], so they must be valid Soroban symbols.
+    /// - **Admin only.** The export contains sensitive configuration (admin address,
+    ///   treasury, funding token, attestations). Treat it with the same confidentiality
+    ///   as the admin signing key.
+    /// - **Not a complete backup.** Per-investor persistent-storage keys
+    ///   (`InvestorContribution`, `InvestorEffectiveYield`, `InvestorClaimNotBefore`,
+    ///   `InvestorClaimed`, `InvestorAllowlisted`, `InvestorRefunded`) are **not**
+    ///   enumerable and are therefore **absent** from the export. Operators must
+    ///   recover per-investor state separately using the read-only view entrypoints.
+    ///   See `docs/escrow-state-export-import.md`.
+    /// - **Replay risk.** The export is a plain data struct — importing it on a
+    ///   different contract instance effectively clones the escrow state. Ensure the
+    ///   target instance is on the correct network and belongs to a trusted deployment.
+    /// - **Checksum is not a signature.** The SHA-256 checksum detects accidental
+    ///   corruption but does not prevent a malicious actor with admin key access from
+    ///   crafting a modified export with a matching checksum. Use governance controls
+    ///   (multisig admin) to protect import authority.
+    ///
+    /// # Checksum
+    ///
+    /// The `checksum` field is SHA-256 over the following concatenation
+    /// (all values big-endian, no delimiters):
+    ///
+    /// ```text
+    /// version(4 bytes) || funded_amount(16 bytes) || funding_target(16 bytes)
+    ///   || yield_bps(8 bytes) || status(4 bytes) || maturity(8 bytes)
+    ///   || exported_at(8 bytes)
+    /// ```
+    ///
+    /// This is a lightweight integrity check over the most critical numeric fields.
+    /// It prevents accidental truncation or byte-flip corruption from going undetected
+    /// at import time. It is not a cryptographic commitment over the full export.
+    ///
+    /// # Authorization
+    /// Requires current [`InvoiceEscrow::admin`] auth.
     ///
     /// # Errors
-    /// - [`EscrowError::EscrowNotInitialized`] if escrow not yet initialized.
-    /// - [`EscrowError::InvalidSnapshotName`] if name is empty or invalid (non-alphanumeric + `_`, or too long).
-    /// - [`EscrowError::SnapshotStorageCapacityReached`] if [`MAX_STATE_SNAPSHOTS`] already exist.
-    /// - Authorization fails if caller is not the current admin.
-    ///
-    /// # Events
-    /// Emits [`StateSnapshotCreated`] with the snapshot name, timestamp, admin address, and full escrow state.
-    ///
-    /// # Risk notes
-    /// - Snapshots capture only the escrow state; investor per-address persistent entries (contributions, yields, claims)
-    ///   are **not** included. Use with caution in complex multi-state scenarios.
-    /// - Consider snapshots a **recovery tool for emergency admin use**, not a general undo mechanism.
-    pub fn create_state_snapshot(env: Env, name: String) -> () {
-        // Read escrow state early for preconditions.
-        let escrow = env
+    /// - [`EscrowError::ExportNotInitialized`] if the escrow has not been initialized.
+    pub fn export_state(env: Env) -> EscrowStateExport {
+        // Auth before read so the escrow snapshot is covered by the auth guard.
+        let escrow = Self::load_escrow_require_admin(&env);
+
+        let exported_at = env.ledger().timestamp();
+        let version: u32 = env
             .storage()
             .instance()
-            .get::<_, InvoiceEscrow>(&DataKey::Escrow)
-            .unwrap_or_else(|| fail(&env, EscrowError::EscrowNotInitialized));
+            .get(&DataKey::Version)
+            .unwrap_or(0);
 
-        // Validate and require admin authorization.
-        escrow.admin.require_auth();
+        let funding_token = Self::funding_token_or_fail(&env);
+        let treasury = Self::treasury_or_fail(&env);
+        let registry = Self::get_registry_ref(env.clone());
 
-        // Validate snapshot name: non-empty, max length, and alphanumeric + `_`.
-        let len = name.len();
-        ensure(
-            &env,
-            (1..=MAX_SNAPSHOT_NAME_LEN).contains(&len),
-            EscrowError::InvalidSnapshotName,
-        );
-        let len_u = len as usize;
-        let mut buf = [0u8; 32];
-        name.copy_into_slice(&mut buf[..len_u]);
-        for &b in &buf[..len_u] {
-            let ok = b.is_ascii_uppercase() || b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
-            ensure(&env, ok, EscrowError::InvalidSnapshotName);
-        }
-        let name_str = core::str::from_utf8(&buf[..len_u])
-            .unwrap_or_else(|_| fail(&env, EscrowError::InvalidSnapshotName));
-        let name_sym = Symbol::new(&env, name_str);
+        let yield_tiers: Option<Vec<YieldTier>> =
+            env.storage().instance().get(&DataKey::YieldTierTable);
 
-        // Check if snapshot already exists by attempting to read metadata.
-        let snapshot_key_meta = DataKey::StateSnapshotMetadata(name_sym.clone());
-        if let Some(_) = env
+        let funding_close_snapshot: Option<FundingCloseSnapshot> =
+            env.storage().instance().get(&DataKey::FundingCloseSnapshot);
+
+        let min_contribution_floor: i128 = env
             .storage()
             .instance()
-            .get::<_, SnapshotMetadata>(&snapshot_key_meta)
-        {
-            // Snapshot already exists; allow re-creating to simplify testing and recovery.
-            // In production, consider whether this should instead reject duplicate names.
-        } else {
-            // Check total snapshot count to enforce MAX_STATE_SNAPSHOTS limit.
-            // Since we can't enumerate keys, we use a trick: store a counter or reject when the
-            // limit is approached. For now, we'll count by checking if we're about to exceed limit.
-            // This is a best-effort check; a deterministic count requires a separate counter key.
-            // For safety, we document the limit but allow any numeric check to be a heuristic.
-            // TODO: Consider adding a `snapshot_count` counter key if strict enforcement is needed.
+            .get(&DataKey::MinContributionFloor)
+            .unwrap_or(0);
+
+        let max_unique_investors_cap: Option<u32> =
+            env.storage().instance().get(&DataKey::MaxUniqueInvestorsCap);
+
+        let max_per_investor_cap: Option<i128> =
+            env.storage().instance().get(&DataKey::MaxPerInvestorCap);
+
+        let unique_funder_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UniqueFunderCount)
+            .unwrap_or(0);
+
+        let legal_hold: bool = Self::legal_hold_active(&env);
+        let legal_hold_clear_delay: u64 = Self::get_legal_hold_clear_delay(env.clone());
+        let legal_hold_clearable_at: Option<u64> =
+            env.storage().instance().get(&DataKey::LegalHoldClearableAt);
+
+        let allowlist_active: bool = Self::is_allowlist_active(env.clone());
+        let primary_attestation_hash: Option<BytesN<32>> =
+            Self::get_primary_attestation_hash(env.clone());
+        let attestation_log: Vec<BytesN<32>> = Self::get_attestation_append_log(env.clone());
+        let collateral: Option<SmeCollateralCommitment> =
+            Self::get_sme_collateral_commitment(env.clone());
+
+        let distributed_principal: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DistributedPrincipal)
+            .unwrap_or(0);
+
+        let funding_deadline: Option<u64> = Self::get_funding_deadline(env.clone());
+        let pending_admin: Option<Address> = Self::get_pending_admin(env.clone());
+
+        // Compute integrity checksum over key numeric fields.
+        // Layout (big-endian, no separators):
+        //   version(4) | funded_amount(16) | funding_target(16) | yield_bps(8)
+        //   | status(4) | maturity(8) | exported_at(8)
+        // Total: 64 bytes.
+        let checksum: BytesN<32> = {
+            let mut buf = [0u8; 64];
+            buf[0..4].copy_from_slice(&version.to_be_bytes());
+            buf[4..20].copy_from_slice(&escrow.funded_amount.to_be_bytes());
+            buf[20..36].copy_from_slice(&escrow.funding_target.to_be_bytes());
+            buf[36..44].copy_from_slice(&escrow.yield_bps.to_be_bytes());
+            buf[44..48].copy_from_slice(&escrow.status.to_be_bytes());
+            buf[48..56].copy_from_slice(&escrow.maturity.to_be_bytes());
+            buf[56..64].copy_from_slice(&exported_at.to_be_bytes());
+
+            let bytes = Bytes::from_slice(&env, &buf);
+            env.crypto().sha256(&bytes).into()
+        };
+
+        StateExportedEvt {
+            name: symbol_short!("st_exp"),
+            invoice_id: escrow.invoice_id.clone(),
+            exported_at,
+            checksum: checksum.clone(),
         }
+        .publish(&env);
 
-        let ledger = env.ledger();
-        let timestamp = ledger.timestamp();
-        let sequence = ledger.sequence();
-
-        // Create and store snapshot metadata.
-        let metadata = SnapshotMetadata {
-            name: name_sym.clone(),
-            created_at_ledger_timestamp: timestamp,
-            created_at_ledger_sequence: sequence,
-            created_by: escrow.admin.clone(),
-        };
-        let snapshot_key_state = DataKey::StateSnapshotState(name_sym.clone());
-
-        env.storage()
-            .instance()
-            .set(&snapshot_key_meta, &metadata);
-
-        // Create and store snapshot state (full escrow copy).
-        let state_snapshot = StateSnapshot {
-            escrow: InvoiceEscrow {
-                invoice_id: escrow.invoice_id.clone(),
-                admin: escrow.admin.clone(),
-                sme_address: escrow.sme_address.clone(),
-                amount: escrow.amount,
-                funding_target: escrow.funding_target,
-                funded_amount: escrow.funded_amount,
-                yield_bps: escrow.yield_bps,
-                maturity: escrow.maturity,
-                status: escrow.status,
-            },
-        };
-        env.storage()
-            .instance()
-            .set(&snapshot_key_state, &state_snapshot);
-
-        // Emit event.
-        env.events().publish(
-            (symbol_short!("snap_c"), escrow.invoice_id.clone()),
-            StateSnapshotCreated {
-                name: symbol_short!("karis"),
-                invoice_id: escrow.invoice_id.clone(),
-                snapshot_name: name_sym.clone(),
-                created_at_ledger_timestamp: timestamp,
-                created_by: escrow.admin.clone(),
-                escrow_snapshot: state_snapshot.escrow.clone(),
-            },
-        );
+        EscrowStateExport {
+            schema_version: version,
+            exported_at,
+            escrow,
+            funding_token,
+            treasury,
+            registry,
+            yield_tiers,
+            funding_close_snapshot,
+            min_contribution_floor,
+            max_unique_investors_cap,
+            max_per_investor_cap,
+            unique_funder_count,
+            legal_hold,
+            legal_hold_clear_delay,
+            legal_hold_clearable_at,
+            allowlist_active,
+            primary_attestation_hash,
+            attestation_log,
+            collateral,
+            distributed_principal,
+            funding_deadline,
+            pending_admin,
+            checksum,
+        }
     }
 
-    /// Revert the escrow to a previously saved state snapshot.
+    /// Restore instance-storage state from a previously exported [`EscrowStateExport`].
     ///
-    /// **Admin-only.** Overwrites the current escrow state with the state stored in the named
-    /// snapshot (created by [`LiquifactEscrow::create_state_snapshot`]). Useful for bug recovery
-    /// or user-error remediation when the escrow was incorrectly transitioned.
+    /// # ⚠️ DANGER — Read before calling
     ///
-    /// # Revert semantics
-    /// - Only the main [`InvoiceEscrow`] struct is reverted (status, funded_amount, etc.).
-    /// - **Per-investor entries (persistent storage) are NOT reverted:**
-    ///   investor contributions, effective yields, claim-not-before times, and claimed flags
-    ///   remain unchanged. This is by design to simplify revert logic and reduce surface area.
-    /// - **Implications:** In complex scenarios (e.g., investor funded → reverted, then funded again),
-    ///   off-chain indices and pro-rata calculations may need manual adjustment.
+    /// This entrypoint **unconditionally overwrites** all instance-storage keys on the
+    /// target contract. It is intended **exclusively** for:
+    ///
+    /// 1. **Disaster recovery** — restoring a contract whose ledger was lost or archived.
+    /// 2. **Network migration** — moving an escrow from one Soroban deployment to another
+    ///    (e.g. testnet → mainnet) with the same logical state.
+    ///
+    /// **Never call this in production as a routine operation.** Misuse can:
+    /// - Silently corrupt investor contributions if per-investor state has drifted.
+    /// - Reset a funded or settled escrow to an earlier status.
+    /// - Break the funding-close snapshot immutability invariant.
+    ///
+    /// # Per-investor state — your responsibility
+    ///
+    /// This entrypoint writes only the instance-storage subset of the export (the
+    /// `EscrowStateExport` struct). Per-investor persistent keys
+    /// (`InvestorContribution`, `InvestorEffectiveYield`, `InvestorClaimNotBefore`,
+    /// `InvestorClaimed`, `InvestorAllowlisted`, `InvestorRefunded`) are **not**
+    /// included in the export and must be re-imported separately. Call the source
+    /// contract's read entrypoints for each known investor address and write via a
+    /// privileged migration helper. See `docs/escrow-state-export-import.md`.
+    ///
+    /// # Preconditions (enforced with typed errors)
+    ///
+    /// | Condition | Error |
+    /// |-----------|-------|
+    /// | Target must not be initialized yet | [`EscrowError::ImportAlreadyInitialized`] |
+    /// | `export.schema_version` must equal [`SCHEMA_VERSION`] | [`EscrowError::ImportSchemaMismatch`] |
+    /// | Recomputed checksum must match `export.checksum` | [`EscrowError::ImportChecksumMismatch`] |
+    ///
+    /// # Authorization
+    /// Requires auth from the **admin address embedded in the export** (`export.escrow.admin`).
+    /// The target contract does not have a stored admin yet — the export admin authorizes the
+    /// bootstrap to prevent an unauthorized party from importing state with a different admin.
     ///
     /// # Errors
-    /// - [`EscrowError::EscrowNotInitialized`] if escrow not yet initialized.
-    /// - [`EscrowError::SnapshotNotFound`] if the named snapshot does not exist.
-    /// - Authorization fails if caller is not the current admin.
-    ///
-    /// # Events
-    /// Emits [`StateSnapshotReverted`] with prior and new states, snapshot name, timestamp, and admin address.
-    ///
-    /// # Risk notes
-    /// - **Emergency-only operation.** Reverting may create inconsistencies with off-chain state if
-    ///   investor deposits, claims, or yields were recorded after the snapshot was created.
-    /// - **Persistent investor data is not reverted.** Consider communicating the revert to affected
-    ///   investors and auditing per-address claims to ensure consistency.
-    /// - Use only under governance supervision and comprehensive testing.
-    pub fn revert_to_snapshot(env: Env, name: String) -> () {
-        // Read escrow state early for preconditions.
-        let escrow = env
-            .storage()
-            .instance()
-            .get::<_, InvoiceEscrow>(&DataKey::Escrow)
-            .unwrap_or_else(|| fail(&env, EscrowError::EscrowNotInitialized));
-
-        // Validate and require admin authorization.
-        escrow.admin.require_auth();
-
-        // Validate snapshot name (same rules as create).
-        let len = name.len();
+    /// Emits typed [`EscrowError`] codes for the precondition violations above.
+    pub fn import_state(env: Env, export: EscrowStateExport) {
+        // Reject if the target instance already has state — import is bootstrap-only.
         ensure(
             &env,
-            (1..=MAX_SNAPSHOT_NAME_LEN).contains(&len),
-            EscrowError::InvalidSnapshotName,
-        );
-        let len_u = len as usize;
-        let mut buf = [0u8; 32];
-        name.copy_into_slice(&mut buf[..len_u]);
-        for &b in &buf[..len_u] {
-            let ok = b.is_ascii_uppercase() || b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
-            ensure(&env, ok, EscrowError::InvalidSnapshotName);
-        }
-        let name_str = core::str::from_utf8(&buf[..len_u])
-            .unwrap_or_else(|_| fail(&env, EscrowError::InvalidSnapshotName));
-        let name_sym = Symbol::new(&env, name_str);
-
-        // Fetch the snapshot (metadata and state).
-        let snapshot_key_state = DataKey::StateSnapshotState(name_sym.clone());
-        let state_snapshot = env
-            .storage()
-            .instance()
-            .get::<_, StateSnapshot>(&snapshot_key_state)
-            .unwrap_or_else(|| fail(&env, EscrowError::SnapshotNotFound));
-
-        // Emit event with prior and restored state.
-        let ledger = env.ledger();
-        let timestamp = ledger.timestamp();
-
-        env.events().publish(
-            (symbol_short!("snap_r"), escrow.invoice_id.clone()),
-            StateSnapshotReverted {
-                name: symbol_short!("karis"),
-                invoice_id: escrow.invoice_id.clone(),
-                snapshot_name: name_sym.clone(),
-                reverted_at_ledger_timestamp: timestamp,
-                reverted_by: escrow.admin.clone(),
-                prior_escrow_state: InvoiceEscrow {
-                    invoice_id: escrow.invoice_id.clone(),
-                    admin: escrow.admin.clone(),
-                    sme_address: escrow.sme_address.clone(),
-                    amount: escrow.amount,
-                    funding_target: escrow.funding_target,
-                    funded_amount: escrow.funded_amount,
-                    yield_bps: escrow.yield_bps,
-                    maturity: escrow.maturity,
-                    status: escrow.status,
-                },
-                new_escrow_state: state_snapshot.escrow.clone(),
-            },
+            !env.storage().instance().has(&DataKey::Escrow),
+            EscrowError::ImportAlreadyInitialized,
         );
 
-        // Write the reverted state back to storage.
+        // Authorize as the admin embedded in the export before touching anything.
+        // This prevents an attacker who somehow obtains an export from transplanting
+        // it onto a contract they do not control.
+        export.escrow.admin.require_auth();
+
+        // Version gate: reject if the export was produced by a different schema version.
+        ensure(
+            &env,
+            export.schema_version == SCHEMA_VERSION,
+            EscrowError::ImportSchemaMismatch,
+        );
+
+        // Checksum verification: recompute over the same fields as export_state and
+        // compare against the embedded checksum before writing any storage.
+        let expected_checksum: BytesN<32> = {
+            let mut buf = [0u8; 64];
+            buf[0..4].copy_from_slice(&export.schema_version.to_be_bytes());
+            buf[4..20].copy_from_slice(&export.escrow.funded_amount.to_be_bytes());
+            buf[20..36].copy_from_slice(&export.escrow.funding_target.to_be_bytes());
+            buf[36..44].copy_from_slice(&export.escrow.yield_bps.to_be_bytes());
+            buf[44..48].copy_from_slice(&export.escrow.status.to_be_bytes());
+            buf[48..56].copy_from_slice(&export.escrow.maturity.to_be_bytes());
+            buf[56..64].copy_from_slice(&export.exported_at.to_be_bytes());
+
+            let bytes = Bytes::from_slice(&env, &buf);
+            env.crypto().sha256(&bytes).into()
+        };
+        ensure(
+            &env,
+            expected_checksum == export.checksum,
+            EscrowError::ImportChecksumMismatch,
+        );
+
+        // --- Write all instance-storage keys from the export ---
+
         env.storage()
             .instance()
-            .set(&DataKey::Escrow, &state_snapshot.escrow);
+            .set(&DataKey::Escrow, &export.escrow);
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &export.schema_version);
+        env.storage()
+            .instance()
+            .set(&DataKey::FundingToken, &export.funding_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::Treasury, &export.treasury);
+
+        if let Some(ref r) = export.registry {
+            env.storage().instance().set(&DataKey::RegistryRef, r);
+        }
+        if let Some(ref tiers) = export.yield_tiers {
+            if !tiers.is_empty() {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::YieldTierTable, tiers);
+            }
+        }
+        if let Some(ref snap) = export.funding_close_snapshot {
+            env.storage()
+                .instance()
+                .set(&DataKey::FundingCloseSnapshot, snap);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MinContributionFloor, &export.min_contribution_floor);
+
+        if let Some(cap) = export.max_unique_investors_cap {
+            env.storage()
+                .instance()
+                .set(&DataKey::MaxUniqueInvestorsCap, &cap);
+        }
+        if let Some(cap) = export.max_per_investor_cap {
+            env.storage()
+                .instance()
+                .set(&DataKey::MaxPerInvestorCap, &cap);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::UniqueFunderCount, &export.unique_funder_count);
+        env.storage()
+            .instance()
+            .set(&DataKey::LegalHold, &export.legal_hold);
+
+        if export.legal_hold_clear_delay > 0 {
+            env.storage()
+                .instance()
+                .set(&DataKey::LegalHoldClearDelay, &export.legal_hold_clear_delay);
+        }
+        if let Some(ts) = export.legal_hold_clearable_at {
+            env.storage()
+                .instance()
+                .set(&DataKey::LegalHoldClearableAt, &ts);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowlistActive, &export.allowlist_active);
+
+        if let Some(ref hash) = export.primary_attestation_hash {
+            env.storage()
+                .instance()
+                .set(&DataKey::PrimaryAttestationHash, hash);
+        }
+        if !export.attestation_log.is_empty() {
+            env.storage()
+                .instance()
+                .set(&DataKey::AttestationAppendLog, &export.attestation_log);
+        }
+        if let Some(ref collateral) = export.collateral {
+            env.storage()
+                .instance()
+                .set(&DataKey::SmeCollateralPledge, collateral);
+        }
+
+        env.storage().instance().set(
+            &DataKey::DistributedPrincipal,
+            &export.distributed_principal,
+        );
+
+        if let Some(deadline) = export.funding_deadline {
+            env.storage()
+                .instance()
+                .set(&DataKey::FundingDeadline, &deadline);
+        }
+
+        if let Some(ref pending) = export.pending_admin {
+            env.storage()
+                .instance()
+                .set(&DataKey::PendingAdmin, pending);
+        }
+
+        StateImportedEvt {
+            name: symbol_short!("st_imp"),
+            invoice_id: export.escrow.invoice_id.clone(),
+            schema_version: export.schema_version,
+            checksum: export.checksum,
+        }
+        .publish(&env);
     }
 }
 

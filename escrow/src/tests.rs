@@ -60,9 +60,7 @@ mod legal_hold;
 mod properties;
 mod regressions;
 mod settlement;
-mod state_inconsistency;
-mod token_cache;
-mod yield_slippage;
+mod state_export_import;
 
 /// Registers a new escrow contract instance and returns its contract id.
 pub fn deploy_id(env: &Env) -> Address {
