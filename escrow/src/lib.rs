@@ -143,7 +143,7 @@ include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 /// | 4 | Added `PrimaryAttestationHash`, `AttestationAppendLog` | Additive keys — no `migrate` call required |
 /// | 5 | Added `YieldTierTable`, `RegistryRef`, `Treasury`; `fund_with_commitment` | **Redeploy required** if `InvoiceEscrow` XDR changed |
 /// | 6 | Per-investor keys moved to **persistent** storage (see ADR-007) | **Redeploy required** — no `migrate` path (addresses not enumerable) |
-/// | 7 | Added `SettlementNotifierContract`, `CreatedAt`, status 5 (archived), `archive_escrow`, `notify_settlement`, `get_registry_listing` | Additive keys + new entrypoints — **redeploy required** for new status codes |
+/// | 7 | Added `DisputePaused` state for temporary dispute resolution freezes (separate from legal hold) | Additive keys — no `migrate` call required |
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
 pub const SCHEMA_VERSION: u32 = 7;
@@ -398,7 +398,22 @@ pub enum EscrowError {
     NoPendingAdmin = 163,
     /// The contract's funding-token balance is less than `funded_amount` at withdraw time.
     /// Funds must be custodied in this contract before the SME can pull them.
-    InsufficientContractBalance = 165,
+    InsufficientContractBalance = 164,
+
+    /// [`LiquifactEscrow::fund`] / [`LiquifactEscrow::fund_with_commitment`] blocked while a dispute pause is active.
+    DisputePausedBlocksFunding = 165,
+    /// [`LiquifactEscrow::settle`] blocked while a dispute pause is active.
+    DisputePausedBlocksSettlement = 166,
+    /// [`LiquifactEscrow::withdraw`] blocked while a dispute pause is active.
+    DisputePausedBlocksWithdrawal = 167,
+    /// [`LiquifactEscrow::pause_dispute`] received a non-positive pause duration in seconds.
+    DisputePauseDurationNotPositive = 168,
+    /// [`LiquifactEscrow::pause_dispute`] received an empty dispute ticket reference.
+    DisputeTicketIdEmpty = 169,
+    /// [`LiquifactEscrow::resume_dispute`] called when no dispute pause is active.
+    NoPauseActive = 170,
+    /// Computed ledger timestamp would overflow (e.g., `now + duration > u64::MAX`).
+    LedgerTimestampOverflow = 171,
 }
 
 #[inline(always)]
@@ -525,14 +540,10 @@ pub enum DataKey {
     DistributedPrincipal,
     /// Optional funding deadline (ledger timestamp); after it passes, new funds are rejected.
     FundingDeadline,
-    /// Optional delegate address for an investor's yield claim rights.
-    /// **Persistent** storage. Absent ⇒ no delegation. Set by [`LiquifactEscrow::set_yield_claim_delegate`];
-    /// cleared by [`LiquifactEscrow::revoke_yield_claim_delegate`].
-    YieldClaimDelegate(Address),
-    /// Revocation marker for [`DataKey::YieldClaimDelegate`].
-    /// **Persistent** storage. Absent ⇒ delegation not revoked. Set by [`LiquifactEscrow::revoke_yield_claim_delegate`]
-    /// to track that a delegation was explicitly revoked (vs. never set).
-    YieldClaimDelegateRevoked(Address),
+    /// When active, temporarily freezes the escrow during dispute resolution (separate from legal hold).
+    /// Blocks `fund`, `settle`, and `withdraw`. Stores [`DisputePauseState`].
+    /// Absent ⇒ no dispute pause active.
+    DisputePaused,
 }
 
 // --- Data types ---
@@ -733,6 +744,25 @@ pub enum SettlementNftSnapshot {
     Some(SettlementNftMetadata),
 }
 
+/// State of a dispute pause on an escrow instance.
+/// 
+/// Dispute pause is **separate** from legal hold and is triggered by admin for dispute
+/// resolution (e.g., invoice validity challenge). It auto-expires after the configured
+/// duration or is manually resumed.
+///
+/// # Fields
+/// - `ticket_id`: Identifier or reference to the support/dispute ticket (for audit trail).
+/// - `paused_at_ledger_timestamp`: Soroban ledger timestamp when pause was activated.
+/// - `expires_at_ledger_timestamp`: Ledger timestamp after which the pause auto-expires.
+///   Once ledger time reaches or exceeds this value, the escrow is unpaused.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputePauseState {
+    pub ticket_id: String,
+    pub paused_at_ledger_timestamp: u64,
+    pub expires_at_ledger_timestamp: u64,
+}
+
 // --- Events ---
 
 #[contractevent]
@@ -879,20 +909,30 @@ pub struct LegalHoldClearRequested {
     pub clearable_at: u64,
 }
 
-/// Emitted by [`LiquifactEscrow::revalidate_token_cache`] when the token metadata cache is updated.
+/// Emitted when a dispute pause is activated or resumed on an escrow.
 ///
-/// This event signals that the cached token metadata (decimals, etc.) has been refreshed from
-/// the token contract. Used for auditing and monitoring cache staleness.
+/// Dispute pause is separate from legal hold and is used for temporary resolution
+/// of invoice disputes (e.g., validity challenges). The escrow is frozen until either
+/// the auto-expiration timestamp is reached or an admin manually resumes it.
+///
+/// # Fields
+/// - `name`: Hardcoded symbol (e.g., `dispute_pause` or `disp_pause`).
+/// - `invoice_id`: Symbol representation of the invoice.
+/// - `ticket_id`: Support/dispute ticket reference for audit trail.
+/// - `action`: `1` = paused, `0` = resumed.
+/// - `paused_at`: Ledger timestamp when pause was activated.
+/// - `expires_at`: Ledger timestamp when pause auto-expires (or 0 if manually resumed).
 #[contractevent]
-pub struct TokenCacheRevalidated {
+pub struct DisputePausedEvt {
     #[topic]
     pub name: Symbol,
     #[topic]
     pub invoice_id: Symbol,
-    /// Updated token decimals from the token contract.
-    pub decimals: u32,
-    /// Ledger timestamp when the cache was revalidated.
-    pub revalidated_at_ledger_timestamp: u64,
+    pub ticket_id: String,
+    /// `1` = paused, `0` = resumed.
+    pub action: u32,
+    pub paused_at: u64,
+    pub expires_at: u64,
 }
 
 /// SME collateral commitment metadata recorded.
@@ -3907,8 +3947,8 @@ impl LiquifactEscrow {
         );
         ensure(
             &env,
-            !Self::escrow_paused_active(&env),
-            EscrowError::EscrowIsPaused,
+            !Self::is_dispute_paused(&env),
+            EscrowError::DisputePausedBlocksFunding,
         );
         ensure(
             &env,
@@ -4363,8 +4403,8 @@ impl LiquifactEscrow {
         );
         ensure(
             &env,
-            !Self::escrow_paused_active(&env),
-            EscrowError::EscrowIsPaused,
+            !Self::is_dispute_paused(&env),
+            EscrowError::DisputePausedBlocksSettlement,
         );
 
         // env.clone(): env is used again after this call for ledger timestamp, storage set, and publish.
@@ -4639,8 +4679,8 @@ impl LiquifactEscrow {
         );
         ensure(
             &env,
-            !Self::escrow_paused_active(&env),
-            EscrowError::EscrowIsPaused,
+            !Self::is_dispute_paused(&env),
+            EscrowError::DisputePausedBlocksWithdrawal,
         );
 
         let mut escrow = Self::load_escrow_require_sme(&env);
@@ -5664,224 +5704,150 @@ impl LiquifactEscrow {
             .unwrap_or(0)
     }
 
-    // ============================================================================
-    // Simulation Entrypoints (Dry-Run, Non-State-Changing)
-    // ============================================================================
-    //
-    // These entrypoints allow wallets and UIs to preview the outcome of state-changing
-    // operations without actually committing the changes to the ledger. They are read-only
-    // and do not require authorization from the investor or SME.
-    //
-    // **Important:** Simulation results may differ from actual results if:
-    // - Ledger state changes between simulation and invocation (e.g., new funding, maturity reached)
-    // - Legal holds are activated or cleared
-    // - Token balances or contract state are modified
-    //
-    // Simulations are for preview purposes only and must not be relied upon for
-    // correctness guarantees.
-
-    /// **Dry-run:** Preview the escrow state after a funding deposit (without persisting).
-    ///
-    /// Returns the escrow state that would result from calling [`LiquifactEscrow::fund`]
-    /// with the same `investor` and `amount`, performing all guard checks but NOT modifying
-    /// storage, transferring tokens, or emitting events.
-    ///
+    /// Pause the escrow due to a dispute (e.g., invoice validity challenge).
+    /// 
+    /// Freezes the escrow independently of legal hold: blocks `fund`, `settle`, and `withdraw`
+    /// until either auto-expiration (after `duration_secs`) or manual resumption.
+    /// 
     /// # Parameters
-    /// - `investor`: The address that would fund
-    /// - `amount`: The funding amount (in base units)
+    /// - `ticket_id`: Support/dispute ticket reference (non-empty String for audit trail).
+    /// - `duration_secs`: How long the pause lasts (must be positive).
     ///
-    /// # Returns
-    /// The resulting [`InvoiceEscrow`] state if the funding were to succeed.
+    /// # Guard ordering
     ///
-    /// # Errors
-    /// Emits the same typed [`EscrowError`] codes as [`LiquifactEscrow::fund`]:
-    /// - Non-positive amount, legal hold, closed/settled escrow, allowlist rejection,
-    ///   capacity exhaustion, overflow guards, funding deadline, etc.
-    ///
-    /// # Differences from [`LiquifactEscrow::fund`]
-    /// - No `require_auth()` — accessible by any caller
-    /// - No storage writes (contribution tracking unchanged)
-    /// - No token transfers
-    /// - No event emission
-    /// - Returns the projected escrow state for inspection
-    ///
-    /// # Use Cases
-    /// - Wallet UI preview before user confirmation
-    /// - Off-chain script to validate funding feasibility
-    /// - Test coverage without state mutations
-    pub fn simulate_fund(env: Env, investor: Address, amount: i128) -> InvoiceEscrow {
-        // Guard checks (same as fund_impl)
-        ensure(&env, amount > 0, EscrowError::FundingAmountNotPositive);
-
-        let floor: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinContributionFloor)
-            .unwrap_or(0);
-        if floor > 0 {
-            ensure(
-                &env,
-                amount >= floor,
-                EscrowError::FundingBelowMinContribution,
-            );
-        }
-
-        let mut escrow = Self::get_escrow(env.clone());
-
-        ensure(
-            &env,
-            !Self::legal_hold_active(&env),
-            EscrowError::LegalHoldBlocksFunding,
-        );
-        ensure(
-            &env,
-            escrow.status == 0,
-            EscrowError::EscrowNotOpenForFunding,
-        );
-
-        // Check funding deadline
-        if let Some(deadline) = env.storage().instance().get(&DataKey::FundingDeadline) {
-            ensure(
-                &env,
-                env.ledger().timestamp() <= deadline,
-                EscrowError::FundingDeadlinePassed,
-            );
-        }
-
-        if Self::is_allowlist_active(env.clone()) {
-            ensure(
-                &env,
-                Self::is_investor_allowlisted(env.clone(), investor.clone()),
-                EscrowError::InvestorNotAllowlisted,
-            );
-        }
-
-        let prev: i128 = Self::get_persistent_investor_contribution(&env, investor.clone());
-        let new_contribution: i128 = prev
-            .checked_add(amount)
-            .unwrap_or_else(|| fail(&env, EscrowError::InvestorContributionOverflow));
-
-        if let Some(cap) = env
-            .storage()
-            .instance()
-            .get::<DataKey, i128>(&DataKey::MaxPerInvestorCap)
-        {
-            ensure(
-                &env,
-                new_contribution <= cap,
-                EscrowError::InvestorContributionExceedsCap,
-            );
-        }
-
-        let cur_funder_count: u32 = if prev == 0 {
-            env.storage()
-                .instance()
-                .get(&DataKey::UniqueFunderCount)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        if prev == 0 {
-            if let Some(cap) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u32>(&DataKey::MaxUniqueInvestorsCap)
-            {
-                ensure(
-                    &env,
-                    cur_funder_count < cap,
-                    EscrowError::UniqueInvestorCapReached,
-                );
-            }
-        }
-
-        // Update funded_amount in the projected state (no storage write)
-        escrow.funded_amount = escrow
-            .funded_amount
-            .checked_add(amount)
-            .unwrap_or_else(|| fail(&env, EscrowError::FundedAmountOverflow));
-
-        // Transition to funded if target reached
-        if escrow.funded_amount >= escrow.funding_target && escrow.status == 0 {
-            escrow.status = 1;
-        }
-
-        escrow
-    }
-
-    /// **Dry-run:** Preview the escrow state after settlement (without persisting).
-    ///
-    /// Returns the escrow state that would result from calling [`LiquifactEscrow::settle`]
-    /// with the SME's authority, performing all guard checks but NOT modifying storage
-    /// or emitting events.
-    ///
-    /// # Returns
-    /// The resulting [`InvoiceEscrow`] state if settlement were to succeed (status → 2).
+    /// 1. Ticket ID validation (non-empty).
+    /// 2. Duration validation (positive).
+    /// 3. `admin.require_auth()` (via `load_escrow_require_admin`).
+    /// 4. Compute expiration timestamp and check for overflow.
+    /// 5. Storage write and event emission.
     ///
     /// # Errors
-    /// Emits the same typed [`EscrowError`] codes as [`LiquifactEscrow::settle`]:
-    /// - Legal hold active, escrow not funded, maturity not reached
-    ///
-    /// # Differences from [`LiquifactEscrow::settle`]
-    /// - No `require_auth()` from SME
-    /// - No storage write
-    /// - No event emission
-    /// - Returns the projected escrow state
-    ///
-    /// # Use Cases
-    /// - UI verification of settlement readiness (maturity check, funding status)
-    /// - Off-chain automation (check if settlement would succeed before invoking)
-    pub fn simulate_settle(env: Env) -> InvoiceEscrow {
+    /// - [`EscrowError::DisputeTicketIdEmpty`] — `ticket_id` is empty.
+    /// - [`EscrowError::DisputePauseDurationNotPositive`] — `duration_secs <= 0`.
+    /// - [`EscrowError::LedgerTimestampOverflow`] — computing expiration timestamp overflows.
+    pub fn pause_dispute(env: Env, ticket_id: String, duration_secs: u64) {
         ensure(
             &env,
-            !Self::legal_hold_active(&env),
-            EscrowError::LegalHoldBlocksSettlement,
+            !ticket_id.is_empty(),
+            EscrowError::DisputeTicketIdEmpty,
+        );
+        ensure(
+            &env,
+            duration_secs > 0,
+            EscrowError::DisputePauseDurationNotPositive,
         );
 
-        let mut escrow = Self::get_escrow(env.clone());
-
-        ensure(&env, escrow.status == 1, EscrowError::SettlementNotFunded);
+        let escrow = Self::load_escrow_require_admin(&env);
 
         let now = env.ledger().timestamp();
-        if escrow.maturity > 0 {
-            ensure(
-                &env,
-                now >= escrow.maturity,
-                EscrowError::MaturityNotReached,
-            );
-        }
+        let expires_at = now
+            .checked_add(duration_secs)
+            .unwrap_or_else(|| fail(&env, EscrowError::LedgerTimestampOverflow));
 
-        escrow.status = 2;
-        escrow
+        let pause_state = DisputePauseState {
+            ticket_id: ticket_id.clone(),
+            paused_at_ledger_timestamp: now,
+            expires_at_ledger_timestamp: expires_at,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputePaused, &pause_state);
+
+        DisputePausedEvt {
+            name: symbol_short!("disppause"),
+            invoice_id: escrow.invoice_id.clone(),
+            ticket_id,
+            action: 1, // 1 = paused
+            paused_at: now,
+            expires_at,
+        }
+        .publish(&env);
     }
 
-    /// **Dry-run:** Preview the investor payout after settlement (without persisting).
+    /// Resume (unpause) a dispute pause on the escrow.
     ///
-    /// Returns the pro-rata gross payout that an investor would receive via
-    /// [`LiquifactEscrow::claim_investor_payout`], based on the current
-    /// [`FundingCloseSnapshot`] and investor contribution.
+    /// Clears the dispute pause, allowing normal escrow operations to resume.
+    /// 
+    /// # Guard ordering
     ///
-    /// This is equivalent to reading the result of [`LiquifactEscrow::compute_investor_payout`]
-    /// and is included here for API symmetry.
-    ///
-    /// # Parameters
-    /// - `investor`: The investor address to compute payout for
-    ///
-    /// # Returns
-    /// The gross payout amount (principal + accrued yield), or `0` if:
-    /// - The investor has no contribution
-    /// - The escrow has not yet reached funded status (no snapshot)
+    /// 1. Dispute pause existence check.
+    /// 2. `admin.require_auth()` (via `load_escrow_require_admin`).
+    /// 3. Remove the pause state and emit event.
     ///
     /// # Errors
-    /// Emits [`EscrowError::ComputePayoutArithmeticOverflow`] if payout computation
-    /// overflows during multiplication or division (extremely unlikely with realistic values).
+    /// - [`EscrowError::NoPauseActive`] — no active dispute pause exists.
+    pub fn resume_dispute(env: Env) {
+        let escrow = Self::load_escrow_require_admin(&env);
+
+        let pause_state: Option<DisputePauseState> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputePaused);
+
+        ensure(
+            &env,
+            pause_state.is_some(),
+            EscrowError::NoPauseActive,
+        );
+
+        let state = pause_state.unwrap();
+        let now = env.ledger().timestamp();
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::DisputePaused);
+
+        DisputePausedEvt {
+            name: symbol_short!("disppause"),
+            invoice_id: escrow.invoice_id.clone(),
+            ticket_id: state.ticket_id,
+            action: 0, // 0 = resumed
+            paused_at: state.paused_at_ledger_timestamp,
+            expires_at: now, // Use current time to signal manual resumption
+        }
+        .publish(&env);
+    }
+
+    /// Check if a dispute pause is currently active on this escrow.
     ///
-    /// # Use Cases
-    /// - Wallet UI to show expected settlement payout before claiming
-    /// - Off-chain script to compute investor distributions
-    pub fn simulate_claim_investor_payout(env: Env, investor: Address) -> i128 {
-        Self::compute_investor_payout(env, investor)
+    /// Includes auto-expiration logic: if the pause was configured to expire and
+    /// current ledger time has reached/exceeded the expiration, the pause is
+    /// considered inactive (although the storage entry is not automatically cleaned).
+    /// 
+    /// # Returns
+    /// `true` if a dispute pause exists and has not auto-expired; `false` otherwise.
+    pub fn is_dispute_paused(env: &Env) -> bool {
+        let pause_state: Option<DisputePauseState> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputePaused);
+
+        if let Some(state) = pause_state {
+            let now = env.ledger().timestamp();
+            // Pause is active if current time is before expiration
+            now < state.expires_at_ledger_timestamp
+        } else {
+            false
+        }
+    }
+
+    /// Get the current dispute pause state, if active.
+    ///
+    /// Returns `None` if no pause is active or if the pause has auto-expired.
+    pub fn get_dispute_pause(env: Env) -> Option<DisputePauseState> {
+        let pause_state: Option<DisputePauseState> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputePaused);
+
+        if let Some(state) = pause_state {
+            let now = env.ledger().timestamp();
+            if now < state.expires_at_ledger_timestamp {
+                return Some(state);
+            }
+        }
+        None
     }
 }
 

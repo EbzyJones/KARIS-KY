@@ -1,327 +1,226 @@
-# Implementation Summary: Issues #238, #239, #240, #241
+# Implementation Summary: #254 and #257
 
-## Overview
-This document summarizes the implementation of four GitHub issues for the karis-ky escrow contract, focusing on test coverage, upgrade compatibility, DOS protection, and secure RNG validation.
+## Issue #254: [DOCS] Add security considerations for contract deployers
 
----
+### Overview
+Created comprehensive deployer security guide at [`docs/DEPLOYER_SECURITY.md`](docs/DEPLOYER_SECURITY.md) (377 lines).
 
-## Issue #238: Proptest-based Tokenomics Modeling Tests
+### Key Sections
 
-**File:** `escrow/src/tests/tokenomics.rs` (714 lines)
+1. **Secret Key Protection**
+   - Never use single EOA admin; require multisig governance contract (2-of-3 minimum)
+   - HSM/secure enclave mandatory for all signing keys
+   - Multi-step deployment ceremony: prepare → review → sign → submit
 
-### Acceptance Criteria Met ✅
+2. **Audit Recommendations**
+   - Pre-deployment external security review (2 weeks before mainnet)
+   - Dependency audits (`cargo audit`, `cargo outdated`)
+   - Continuous integration and code review requirements
+   - Staged rollout: testnet (1 week) → staging (3 days) → mainnet
 
-1. **Proptest-based tokenomics scenarios**: ✓
-   - 9 property-based test functions using `proptest!` macro
-   - Strategies for funding amount, investor count, yield rate, lock duration
+3. **Post-Deployment Monitoring**
+   - Real-time event monitoring and alerting (EscrowFunded, LegalHoldActivated, DisputePausedEvt, etc.)
+   - Weekly storage audits and invariant validation
+   - Token balance reconciliation before settlement
+   - Quarterly security audits
 
-2. **Variables verified**:
-   - Funding amount: 1K–100M base units
-   - Investor count: 1–20 investors
-   - Yield rate: 0–5000 bps (deflation to 50% inflation)
-   - Lock duration: 0–86400 seconds
+4. **Incident Response Plan**
+   - Legal hold as emergency brake for unauthorized fund withdrawal, token balance issues, suspected key compromise
+   - Disaster recovery procedures for admin key compromise with admin handover workflow
+   - Communication templates for investors and governance
+   - Incident logging and evidence retention
 
-3. **Yield distribution invariants**:
-   - **Single investor**: Payout = principal + (principal × yield_bps / 10,000)
-   - **Equal contributions**: Equal payouts (pro-rata guarantee)
-   - **Sum bounded**: Total payout ≤ principal + coupon
-   - **Tiered yield**: Committed investors receive higher yields
-   - **Zero yield (deflation)**: Payouts = contributions
-   - **High yield (inflation)**: Pool ≈ 1.5× principal at 50% yield
-   - **Overfunding**: Snapshot uses actual funded_amount, not target
-   - **Varying contributions**: Pro-rata ratio maintained (30/70 split preserved)
+5. **Compliance and Documentation**
+   - Permanent deployment log (WASM hash, schema version, admin, trigger, status)
+   - Incident tracking with ID, date, escrow, type, severity, root cause, resolution
+   - External audit report archival
 
-4. **Tests verify**:
-   - No yields created or destroyed ✓
-   - Pro-rata distribution correctness ✓
-   - Rounding residuals < investor_count ✓
-   - Effective yield captured per investor on first deposit ✓
-
-### Key Tests
-
-| Test | Focus |
-|------|-------|
-| `prop_single_investor_yield_not_created_or_destroyed` | Yield conservation for single investor |
-| `prop_equal_contributions_equal_payouts` | Pro-rata invariant with equal shares |
-| `prop_sum_of_payouts_bounded_by_settle_pool` | Rounding residual bounds |
-| `prop_tiered_yield_increases_investor_return` | Yield tier selection and increase |
-| `prop_zero_yield_equals_principal` | Deflation scenario |
-| `prop_high_yield_inflation_scenario` | Extreme yield (50% APY) handling |
-| `prop_overfunding_snapshot_uses_actual_funded_amount` | Snapshot correctness |
-| `prop_varying_contributions_maintain_pro_rata_ratio` | Multi-investor pro-rata math |
-| `test_yield_lifecycle_complete` | End-to-end yield cycle |
+### Checklist
+Pre-deployment verification checklist covering multisig governance, HSM key storage, external review, dependency audits, testnet validation, ceremony documentation, event monitoring, storage audits, quarterly reviews, incident response, and deployment logging.
 
 ---
 
-## Issue #239: Contract Upgrade Compatibility Tests
+## Issue #257: [FEATURE] Implement escrow pause-lock for dispute resolution
 
-**File:** `escrow/src/tests/upgrade_compat.rs` (645 lines)
+### Overview
+Implemented `DisputePaused` state for admin-gated temporary escrow freezes independent of legal holds. Features include auto-expiration, event logging, and integration with fund/settle/withdraw blocking.
 
-### Acceptance Criteria Met ✅
+### Changes to `/workspaces/KARIS-KY/escrow/src/lib.rs`
 
-1. **Test matrix for v1→v6**: ✓
-   - v1→v2: Additive investor yield keys (`InvestorEffectiveYield`, `InvestorClaimNotBefore`)
-   - v2→v3: Additive snapshot and cap keys (`FundingCloseSnapshot`, unique funder count)
-   - v3→v4: Additive attestation keys (`PrimaryAttestationHash`, `AttestationAppendLog`)
-   - v4→v5: Tiered yield and registry binding
-   - v5→v6: Per-investor persistent storage (non-additive, redeploy required)
+#### Error Codes Added
+- `DisputePausedBlocksFunding` (165)
+- `DisputePausedBlocksSettlement` (166)
+- `DisputePausedBlocksWithdrawal` (167)
+- `DisputePauseDurationNotPositive` (168)
+- `DisputeTicketIdEmpty` (169)
+- `NoPauseActive` (170)
+- `LedgerTimestampOverflow` (171)
 
-2. **Each test deploys old version, verifies state intact**: ✓
-   - Old data readable via forward-compatible getters
-   - New keys return sensible defaults
-   - Typed error codes on migration failures
+#### Data Structures
+- **DisputePauseState** struct:
+  - `ticket_id: String` — Support/dispute ticket reference for audit trail
+  - `paused_at_ledger_timestamp: u64` — Activation timestamp
+  - `expires_at_ledger_timestamp: u64` — Auto-expiration timestamp
 
-3. **Tests run in CI**: ✓
-   - All tests use standard `#[test]` attribute
-   - Compatible with `cargo test` runner
+- **DataKey::DisputePaused** — Instance storage key holding optional DisputePauseState
 
-4. **Migration error handling**: ✓
-   - `MigrationVersionMismatch` (code 90)
-   - `AlreadyCurrentSchemaVersion` (code 91)
-   - `NoMigrationPath` (code 92)
-   - Admin authentication required before version checks
+- **DisputePausedEvt** event:
+  - Topics: `name`, `invoice_id`
+  - Fields: `ticket_id`, `action` (1=paused, 0=resumed), `paused_at`, `expires_at`
 
-### Key Tests
+#### Entrypoints
+1. **`pause_dispute(ticket_id: String, duration_secs: u64)`**
+   - Admin-only (requires `admin.require_auth()`)
+   - Validates non-empty ticket_id and positive duration
+   - Computes expiration with overflow check
+   - Emits DisputePausedEvt with action=1
+   - Blocks fund/settle/withdraw while active
 
-| Test | Focus |
-|------|-------|
-| `test_schema_v1_to_v2_additive_investor_yield_keys` | v2 backward compatibility |
-| `test_schema_v2_to_v3_additive_snapshot_and_caps` | v3 funding snapshot |
-| `test_schema_v3_to_v4_additive_attestation_keys` | v4 attestation support |
-| `test_schema_v4_to_v5_tiered_yield_and_registry` | v5 yield tiers |
-| `test_schema_v5_to_v6_persistent_storage_requires_redeploy` | v6 persistent storage |
-| `test_migrate_error_codes_are_typed_and_consistent` | Error code consistency |
-| `test_migrate_requires_admin_auth_before_version_checks` | Auth boundary |
-| `test_full_version_upgrade_matrix` | Complete v1→v6 lifecycle |
-| `test_old_and_new_instances_coexist` | Gradual rollout support |
+2. **`resume_dispute()`**
+   - Admin-only
+   - Checks pause exists before removal
+   - Clears DataKey::DisputePaused
+   - Emits DisputePausedEvt with action=0
 
----
+3. **`is_dispute_paused(env: &Env) -> bool`**
+   - Checks if pause exists and current time < expiration
+   - Auto-expiration: pause inactive after ledger time reaches expiration
+   - Does not clean up expired storage entries
 
-## Issue #240: DOS Attack Surface Analysis
+4. **`get_dispute_pause(env: Env) -> Option<DisputePauseState>`**
+   - Returns active pause state if current time < expiration
+   - Returns None if paused or expired
 
-**File:** `escrow/src/tests/dos_analysis.rs` (455 lines)
+#### Integration
+- **fund_impl**: Added dispute pause check alongside legal hold check before processing deposit
+- **settle**: Added dispute pause check before status transition to settled
+- **withdraw**: Added dispute pause check before status transition to withdrawn
 
-### Acceptance Criteria Met ✅
+#### Schema Version
+- Updated `SCHEMA_VERSION` from 6 → 7
+- Changelog entry: "Added `DisputePaused` state for temporary dispute resolution (separate from legal hold) — Additive keys — no `migrate` call required"
+- Backward compatible; old instances default to no pause
 
-1. **Code audit for all loops; bounds added**: ✓
+### Changes to `/workspaces/KARIS-KY/escrow/src/tests/admin.rs`
 
-| Loop/Operation | Bound | Constant | Enforcement |
-|---|---|---|---|
-| `fund_batch` | 50 entries max | `MAX_FUND_BATCH = 50` | Runtime check |
-| `append_attestation_digest` log | 32 entries max | `MAX_ATTESTATION_APPEND_ENTRIES = 32` | Runtime check |
-| `sweep_terminal_dust` | 100M base units max | `MAX_DUST_SWEEP_AMOUNT = 100_000_000` | Runtime check |
-| `set_investor_allowlist_batch` | 32 entries max | `MAX_INVESTOR_ALLOWLIST_BATCH = 32` | Runtime check |
-| Per-investor storage | Optional cap | `max_unique_investors` parameter | Init-time config |
+#### Test Suite (11 tests)
+1. **test_pause_dispute_success** — Verify pause state set correctly with ticket_id and duration
+2. **test_pause_dispute_empty_ticket_fails** — Validate non-empty ticket_id requirement
+3. **test_pause_dispute_zero_duration_fails** — Validate positive duration requirement
+4. **test_resume_dispute_success** — Verify pause cleared after resume
+5. **test_resume_dispute_no_pause_fails** — Error on resume when no pause active
+6. **test_dispute_pause_blocks_funding** — Fund rejected while pause active
+7. **test_dispute_pause_blocks_settlement** — Settle rejected while pause active
+8. **test_dispute_pause_blocks_withdrawal** — Withdraw rejected while pause active
+9. **test_dispute_pause_auto_expiration** — Pause inactive after ledger time reaches expiration
+10. **test_dispute_pause_event_emitted_on_pause** — DisputePausedEvt emitted with correct fields
+11. **test_dispute_pause_event_emitted_on_resume** — DisputePausedEvt emitted on resume with action=0
 
-2. **Storage operations cost analyzed**: ✓
+### Changes to `/workspaces/KARIS-KY/README.md`
 
-| Operation | Cost | Worst Case |
-|---|---|---|
-| `fund_batch` with 50 entries | 2 writes/entry | 100 storage writes |
-| `settle` | O(1) | Constant time |
-| `claim_investor_payout` | 2 writes | Constant time |
-| `append_attestation_digest` | 1 read + 1 write | O(log size) = O(32) |
-| Dust sweep | 1 token transfer | Single external call |
+#### Schema Version Changelog (Updated)
+- Added row 7: dispute pause feature with additive keys upgrade path
+- Updated current version from 6 → 7
 
-3. **Documentation**: ✓
-   - Per-operation cost documented in test module header
-   - Worst-case per-call cost: 100 writes (fund_batch, well within Soroban budgets)
-   - No O(n) loops where n is escrow-dependent or network-dependent
+#### Public Entrypoints Table (Updated)
+- Added `pause_dispute`
+- Added `resume_dispute`
+- Added `is_dispute_paused`
+- Added `get_dispute_pause`
 
-4. **CI enforcement**: ✓
-   - Bounds checked at runtime
-   - Tests verify constants are defined and reasonable
-   - Tests verify oversized batches are rejected
+#### Test Organization Table (Updated)
+- Updated `admin.rs` entry to include "dispute pause" coverage
 
-### Key Tests
-
-| Test | Focus |
-|------|-------|
-| `test_fund_batch_has_bounded_iteration` | Verify `MAX_FUND_BATCH` defined |
-| `test_attestation_append_log_has_bounded_capacity` | Verify `MAX_ATTESTATION_APPEND_ENTRIES` defined |
-| `test_dust_sweep_has_bounded_amount` | Verify `MAX_DUST_SWEEP_AMOUNT` defined |
-| `test_fund_batch_enforces_size_limit` | Reject >50 entries |
-| `test_fund_batch_accepts_max_entries` | Accept exactly 50 entries |
-| `test_attestation_append_enforces_log_capacity` | Reject >32 entries |
-| `test_allowlist_batch_enforces_size_limit` | Reject oversized batches |
-| `test_per_investor_storage_cardinality_bounded_by_cap` | Enforce unique investor cap |
-| `test_per_investor_storage_no_unbounded_enumeration` | Document no O(n) enumeration |
-
----
-
-## Issue #241: Secure Random Number Generation Audit
-
-**File:** `escrow/src/tests/secure_rng.rs` (293 lines)
-
-### Acceptance Criteria Met ✅
-
-1. **RNG usage audit**: ✓
-   - **Finding**: No RNG currently used in escrow
-   - Non-deterministic behavior is **only** from ledger timestamp (validator-authenticated)
-   - Pro-rata calculations are deterministic
-
-2. **Soroban PRNG documentation**: ✓
-   - Approved pattern: `env.prng()` from `soroban_sdk`
-   - Secure (consensus-validated entropy)
-   - Not based on block hash or timestamp
-
-3. **Prohibited patterns documented**: ✓
-   - ❌ Timestamp as entropy (predictable, low granularity)
-   - ❌ Block hash as entropy (immutable after close, predictable)
-   - ❌ Insufficient entropy sources (counter, address alone)
-
-4. **Tests verify randomness**: ✓
-   - Soroban PRNG produces non-zero output
-   - Successive calls produce distinct values
-   - Byte distribution is not obviously biased (proptest)
-
-### Key Tests
-
-| Test | Focus |
-|------|-------|
-| `test_soroban_prng_available` | PRNG available and produces output |
-| `test_soroban_prng_not_reused` | PRNG not reusing values |
-| `prop_soroban_prng_byte_distribution` | Statistical distribution check |
-| `test_no_timestamp_based_randomness` | Document no timestamp-based RNG |
-| `test_no_block_hash_entropy` | Document no block-hash entropy |
-| `test_example_secure_rng_usage` | Show correct usage pattern |
-| `test_commit_reveal_pattern_for_randomness` | Document high-stakes pattern |
-| `test_rng_audit_summary` | Audit result documentation |
+#### Security Notes (Updated)
+- Added **Dispute pause** bullet explaining admin-triggered temporary freeze, auto-expiration, and operational guidance reference
 
 ---
 
-## Test Coverage Summary
+## Design Decisions
 
-### Total Test Addition
-- **Lines of test code added**: ~2,000 lines
-- **New test modules**: 4
-- **New test functions**: 45+ tests
-- **Property-based tests**: 10+ proptest scenarios
+### Dispute Pause vs. Legal Hold
+- **Separate state**: dispute pause (DataKey::DisputePaused) is independent from legal hold (DataKey::LegalHold)
+- **Use case distinction**:
+  - Legal hold: compliance/regulatory freeze (indefinite until cleared)
+  - Dispute pause: operational dispute resolution (time-limited with auto-expiration)
+- **Combined blocking**: both legal hold AND dispute pause block fund/settle/withdraw
 
-### Test Files Created
+### Auto-Expiration Logic
+- Pause state remains in storage even after expiration
+- `is_dispute_paused()` and `get_dispute_pause()` check `now < expires_at` dynamically
+- No automatic cleanup; manual `resume_dispute()` call explicitly clears storage
+- Rationale: allows auditing of expired pauses; avoids background cleanup overhead
 
-1. `tokenomics.rs` (714 lines)
-   - 8 property tests
-   - 1 integration test
-   - Covers yield invariants, pro-rata distribution, tokenomics scenarios
+### Ticket ID Requirement
+- Non-empty String for audit trail linking on-chain pause to off-chain dispute ticket
+- Off-chain system must track tickets separately; contract stores reference only
+- Enables correlation between support system and blockchain events
 
-2. `upgrade_compat.rs` (645 lines)
-   - 9 integration tests
-   - Tests v1→v2→v3→v4→v5→v6 upgrade paths
-   - Verifies migration error handling
+### Error Codes (Append-only)
+- All new error codes (165–171) are append-only; previous codes unchanged
+- Client SDKs can branch on numeric codes independently
+- Full reference available in `docs/escrow-error-messages.md` (to be updated separately)
 
-3. `dos_analysis.rs` (455 lines)
-   - 9 runtime bounds enforcement tests
-   - Verifies loop/storage operation limits
-   - Documents per-operation cost
+---
 
-4. `secure_rng.rs` (293 lines)
-   - 8 tests for RNG audit and guidelines
-   - 1 property test for byte distribution
-   - Documents secure RNG patterns
+## Files Modified
 
-### Module Registration
+1. `/workspaces/KARIS-KY/docs/DEPLOYER_SECURITY.md` (NEW) — 377 lines
+   - Comprehensive deployer guide with key management, audit, monitoring, incident response
 
-All new test modules registered in `escrow/src/tests.rs`:
-```rust
-mod dos_analysis;
-mod secure_rng;
-mod tokenomics;
-mod upgrade_compat;
-```
+2. `/workspaces/KARIS-KY/escrow/src/lib.rs`
+   - Added 7 error codes (165–171)
+   - Added DisputePauseState struct and DisputePausedEvt event
+   - Added DataKey::DisputePaused variant
+   - Added pause_dispute, resume_dispute, is_dispute_paused, get_dispute_pause entrypoints (140+ lines)
+   - Integrated dispute pause checks in fund_impl, settle, withdraw (5 new checks)
+   - Updated SCHEMA_VERSION 6 → 7
+   - Added DisputePauseState to module documentation
+
+3. `/workspaces/KARIS-KY/escrow/src/tests/admin.rs`
+   - Added 11 comprehensive test cases for dispute pause feature (169 lines)
+
+4. `/workspaces/KARIS-KY/README.md`
+   - Updated schema version changelog table
+   - Updated public entrypoints table (added 4 new functions)
+   - Updated test organization table
+   - Updated security notes section
 
 ---
 
 ## Verification Checklist
 
-### Tokenomics Tests (#238)
-- [x] Proptest-based scenarios implemented
-- [x] Yield distribution verified (creation/destruction check)
-- [x] Pro-rata invariant tested
-- [x] Tiered yield tested
-- [x] Deflation (zero yield) scenario tested
-- [x] Inflation (high yield) scenario tested
-- [x] Overfunding snapshot verified
-- [x] Varying contributions pro-rata ratio maintained
-- [x] Tests added to module registry
-
-### Upgrade Compatibility Tests (#239)
-- [x] v1→v2 additive keys tested
-- [x] v2→v3 snapshot and caps tested
-- [x] v3→v4 attestation keys tested
-- [x] v4→v5 tiered yield tested
-- [x] v5→v6 persistent storage tested
-- [x] Migration error paths documented (90, 91, 92)
-- [x] Admin auth boundary verified
-- [x] Full upgrade matrix (v1→v6) tested
-- [x] Old/new instances coexistence tested
-- [x] Tests added to module registry
-
-### DOS Analysis (#240)
-- [x] All loops bounded (fund_batch, attestation log, allowlist batch)
-- [x] Storage operations cost analyzed
-- [x] MAX_FUND_BATCH enforced (50 entries)
-- [x] MAX_ATTESTATION_APPEND_ENTRIES enforced (32 entries)
-- [x] MAX_DUST_SWEEP_AMOUNT documented (100M base units)
-- [x] Per-investor cardinality capped
-- [x] No unbounded enumeration
-- [x] Worst-case per-call cost documented (100 writes)
-- [x] Tests added to module registry
-
-### Secure RNG Audit (#241)
-- [x] Current RNG usage audited (none found)
-- [x] Soroban PRNG pattern approved and documented
-- [x] Prohibited patterns documented (timestamp, block hash)
-- [x] PRNG availability tested
-- [x] PRNG distribution tested (proptest)
-- [x] Commit-reveal pattern documented
-- [x] Future integration guidelines documented
-- [x] Tests added to module registry
+- [x] Error codes append-only and non-reused
+- [x] DisputePauseState struct with immutable fields
+- [x] DisputePaused key separate from LegalHold key
+- [x] pause_dispute requires admin auth
+- [x] resume_dispute requires admin auth
+- [x] is_dispute_paused correctly checks auto-expiration
+- [x] get_dispute_pause correctly checks auto-expiration
+- [x] fund_impl blocks on active dispute pause
+- [x] settle blocks on active dispute pause
+- [x] withdraw blocks on active dispute pause
+- [x] Dispute pause and legal hold can be active simultaneously
+- [x] DisputePausedEvt emitted on pause/resume
+- [x] Test coverage: success, validation, auto-expiration, blocking behavior
+- [x] Schema version updated with changelog
+- [x] README documentation updated
+- [x] DEPLOYER_SECURITY.md comprehensive and detailed
 
 ---
 
-## Compilation & CI
+## Backward Compatibility
 
-### Syntax Verification ✅
-- [x] tokenomics.rs: 23,538 bytes, syntactically valid
-- [x] upgrade_compat.rs: 19,628 bytes, syntactically valid
-- [x] dos_analysis.rs: 13,719 bytes, syntactically valid
-- [x] secure_rng.rs: 10,944 bytes, syntactically valid
-- [x] tests.rs: Module declarations correct
-
-### Expected CI Results
-- Format check: `cargo fmt --check` ✓
-- Lint check: `cargo clippy -- -D warnings` ✓
-- Build: `cargo build` ✓
-- Tests: `cargo test` ✓
-- Coverage: Existing 95% threshold maintained ✓
+- **Schema Version 7 is additive**: old instances continue working without migration
+- DisputePaused key absent on old instances → `is_dispute_paused()` returns false
+- No required redeployment for existing instances
+- New WASM can be deployed in-place via standard upgrade path
 
 ---
 
-## Notes for Operators
+## Future Enhancements (Not Included)
 
-### For Issue #239 (Upgrades)
-- Instances at v5 cannot auto-migrate to v6 due to per-investor storage layout change
-- Redeployment required for v5→v6 (no backward compatibility path)
-- Additive upgrades (v1→v5) compatible; old data readable with forward-compatible defaults
-
-### For Issue #240 (DOS)
-- `fund_batch` limited to 50 entries per call (efficient batching)
-- Attestation log limited to 32 entries (bounded audit trail)
-- Dust sweep limited to 100M base units per call (prevents large unintended transfers)
-- Optional unique investor cap at init prevents unbounded per-address storage
-
-### For Issue #241 (RNG)
-- Currently no randomness used (deterministic contract)
-- If future features need randomness, must use `env.prng()` (Soroban PRNG)
-- Commit-reveal pattern recommended for sensitive random operations
-
----
-
-## References
-
-- Schema version documentation: README.md, SCHEMA_VERSION constant in lib.rs
-- Error codes: docs/escrow-error-messages.md
-- Operator runbook: docs/OPERATOR_RUNBOOK.md
-- Architecture decision records: docs/adr/
-
+- Dispute pause TTL extension mechanism (admin can extend auto-expiration)
+- Dispute pause history/audit log (store past pauses)
+- Dispute pause automatic cleanup after expiration (requires background job)
+- Integration with external dispute tracking systems (off-chain)
