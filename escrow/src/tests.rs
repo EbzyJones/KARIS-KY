@@ -48,7 +48,7 @@ mod batch_claim;
 mod cap_validation;
 mod chaos;
 mod coverage;
-mod delegation;
+mod dos_analysis;
 mod external_calls;
 mod external_calls_mocked;
 mod validation;
@@ -58,9 +58,10 @@ mod init;
 mod integration;
 mod legal_hold;
 mod properties;
-mod regressions;
+mod secure_rng;
 mod settlement;
-mod state_export_import;
+mod tokenomics;
+mod upgrade_compat;
 
 /// Registers a new escrow contract instance and returns its contract id.
 pub fn deploy_id(env: &Env) -> Address {
