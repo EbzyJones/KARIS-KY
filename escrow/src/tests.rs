@@ -8,10 +8,11 @@
 )]
 #[allow(unused_imports)]
 use super::{
-    AttestationDigestRevoked, CollateralRecordedEvt, DataKey, EscrowError, EscrowFunded,
-    EscrowInitialized, FundingTargetUpdated, LiquifactEscrow, LiquifactEscrowClient,
-    MaxUniqueInvestorsCapLowered, YieldSlippageWarning, YieldTier, MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT,
-    MAX_FUND_BATCH, SCHEMA_VERSION,
+    AttestationDigestRevoked, CollateralRecordedEvt, ContractVersionMetadata, DataKey, EscrowError,
+    EscrowFunded, EscrowInitialized, FundingTargetUpdated, LiquifactEscrow, LiquifactEscrowClient,
+    MaxUniqueInvestorsCapLowered, TokenTransferFailedEvt, YieldTier,
+    MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT, MAX_FUND_BATCH, MAX_INVESTOR_PAGE_SIZE,
+    SCHEMA_VERSION,
 };
 use soroban_sdk::{
     symbol_short,
@@ -46,6 +47,7 @@ mod admin;
 mod attestations;
 mod batch_claim;
 mod cap_validation;
+mod chaos;
 mod coverage;
 mod external_calls;
 mod external_calls_mocked;
@@ -136,7 +138,8 @@ pub fn default_init(client: &LiquifactEscrowClient<'_>, env: &Env, admin: &Addre
         &None,
         &None,
         &None,
-        &None, // No funding deadline
+        &None, // No yield slippage threshold
+        &None, // No settlement notifier
     );
 }
 
@@ -181,7 +184,8 @@ pub fn init_and_fund_with_real_token<'a>(
         &None,
         &None,
         &None,
-        &None,
+        &None, // No yield slippage threshold
+        &None, // No settlement notifier
     );
 
     let investor = Address::generate(env);

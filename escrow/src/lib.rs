@@ -134,9 +134,10 @@ pub mod validation;
 /// | 4 | Added `PrimaryAttestationHash`, `AttestationAppendLog` | Additive keys — no `migrate` call required |
 /// | 5 | Added `YieldTierTable`, `RegistryRef`, `Treasury`; `fund_with_commitment` | **Redeploy required** if `InvoiceEscrow` XDR changed |
 /// | 6 | Per-investor keys moved to **persistent** storage (see ADR-007) | **Redeploy required** — no `migrate` path (addresses not enumerable) |
+/// | 7 | Added `SettlementNotifierContract`, `CreatedAt`, status 5 (archived), `archive_escrow`, `notify_settlement`, `get_registry_listing` | Additive keys + new entrypoints — **redeploy required** for new status codes |
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Contract interface version — identifies the ABI surface exposed to callers.
 ///
@@ -164,10 +165,6 @@ pub const SCHEMA_VERSION: u32 = 6;
 ///   on a case-by-case basis and prefer a bump when in doubt.
 ///
 /// See `docs/escrow-interface-versioning.md` for the full policy and examples.
-/// Bumped to 2 because new entrypoints were added:
-/// - `batch_claim_investor_payouts` (batch claim endpoint)
-/// - `verify_investor_proof` (Merkle proof verification)
-/// - `get_funding_close_merkle_root` (Merkle root getter)
 pub const CONTRACT_INTERFACE_VERSION: u32 = 2;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
@@ -182,9 +179,11 @@ pub const MAX_INVESTOR_ALLOWLIST_BATCH: u32 = 32;
 /// Mirrors the spirit of `MAX_ATTESTATION_APPEND_ENTRIES` to limit per-call work.
 pub const MAX_FUND_BATCH: u32 = 50;
 
-/// Upper bound on [`LiquifactEscrow::batch_claim_investor_payouts`] entries to keep
-/// persistent storage writes and CPU bounded within a single invocation.
-pub const MAX_BATCH_CLAIM: u32 = 50;
+/// Maximum number of investor addresses returned per [`LiquifactEscrow::list_investors`] call.
+///
+/// Caps per-call storage read cost and prevents unbounded response sizes in UI/dashboard
+/// tooling. Callers should page through results using `offset` and `limit`.
+pub const MAX_INVESTOR_PAGE_SIZE: u32 = 1_000;
 
 /// Upper bound on [`LiquifactEscrow::sweep_terminal_dust`] per call (base units of the funding token).
 ///
@@ -406,14 +405,12 @@ pub enum EscrowError {
     NoPendingAdmin = 163,
     /// The contract's funding-token balance is less than `funded_amount` at withdraw time.
     /// Funds must be custodied in this contract before the SME can pull them.
-    InsufficientContractBalance = 164,
+    InsufficientContractBalance = 167,
 
-    /// [`LiquifactEscrow::batch_claim_investor_payouts`] received an empty investors vector.
-    BatchClaimEmpty = 170,
-    /// [`LiquifactEscrow::batch_claim_investor_payouts`] exceeded [`MAX_BATCH_CLAIM`].
-    BatchClaimTooLarge = 171,
-    /// [`LiquifactEscrow::verify_investor_proof`] proof verification failed.
-    MerkleProofInvalid = 172,
+    /// [`LiquifactEscrow::list_investors`] received a `limit` of zero.
+    PaginationLimitZero = 165,
+    /// [`LiquifactEscrow::list_investors`] `limit` exceeds [`MAX_INVESTOR_PAGE_SIZE`].
+    PaginationLimitExceedsMax = 166,
 }
 
 #[inline(always)]
@@ -540,22 +537,19 @@ pub enum DataKey {
     DistributedPrincipal,
     /// Optional funding deadline (ledger timestamp); after it passes, new funds are rejected.
     FundingDeadline,
-    /// Optional yield slippage threshold in basis points (bps) for real-time anomaly detection.
-    /// When set, [`LiquifactEscrow::claim_investor_payout`] compares actual vs. expected yield.
-    /// If deviation exceeds threshold, a [`YieldSlippageWarning`] is emitted.
-    /// Absent ⇒ `0` (no slippage check).
-    YieldSlippageThreshold,
-    /// Merkle root of investor contributions at funding close; stored once alongside
-    /// [`FundingCloseSnapshot`] as a compact proof anchor. Absent ⇒ not computed.
-    /// Enables gas-efficient [`LiquifactEscrow::verify_investor_proof`] calls.
-    FundingCloseMerkleRoot,
-    /// Number of entries in the attestation append log (replaces reading the full Vec).
-    /// Absent ⇒ `0`. Written atomically with each append; used for O(1) capacity checks.
-    AttestationAppendLogCount,
-    /// Individual attestation log entry at the given index (0-based).
-    /// Each entry is a 32-byte digest; stored independently to avoid full-Vec deserialization.
-    /// Absent ⇒ no entry at that index. See [`DataKey::AttestationAppendLogCount`] for length.
-    AttestationLogEntry(u32),
+    /// Sequential index mapping a `u32` position to an investor [`Address`].
+    ///
+    /// Written exactly once per new investor (when `prev == 0` in `fund_impl`).
+    /// Used by [`LiquifactEscrow::list_investors`] for efficient pagination without
+    /// loading all investor addresses simultaneously.
+    /// **Instance** storage (lives in the same footprint as other escrow data).
+    InvestorIndex(u32),
+    /// Total count of investor addresses recorded in the [`InvestorIndex`] list.
+    ///
+    /// Mirrors [`DataKey::UniqueFunderCount`] but is maintained separately so the
+    /// ordered list can be paginated independently of the funder-count counter.
+    /// Written as `0` at init; incremented once per new investor.
+    InvestorCount,
 }
 
 // --- Data types ---
@@ -579,7 +573,7 @@ pub struct InvoiceEscrow {
     pub funded_amount: i128,
     pub yield_bps: i64,
     pub maturity: u64,
-    /// 0 = open, 1 = funded, 2 = settled, 3 = withdrawn (SME pulled liquidity), 4 = cancelled (admin-gated; investors may refund)
+    /// 0 = open, 1 = funded, 2 = settled, 3 = withdrawn (SME pulled liquidity), 4 = cancelled (admin-gated; investors may refund), 5 = archived (admin-gated; read-only terminal)
     pub status: u32,
 }
 
@@ -681,6 +675,25 @@ pub struct EscrowSummary {
     pub has_primary_attestation: bool,
     /// Number of entries in the attestation append log.
     pub attestation_log_length: u32,
+}
+
+/// Metadata about the deployed contract version, including upgrade recommendations.
+///
+/// Returned by [`LiquifactEscrow::get_version_metadata`] for off-chain operators and
+/// dashboards to determine whether to upgrade a running contract instance.
+#[contracttype]
+#[derive(Debug, PartialEq)]
+pub struct ContractVersionMetadata {
+    /// Current schema version (matches [`SCHEMA_VERSION`] when deployed).
+    pub version: u32,
+    /// Minimum version that can be migrated to this version without redeploy.
+    /// Set to [`SCHEMA_VERSION`] itself when no migration path exists.
+    pub min_compatible_version: u32,
+    /// `true` if the operator should consider upgrading (major version gap, deprecated schema).
+    ///
+    /// Currently always `false` since schema version 6 has no migration path from earlier versions.
+    /// Operators must evaluate upgrade necessity based on version and `min_compatible_version`.
+    pub upgrade_recommended: bool,
 }
 
 // --- Events ---
@@ -988,68 +1001,31 @@ pub struct ContractUpgraded {
     pub new_wasm_hash: BytesN<32>,
 }
 
-/// Emitted when the funding-close Merkle root is bound at the funded transition.
-/// Carries the 32-byte root so off-chain verifiers can cross-check proofs
-/// without a separate storage read.
+/// Emitted when a token transfer call fails with a typed [`EscrowError`] (codes 36–41).
+///
+/// Soroban contract host panics propagate to the transaction boundary, so this event
+/// is emitted speculatively in the external_calls error path before the panic. Indexers
+/// that subscribe to this event should treat it as a signal that a token-related error
+/// caused the transaction to revert.
+///
+/// # Operator guidance (#213)
+/// When this event is indexed in a failed transaction, operators should:
+/// - Verify the token contract at [`DataKey::FundingToken`] is still a compliant SEP-41 contract.
+/// - Check the `error_code` field against `docs/escrow-error-messages.md` (codes 36–41).
+/// - If the token contract has been paused or upgraded incompatibly, pause new funding via
+///   `set_legal_hold` and contact the token issuer before clearing.
+/// - Distinguish: codes 36–39 are likely permanent (bad token); code 37 may be transient
+///   (insufficient balance — SME has not yet funded the escrow contract with the withdraw amount).
 #[contractevent]
-pub struct FundingCloseMerkleRootBound {
+pub struct TokenTransferFailedEvt {
     #[topic]
     pub name: Symbol,
     #[topic]
     pub invoice_id: Symbol,
-    /// Keccak-256 Merkle root of (investor_address, contribution) pairs.
-    pub merkle_root: BytesN<32>,
-}
-
-/// Diagnostic information for contract errors, emitted alongside error returns.
-///
-/// SDKs and integrators parse this struct to provide user-friendly error messages,
-/// recovery suggestions, and contextual information (e.g., "can claim in X blocks").
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ErrorDiagnostic {
-    /// Error code (matches [`EscrowError`] discriminant).
+    /// The SEP-41 token address that caused the failure.
+    pub token: Address,
+    /// Numeric code from [`EscrowError`] (36–41) identifying the failure type.
     pub error_code: u32,
-    /// Human-readable error message.
-    pub message: String,
-    /// Suggested recovery action or next steps.
-    pub recovery_action: String,
-    /// Additional context (e.g., timestamp, block number, current value).
-    pub context: Option<String>,
-}
-
-impl ErrorDiagnostic {
-    /// Create a new diagnostic for the given error code with a message and recovery action.
-    pub fn new(env: &Env, error_code: u32, message: &str, recovery_action: &str) -> Self {
-        ErrorDiagnostic {
-            error_code,
-            message: String::from_str(env, message),
-            recovery_action: String::from_str(env, recovery_action),
-            context: None,
-        }
-    }
-
-    /// Create a diagnostic with additional context information.
-    pub fn with_context(env: &Env, error_code: u32, message: &str, recovery_action: &str, context: &str) -> Self {
-        ErrorDiagnostic {
-            error_code,
-            message: String::from_str(env, message),
-            recovery_action: String::from_str(env, recovery_action),
-            context: Some(String::from_str(env, context)),
-        }
-    }
-}
-
-/// Emitted when an error occurs with diagnostic information for caller recovery.
-///
-/// SDKs should listen for this event and parse the diagnostic to provide
-/// user-friendly error messages, recovery suggestions, and contextual information.
-#[contractevent]
-pub struct ErrorDiagnosticEmitted {
-    #[topic]
-    pub name: Symbol,
-    /// Diagnostic information including error code, message, recovery action, and context.
-    pub diagnostic: ErrorDiagnostic,
 }
 
 #[contract]
@@ -1216,6 +1192,7 @@ impl LiquifactEscrow {
         legal_hold_clear_delay: Option<u64>,
         funding_deadline: Option<u64>,
         yield_slippage_threshold: Option<i64>,
+        settlement_notifier_contract: Option<Address>,
     ) -> InvoiceEscrow {
         admin.require_auth();
 
@@ -1294,6 +1271,8 @@ impl LiquifactEscrow {
         env.storage()
             .instance()
             .set(&DataKey::UniqueFunderCount, &0u32);
+        // Initialize the investor-list count alongside the funder count.
+        env.storage().instance().set(&DataKey::InvestorCount, &0u32);
 
         if let Some(cap) = max_per_investor {
             ensure(&env, cap > 0, EscrowError::MaxPerInvestorNotPositive);
@@ -1328,6 +1307,18 @@ impl LiquifactEscrow {
                 .instance()
                 .set(&DataKey::YieldSlippageThreshold, &threshold);
         }
+
+        // Store optional settlement notifier contract address
+        if let Some(ref notifier) = settlement_notifier_contract {
+            env.storage()
+                .instance()
+                .set(&DataKey::SettlementNotifierContract, notifier);
+        }
+
+        // Store creation timestamp for registry listings
+        env.storage()
+            .instance()
+            .set(&DataKey::CreatedAt, &env.ledger().timestamp());
 
         EscrowInitialized {
             name: symbol_short!("escrow_ii"),
@@ -1368,6 +1359,21 @@ impl LiquifactEscrow {
     /// proof of registry membership — query the registry contract directly to verify on-chain state.
     pub fn get_registry_ref(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::RegistryRef)
+    }
+
+    /// Returns the optional settlement notifier contract address stored at
+    /// [`DataKey::SettlementNotifierContract`], or [`None`] when no notifier was configured
+    /// at [`LiquifactEscrow::init`].
+    pub fn get_settlement_notifier_contract(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SettlementNotifierContract)
+    }
+
+    /// Returns the ledger timestamp when [`LiquifactEscrow::init`] was called.
+    /// Returns `0` for escrows that predate this storage key.
+    pub fn get_created_at(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::CreatedAt).unwrap_or(0)
     }
 
     /// Returns the optional pending admin address waiting for [`LiquifactEscrow::accept_admin`],
@@ -1472,7 +1478,7 @@ impl LiquifactEscrow {
         let escrow = Self::get_escrow(env.clone());
         ensure(
             &env,
-            escrow.status == 2 || escrow.status == 3 || escrow.status == 4,
+            escrow.status == 2 || escrow.status == 3 || escrow.status == 4 || escrow.status == 5,
             EscrowError::DustSweepNotTerminal,
         );
 
@@ -1531,6 +1537,50 @@ impl LiquifactEscrow {
         .publish(&env);
 
         sweep_amt
+    }
+
+    /// Archive a terminal escrow to mark it as closed and reduce active monitoring.
+    ///
+    /// Transitions the escrow to status `5` (archived). Only permitted from terminal states:
+    /// `2` (settled), `3` (withdrawn), `4` (cancelled), or `5` (already archived — no-op).
+    /// Open (`0`) or funded (`1`) states are rejected.
+    ///
+    /// # Authorization
+    /// Requires admin authorization. Read-only operations continue to work on archived escrows.
+    /// Archived escrows remain accessible but should be excluded from active-monitoring queries
+    /// by off-chain indexers.
+    ///
+    /// # Errors
+    /// Emits [`EscrowError::ArchiveNotTerminal`] if the escrow is not in a terminal state.
+    /// Emits [`EscrowError::EscrowAlreadyArchived`] if already status `5`.
+    pub fn archive_escrow(env: Env) -> InvoiceEscrow {
+        let mut escrow = Self::load_escrow_require_admin(&env);
+
+        // Idempotent no-op: already archived
+        if escrow.status == 5 {
+            return escrow;
+        }
+
+        ensure(
+            &env,
+            escrow.status == 2 || escrow.status == 3 || escrow.status == 4,
+            EscrowError::ArchiveNotTerminal,
+        );
+
+        let prior_status = escrow.status;
+        escrow.status = 5;
+
+        env.storage().instance().set(&DataKey::Escrow, &escrow);
+
+        EscrowArchived {
+            name: symbol_short!("esc_arch"),
+            invoice_id: escrow.invoice_id.clone(),
+            prior_status,
+            archived_at_ledger_timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        escrow
     }
 
     pub fn get_escrow(env: Env) -> InvoiceEscrow {
@@ -1781,6 +1831,29 @@ impl LiquifactEscrow {
             sme_collateral_commitment,
             has_primary_attestation: primary_attestation_hash.is_some(),
             attestation_log_length,
+        }
+    }
+
+    /// Returns discovery metadata for this escrow, suitable for registry contracts
+    /// and off-chain indexers.
+    ///
+    /// Bundles the escrow's own address, invoice identifier, SME, creation timestamp,
+    /// current status, and funding target into a single read call. This is the canonical
+    /// on-chain source for registry listings.
+    ///
+    /// # Returns
+    /// [`RegistryListing`] with escrow metadata. `created_at` is `0` for escrows that
+    /// predate the [`DataKey::CreatedAt`] storage key.
+    pub fn get_registry_listing(env: Env) -> RegistryListing {
+        let escrow = Self::get_escrow(env.clone());
+        let created_at = Self::get_created_at(env.clone());
+        RegistryListing {
+            escrow_address: env.current_contract_address(),
+            invoice_id: escrow.invoice_id,
+            sme_address: escrow.sme_address,
+            created_at,
+            status: escrow.status,
+            funding_target: escrow.funding_target,
         }
     }
 
@@ -2580,11 +2653,7 @@ impl LiquifactEscrow {
         let n = entries.len();
 
         ensure(&env, n > 0, EscrowError::FundingBatchEmpty);
-        ensure(
-            &env,
-            n <= MAX_FUND_BATCH,
-            EscrowError::FundingBatchTooLarge,
-        );
+        ensure(&env, n <= MAX_FUND_BATCH, EscrowError::FundingBatchTooLarge);
 
         let mut escrow = Self::get_escrow(env.clone());
 
@@ -2791,6 +2860,20 @@ impl LiquifactEscrow {
             env.storage()
                 .instance()
                 .set(&DataKey::UniqueFunderCount, &(cur_funder_count + 1));
+            // Maintain ordered investor index for list_investors pagination.
+            // Read InvestorCount (may differ from UniqueFunderCount on pre-v6 instances
+            // that did not initialize it; default to 0 so the first index is always 0).
+            let investor_count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::InvestorCount)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::InvestorIndex(investor_count), &investor.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::InvestorCount, &(investor_count + 1));
         }
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
@@ -2884,6 +2967,56 @@ impl LiquifactEscrow {
         escrow
     }
 
+    /// Retry / standalone settlement notification. Invokes the configured
+    /// [`DataKey::SettlementNotifierContract`] with the current settlement details.
+    ///
+    /// Use this entrypoint when:
+    /// - The inline notifier call in [`LiquifactEscrow::settle`] reverted (and settlement
+    ///   was retried without a notifier).
+    /// - An off-chain relayer or indexer wants to push settlement data to an external system.
+    ///
+    /// # Authorization
+    /// Open to any caller — the notifier itself enforces its own access control.
+    ///
+    /// # Errors
+    /// Emits [`EscrowError::SettlementNotifierNotSet`] when no notifier was configured at init.
+    /// Emits [`EscrowError::InvestorClaimNotSettled`] (127) when escrow status is not `2` (settled).
+    pub fn notify_settlement(env: Env) {
+        let escrow = Self::get_escrow(env.clone());
+
+        ensure(
+            &env,
+            escrow.status == 2,
+            EscrowError::InvestorClaimNotSettled,
+        );
+
+        let notifier: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SettlementNotifierContract)
+            .unwrap_or_else(|| fail(&env, EscrowError::SettlementNotifierNotSet));
+
+        let now = env.ledger().timestamp();
+        let args = soroban_sdk::vec![
+            &env,
+            escrow.invoice_id.clone(),
+            escrow.funded_amount,
+            escrow.yield_bps,
+            now
+        ];
+        env.invoke_contract(¬ifier, &symbol_short!("on_settle"), args);
+
+        SettlementNotifierInvoked {
+            name: symbol_short!("notify_ok"),
+            invoice_id: escrow.invoice_id.clone(),
+            notifier_contract: notifier,
+            funded_amount: escrow.funded_amount,
+            yield_bps: escrow.yield_bps,
+            settled_at_ledger_timestamp: now,
+        }
+        .publish(&env);
+    }
+
     pub fn settle(env: Env) -> InvoiceEscrow {
         ensure(
             &env,
@@ -2925,6 +3058,11 @@ impl LiquifactEscrow {
             settled_at_ledger_timestamp: now,
         }
         .publish(&env);
+
+        // Settlement always succeeds. The settlement notifier (if configured) is
+        // invoked separately via `notify_settlement()` by an off-chain relayer or
+        // indexer watching for `EscrowSettled`. This guarantees graceful failure:
+        // a broken notifier does not block settlement finalization.
 
         escrow
     }
@@ -3709,6 +3847,115 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::DistributedPrincipal)
             .unwrap_or(0)
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // #215: Investor pagination
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Returns a paginated slice of investor addresses from the ordered investor index.
+    ///
+    /// The list is in first-deposit order. Addresses are stored under
+    /// [`DataKey::InvestorIndex`] and are indexed from `0` to `InvestorCount - 1`.
+    ///
+    /// # Parameters
+    /// - `offset`: Zero-based start index.  An `offset >= InvestorCount` returns an empty list.
+    /// - `limit`: Number of entries to return.  Capped at [`MAX_INVESTOR_PAGE_SIZE`].
+    ///
+    /// # Errors
+    /// - [`EscrowError::PaginationLimitZero`] — `limit` is zero.
+    /// - [`EscrowError::PaginationLimitExceedsMax`] — `limit > MAX_INVESTOR_PAGE_SIZE`.
+    ///
+    /// # Notes
+    /// Only investors whose first deposit was recorded **after** version 6 (schema version that
+    /// introduced [`DataKey::InvestorCount`]) appear in this list. Older escrow instances that
+    /// were not redeployed will return an empty list regardless of `UniqueFunderCount`.
+    /// This is by design: the ordered index cannot be reconstructed from persistent keys alone
+    /// (addresses are not enumerable without an index). For those instances, off-chain indexers
+    /// must reconstruct the investor list from `EscrowFunded` events.
+    pub fn list_investors(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        ensure(&env, limit > 0, EscrowError::PaginationLimitZero);
+        ensure(
+            &env,
+            limit <= MAX_INVESTOR_PAGE_SIZE,
+            EscrowError::PaginationLimitExceedsMax,
+        );
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvestorCount)
+            .unwrap_or(0);
+
+        let mut result = Vec::new(&env);
+
+        if offset >= total {
+            return result;
+        }
+
+        let end = total.min(offset.saturating_add(limit));
+        for i in offset..end {
+            if let Some(addr) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::InvestorIndex(i))
+            {
+                result.push_back(addr);
+            }
+        }
+
+        result
+    }
+
+    /// Total count of investor addresses recorded in the ordered investor index.
+    ///
+    /// Equivalent to [`LiquifactEscrow::get_unique_funder_count`] for escrow instances
+    /// deployed with schema version 6, but tracked separately so pagination math is
+    /// self-contained. Returns `0` for instances predating the investor-index feature.
+    pub fn get_investor_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::InvestorCount)
+            .unwrap_or(0)
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // #204: Contract versioning metadata
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Returns rich versioning metadata for operator tooling and dashboard queries.
+    ///
+    /// The returned [`ContractVersionMetadata`] includes:
+    /// - `version`: the stored schema version (set by [`LiquifactEscrow::init`]).
+    /// - `min_compatible_version`: the oldest on-chain version that can be migrated to
+    ///   the current WASM without a redeploy.  Currently equals [`SCHEMA_VERSION`] because
+    ///   version 6 has **no `migrate` path** from prior versions (see `migrate` docs).
+    /// - `upgrade_recommended`: `true` when a major gap exists or when the stored version
+    ///   is below a threshold that indicates the instance is operating on a deprecated schema.
+    ///
+    /// # Upgrade recommendation threshold
+    /// An upgrade is recommended when the stored version is more than 1 major version below
+    /// the current `SCHEMA_VERSION`.  For version 6, that means stored ≤ 4 triggers the flag.
+    /// Operators should consult `docs/OPERATOR_RUNBOOK.md` before acting on this signal.
+    ///
+    /// # Usage (operator tool)
+    /// ```text
+    /// stellar contract invoke --id <CONTRACT_ID> -- get_version_metadata
+    /// ```
+    /// Compare `version` against the latest published WASM's `SCHEMA_VERSION` constant.
+    /// If `upgrade_recommended` is `true`, follow the runbook's redeploy checklist.
+    pub fn get_version_metadata(env: Env) -> ContractVersionMetadata {
+        let stored: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(0);
+        // min_compatible_version: no migration path exists below SCHEMA_VERSION, so
+        // the only compatible version is the current schema version itself.
+        let min_compatible_version = SCHEMA_VERSION;
+        // Recommend upgrade when the stored version is more than 1 below the current SCHEMA_VERSION.
+        let upgrade_recommended = SCHEMA_VERSION.saturating_sub(stored) > 1;
+        ContractVersionMetadata {
+            version: stored,
+            min_compatible_version,
+            upgrade_recommended,
+        }
     }
 }
 
