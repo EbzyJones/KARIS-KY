@@ -2335,7 +2335,7 @@ fn test_cancel_funding_blocked_by_legal_hold() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     client.cancel_funding();
 }
 
