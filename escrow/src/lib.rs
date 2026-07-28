@@ -400,14 +400,10 @@ pub enum EscrowError {
     /// Funds must be custodied in this contract before the SME can pull them.
     InsufficientContractBalance = 164,
 
-    /// [`LiquifactEscrow::set_yield_claim_delegate`] delegate address is the same as investor.
-    DelegateAddressSameAsInvestor = 165,
-    /// [`LiquifactEscrow::claim_investor_payout`] attempted delegation claim when investor has not delegated.
-    NoDelegationSet = 166,
-    /// [`LiquifactEscrow::claim_investor_payout`] delegation is revoked; investor must reset it.
-    DelegationRevoked = 167,
-    /// [`LiquifactEscrow::revoke_yield_claim_delegate`] attempted revocation when no delegation exists.
-    NoActiveDelegation = 168,
+    /// [`LiquifactEscrow::clone_settled_escrow`] called on escrow that is not settled.
+    CloneNotSettled = 170,
+    /// [`LiquifactEscrow::clone_settled_escrow`] received a non-positive invoice amount.
+    CloneAmountNotPositive = 171,
 }
 
 #[inline(always)]
@@ -1320,115 +1316,26 @@ pub struct ContractUpgraded {
     pub new_wasm_hash: BytesN<32>,
 }
 
-// ---------------------------------------------------------------------------
-// State export / import
-// ---------------------------------------------------------------------------
-
-/// Snapshot of all enumerable instance-storage state for disaster-recovery and
-/// network-migration use. Produced by [`LiquifactEscrow::export_state`] and
-/// consumed by [`LiquifactEscrow::import_state`].
-///
-/// # What is included
-///
-/// All instance-storage keys are captured: escrow core fields, configuration
-/// flags, funding token, treasury, registry, yield tier table, funding-close
-/// snapshot, attestation data, collateral metadata, and every other key whose
-/// absence would change the behavior of a restored instance.
-///
-/// # What is NOT included
-///
-/// **Per-investor persistent-storage keys** (`InvestorContribution`,
-/// `InvestorEffectiveYield`, `InvestorClaimNotBefore`, `InvestorClaimed`,
-/// `InvestorAllowlisted`, `InvestorRefunded`) are keyed by `Address` and are
-/// **not enumerable** in Soroban storage. They are absent from this export.
-///
-/// Operators performing a migration **must** supply the full investor address
-/// list separately and re-import per-investor state via a companion migration
-/// script that calls `get_contribution`, `get_investor_yield_bps`, etc. on the
-/// source contract and writes the values to the target via a privileged import
-/// helper. See `docs/escrow-state-export-import.md`.
-///
-/// # Checksum
-///
-/// `checksum` is SHA-256 over the canonical payload bytes defined in
-/// [`LiquifactEscrow::export_state`]. [`LiquifactEscrow::import_state`]
-/// recomputes and verifies the checksum before writing any storage.
-#[contracttype]
-#[derive(Debug, PartialEq)]
-pub struct EscrowStateExport {
-    /// Schema version of the source contract at export time.
-    /// Must match [`SCHEMA_VERSION`] on the target instance at import time.
-    pub schema_version: u32,
-    /// Ledger timestamp at which the export was produced.
-    pub exported_at: u64,
-    /// Full escrow core state snapshot.
-    pub escrow: InvoiceEscrow,
-    /// SEP-41 funding token address.
-    pub funding_token: Address,
-    /// Protocol treasury address.
-    pub treasury: Address,
-    /// Optional registry hint (may be absent when not configured).
-    pub registry: Option<Address>,
-    /// Optional tiered yield table (may be absent when not configured).
-    pub yield_tiers: Option<Vec<YieldTier>>,
-    /// Optional funding-close snapshot (absent until escrow reaches funded state).
-    pub funding_close_snapshot: Option<FundingCloseSnapshot>,
-    /// Optional configured minimum contribution floor (0 when unconfigured).
-    pub min_contribution_floor: i128,
-    /// Optional maximum unique investors cap (absent when unconfigured).
-    pub max_unique_investors_cap: Option<u32>,
-    /// Optional per-investor contribution cap (absent when unconfigured).
-    pub max_per_investor_cap: Option<i128>,
-    /// Distinct funder count at export time.
-    pub unique_funder_count: u32,
-    /// Legal hold state.
-    pub legal_hold: bool,
-    /// Optional legal hold clear delay (seconds).
-    pub legal_hold_clear_delay: u64,
-    /// Optional pending-clear-at timestamp.
-    pub legal_hold_clearable_at: Option<u64>,
-    /// Allowlist enabled state.
-    pub allowlist_active: bool,
-    /// Optional primary attestation hash.
-    pub primary_attestation_hash: Option<BytesN<32>>,
-    /// Attestation append log (may be empty).
-    pub attestation_log: Vec<BytesN<32>>,
-    /// Optional SME collateral commitment.
-    pub collateral: Option<SmeCollateralCommitment>,
-    /// Distributed principal (for liability floor tracking in cancelled escrows).
-    pub distributed_principal: i128,
-    /// Optional funding deadline.
-    pub funding_deadline: Option<u64>,
-    /// Optional pending admin address waiting for accept_admin (if a handover is in progress).
-    pub pending_admin: Option<Address>,
-    /// SHA-256 checksum over the canonical payload.
-    /// Computed by [`LiquifactEscrow::export_state`] and verified by
-    /// [`LiquifactEscrow::import_state`] before any storage writes.
-    pub checksum: BytesN<32>,
-}
-
 #[contractevent]
-pub struct StateExportedEvt {
+pub struct EscrowCloned {
     #[topic]
     pub name: Symbol,
+    /// Original (template) escrow's invoice_id.
     #[topic]
-    pub invoice_id: Symbol,
-    /// Ledger timestamp of the export.
-    pub exported_at: u64,
-    /// SHA-256 checksum of the exported payload.
-    pub checksum: BytesN<32>,
-}
-
-#[contractevent]
-pub struct StateImportedEvt {
+    pub template_invoice_id: Symbol,
+    /// New escrow's invoice_id.
     #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    /// Schema version of the imported payload.
-    pub schema_version: u32,
-    /// SHA-256 checksum of the imported payload (verified before write).
-    pub checksum: BytesN<32>,
+    pub new_invoice_id: Symbol,
+    /// Admin who performed the clone.
+    pub admin: Address,
+    /// SME address cloned from template.
+    pub sme_address: Address,
+    /// Yield basis points cloned from template.
+    pub yield_bps: i64,
+    /// Maturity timestamp cloned from template.
+    pub maturity: u64,
+    /// New amount for the cloned escrow.
+    pub new_amount: i128,
 }
 
 #[contract]
@@ -4566,6 +4473,149 @@ impl LiquifactEscrow {
         Self::compute_and_emit_health_warning(&env, &escrow, now);
 
         escrow
+    }
+
+    /// Clone a settled escrow template to create a new independent escrow instance.
+    ///
+    /// Creates a fresh escrow for a **new invoice** (supplied by caller) with the same 
+    /// configuration parameters as the template escrow. The template must be in **settled** status
+    /// (status == 2). All immutable configuration (yield_bps, maturity, yield tiers, min contribution,
+    /// max unique investors, max per investor, legal hold clear delay, registry) is copied; 
+    /// per-investor state, funding state, and legal holds are **reset** for the new instance.
+    ///
+    /// # Parameters
+    ///
+    /// - `template_env`: The Soroban environment of the **template** contract (settled escrow).
+    ///   Clone internally calls the template's `get_escrow` to verify status and read immutable config.
+    ///
+    /// - `new_invoice_id` / `new_amount`: Caller must supply the new invoice identifier and funding target.
+    ///
+    /// The new escrow will have:
+    /// - `invoice_id = new_invoice_id` (caller-supplied).
+    /// - `admin, sme_address, yield_bps, maturity` = copied from template.
+    /// - `amount, funding_target = new_amount` (caller-supplied).
+    /// - `funded_amount = 0, status = 0` (open).
+    /// - All per-investor state: cleared (new instance).
+    /// - Immutable configuration (registry, token, treasury, yield tiers, caps, delays) = copied from template.
+    ///
+    /// # Errors
+    ///
+    /// - [`EscrowError::CloneNotSettled`] — template escrow is not in settled status.
+    /// - [`EscrowError::CloneAmountNotPositive`] — `new_amount` is not positive.
+    /// - [`EscrowError::InvoiceIdInvalidLength`] — `new_invoice_id` violates length constraints.
+    /// - [`EscrowError::InvoiceIdInvalidCharset`] — `new_invoice_id` contains invalid characters.
+    /// - Other [`EscrowError`] codes from `init` validation.
+    ///
+    /// # Authorization
+    ///
+    /// Only the **admin** (from the template escrow) may call this method.
+    pub fn clone_settled_escrow(
+        env: Env,
+        template_env: Env,
+        new_invoice_id: String,
+        new_amount: i128,
+    ) -> InvoiceEscrow {
+        // Load and validate the template escrow.
+        let template_escrow = Self::get_escrow(template_env.clone());
+        ensure(
+            &env,
+            template_escrow.status == 2,
+            EscrowError::CloneNotSettled,
+        );
+        ensure(&env, new_amount > 0, EscrowError::CloneAmountNotPositive);
+
+        // Require auth from the template admin.
+        template_escrow.admin.require_auth();
+
+        // Read immutable configuration from template storage.
+        let funding_token: Address = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::FundingToken)
+            .unwrap_or_else(|| fail(&env, EscrowError::FundingTokenNotSet));
+
+        let treasury: Address = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .unwrap_or_else(|| fail(&env, EscrowError::TreasuryNotSet));
+
+        let registry: Option<Address> = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::RegistryRef);
+
+        let yield_tiers: Option<Vec<YieldTier>> = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldTierTable);
+
+        let min_contribution_floor: i128 = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::MinContributionFloor)
+            .unwrap_or(0);
+
+        let max_unique_investors_cap: Option<u32> = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxUniqueInvestorsCap);
+
+        let max_per_investor_cap: Option<i128> = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxPerInvestorCap);
+
+        let legal_hold_clear_delay: Option<u64> = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::LegalHoldClearDelay)
+            .and_then(|d: u64| if d > 0 { Some(d) } else { None });
+
+        let funding_deadline: Option<u64> = template_env
+            .storage()
+            .instance()
+            .get(&DataKey::FundingDeadline);
+
+        // Call init on the current (target) environment with cloned parameters.
+        Self::init(
+            env,
+            template_escrow.admin.clone(),
+            new_invoice_id.clone(),
+            template_escrow.sme_address.clone(),
+            new_amount,
+            template_escrow.yield_bps,
+            template_escrow.maturity,
+            funding_token,
+            registry,
+            treasury,
+            yield_tiers,
+            if min_contribution_floor > 0 {
+                Some(min_contribution_floor)
+            } else {
+                None
+            },
+            max_unique_investors_cap,
+            max_per_investor_cap,
+            legal_hold_clear_delay,
+            funding_deadline,
+        );
+
+        // Emit clone event.
+        let new_escrow = Self::get_escrow(env.clone());
+        EscrowCloned {
+            name: symbol_short!("escrow_cl"),
+            template_invoice_id: template_escrow.invoice_id.clone(),
+            new_invoice_id: new_escrow.invoice_id.clone(),
+            admin: template_escrow.admin.clone(),
+            sme_address: template_escrow.sme_address.clone(),
+            yield_bps: template_escrow.yield_bps,
+            maturity: template_escrow.maturity,
+            new_amount,
+        }
+        .publish(&env);
+
+        new_escrow
     }
 
     /// SME pulls funded liquidity. Transfers `funded_amount` of the bound funding token

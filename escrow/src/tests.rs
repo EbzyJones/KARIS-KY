@@ -46,7 +46,7 @@ mod admin;
 mod attestations;
 mod batch_claim;
 mod cap_validation;
-mod chaos;
+mod clone;
 mod coverage;
 mod dos_analysis;
 mod external_calls;

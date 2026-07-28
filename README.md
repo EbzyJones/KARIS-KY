@@ -180,6 +180,7 @@ cargo clippy --all-targets -- -D warnings
 | `fund` | Record investor principal; marks escrow funded when target is met. |
 | `fund_with_commitment` | First deposit with optional lock period; selects tiered yield. |
 | `settle` | Mark a funded escrow as settled (SME auth required; maturity enforced). |
+| `clone_settled_escrow` | Clone a settled escrow template to create a new independent escrow with the same parameters (admin auth required). |
 | `withdraw` | SME pulls funded liquidity (accounting record). |
 | `claim_investor_payout` | Investor records a payout claim after settlement. |
 | `sweep_terminal_dust` | Treasury sweeps rounding residue from a terminal escrow. |
