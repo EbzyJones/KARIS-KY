@@ -25,6 +25,8 @@ fn test_update_maturity_success() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     let updated = client.update_maturity(&2000u64);
     assert_eq!(updated.maturity, 2000u64);
@@ -47,6 +49,8 @@ fn test_update_maturity_wrong_state() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -82,9 +86,46 @@ fn test_update_maturity_unauthorized() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     env.mock_auths(&[]);
     client.update_maturity(&2000u64);
+}
+
+#[test]
+fn test_verify_asset_custody_reports_signed_discrepancy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+    let token = install_stellar_asset_token(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "CUST001"),
+        &sme,
+        &1_000i128,
+        &800i64,
+        &0u64,
+        &token.id,
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.fund(&investor, &1_000i128);
+    token.stellar.mint(&client.address, &1_200i128);
+
+    let discrepancy = client.verify_asset_custody();
+    assert_eq!(discrepancy, 200i128);
 }
 
 #[test]
@@ -102,6 +143,8 @@ fn test_propose_admin_sets_pending_without_changing_admin() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -130,6 +173,8 @@ fn test_accept_admin_promotes_pending_and_clears_pending() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -167,6 +212,8 @@ fn test_transfer_admin_deprecated_shim_only_proposes() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     let unchanged = client.transfer_admin(&new_admin);
@@ -189,6 +236,8 @@ fn test_transfer_admin_same_address_panics() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -336,6 +385,8 @@ fn test_read_model_summary_includes_optional_admin_fields() {
         &Some(10_000i128),
         &None,
         &None,
+        &None,
+        &None,
     );
 
     let summary = client.get_escrow_summary();
@@ -364,6 +415,8 @@ fn test_record_collateral_stored_and_does_not_block_settle() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -402,6 +455,8 @@ fn test_collateral_zero_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.record_sme_collateral_commitment(&symbol_short!("XLM"), &0i128);
 }
@@ -421,6 +476,8 @@ fn test_collateral_requires_sme_auth() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -453,9 +510,11 @@ fn test_legal_hold_blocks_settle_withdraw_claim_and_fund() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &TARGET);
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(client.get_legal_hold());
 
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -473,7 +532,7 @@ fn test_legal_hold_blocks_settle_withdraw_claim_and_fund() {
     let settled = client.settle();
     assert_eq!(settled.status, 2);
 
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.claim_investor_payout(&investor);
     }))
@@ -500,6 +559,8 @@ fn test_legal_hold_blocks_new_funds_when_open() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -548,6 +609,8 @@ fn test_update_funding_target_by_admin_succeeds() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     let updated = client.update_funding_target(&10_000i128);
@@ -575,6 +638,8 @@ fn test_update_funding_target_by_non_admin_panics() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -615,6 +680,8 @@ fn test_update_funding_target_fails_when_funded() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &5_000i128);
     client.update_funding_target(&10_000i128);
@@ -642,6 +709,8 @@ fn test_update_funding_target_below_funded_panics() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -680,6 +749,8 @@ fn test_update_funding_target_zero_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.update_funding_target(&0i128);
 }
@@ -712,6 +783,8 @@ fn test_update_funding_target_event_fields() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -764,6 +837,8 @@ fn test_update_funding_target_fails_when_settled() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &5_000i128); // status → 1 (funded)
     client.settle(); // status → 2 (settled)
@@ -777,8 +852,7 @@ fn test_update_funding_target_fails_when_settled() {
 fn test_update_funding_target_fails_when_withdrawn() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _escrow_id, _sme) =
-        init_and_fund_with_real_token(&env, 5_000i128, "WD001");
+    let (client, _escrow_id, _sme) = init_and_fund_with_real_token(&env, 5_000i128, "WD001");
     client.withdraw(); // status → 3 (withdrawn)
     client.update_funding_target(&6_000i128);
 }
@@ -807,6 +881,8 @@ fn test_update_funding_target_equal_to_funded_amount_succeeds() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -851,6 +927,8 @@ fn test_update_funding_target_negative_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.update_funding_target(&-1i128);
 }
@@ -884,6 +962,8 @@ fn test_update_maturity_event_fields() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -936,6 +1016,8 @@ fn test_update_maturity_fails_when_funded() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &5_000i128); // status → 1 (funded)
     client.update_maturity(&2000u64);
@@ -971,6 +1053,8 @@ fn test_update_maturity_fails_when_settled() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &5_000i128); // status → 1
     client.settle(); // status → 2
@@ -984,8 +1068,7 @@ fn test_update_maturity_fails_when_settled() {
 fn test_update_maturity_fails_when_withdrawn() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _escrow_id, _sme) =
-        init_and_fund_with_real_token(&env, 5_000i128, "MAT004");
+    let (client, _escrow_id, _sme) = init_and_fund_with_real_token(&env, 5_000i128, "MAT004");
     client.withdraw(); // status → 3
     client.update_maturity(&2000u64);
 }
@@ -1012,6 +1095,8 @@ fn test_update_maturity_to_zero_succeeds() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1048,6 +1133,8 @@ fn test_settle_passes_exactly_at_maturity_ledger_time() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1093,6 +1180,8 @@ fn test_settle_fails_one_second_before_maturity() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     client.fund(&investor, &5_000i128);
 
@@ -1123,6 +1212,8 @@ fn test_update_maturity_twice_overwrites() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1242,7 +1333,7 @@ fn auth_audit_set_legal_hold_requires_admin() {
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
     env.mock_auths(&[]);
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
 }
 
 #[test]
@@ -1264,7 +1355,7 @@ fn auth_audit_append_attestation_requires_admin() {
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
     env.mock_auths(&[]);
-    client.append_attestation_digest(&soroban_sdk::BytesN::from_array(&env, &[0u8; 32]));
+    client.append_attestation_digest(&symbol_short!(""), &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]));
 }
 
 #[test]
@@ -1300,6 +1391,8 @@ fn auth_audit_sweep_terminal_dust_requires_treasury() {
         &token.id,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1458,7 +1551,7 @@ fn test_rotate_beneficiary_with_legal_hold_fails() {
     let (client, admin, sme) = setup(&env);
     let new_sme = Address::generate(&env);
     default_init(&client, &env, &admin, &sme);
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     client.rotate_beneficiary(&new_sme);
 }
 
@@ -1496,6 +1589,8 @@ fn test_rotate_beneficiary_then_withdraw_goes_to_new_sme() {
         &token.id,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
