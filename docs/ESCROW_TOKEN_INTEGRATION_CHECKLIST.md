@@ -43,6 +43,13 @@ The escrow contract and its documented assumptions do not support direct integra
 - The escrow uses [`escrow/src/external_calls.rs`](../escrow/src/external_calls.rs) to assert **exact** sender/recipient balance deltas for the configured **funding** token.
 - Integrations must still treat **fee-on-transfer** and other non-standard tokens as **unsupported**; such tokens can cause the sweep to panic when deltas do not match `amount`.
 
+## Custody reconciliation (`verify_asset_custody`)
+
+- Admins or off-chain schedulers can call `verify_asset_custody()` to compare the escrow contract's current funding-token balance with the recorded `funded_amount`.
+- The entrypoint returns a signed discrepancy (`contract_balance - recorded_funded_amount`) and emits an `AssetCustodyVerified` event for auditing.
+- Reconcile the returned discrepancy with custody statements, bridge transfer logs, and any expected transfers before settlement, withdrawal, or any dust sweep.
+- Treat non-zero discrepancies as a signal to pause downstream actions until the balance mismatch is investigated.
+
 ## Why this matters
 
 Because the contract only records numeric state and collateral metadata (aside from the guarded dust sweep transfer path), token integration security is enforced by the surrounding application or bridge logic.
