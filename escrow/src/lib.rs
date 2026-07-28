@@ -188,11 +188,16 @@ pub const MAX_INVESTOR_ALLOWLIST_BATCH: u32 = 32;
 /// Mirrors the spirit of `MAX_ATTESTATION_APPEND_ENTRIES` to limit per-call work.
 pub const MAX_FUND_BATCH: u32 = 50;
 
-/// Maximum number of investor addresses returned per [`LiquifactEscrow::list_investors`] call.
+/// Number of bucketing shards for investor contribution aggregates (256 buckets).
 ///
-/// Caps per-call storage read cost and prevents unbounded response sizes in UI/dashboard
-/// tooling. Callers should page through results using `offset` and `limit`.
-pub const MAX_INVESTOR_PAGE_SIZE: u32 = 1_000;
+/// Buckets partition investor addresses by `hash(address) % INVESTOR_BUCKET_COUNT`
+/// so that dashboards can compute total funded ≈ Σ buckets in O(256) instance reads
+/// instead of iterating over all per‑investor persistent `InvestorContribution` keys.
+///
+/// The bucket count is chosen as a power‑of‑two for fast modulo with bit‑masking
+/// and provides a good balance between write overhead (+1 instance write per fund)
+/// and read granularity for aggregate queries.
+pub const INVESTOR_BUCKET_COUNT: u32 = 256;
 
 /// Upper bound on [`LiquifactEscrow::sweep_terminal_dust`] per call (base units of the funding token).
 ///
@@ -748,51 +753,31 @@ pub struct EscrowSummary {
     pub attestation_log_length: u32,
 }
 
-/// State inconsistency report for diagnostic and auditing purposes.
+/// Dashboard-ready health score for the escrow.
 ///
-/// Detects logical invariant violations such as:
-/// - Funded amount exceeds the funding target when status is not yet funded.
-/// - Status transitions that violate forward-only invariant (e.g., status decreases).
-/// - Funded amount or unique funder count mismatches.
-/// - Funding target changes after the escrow became funded.
-/// - Legal hold state inconsistencies.
+/// Computed read-only from storage. Can be called by any address.
 ///
-/// This is a **read-only diagnostic report** — it does not modify state and is safe to call
-/// at any time. Used for off-chain auditing, monitoring, and debugging. The report flags
-/// any detected inconsistencies; an empty report (all fields false) indicates valid state.
+/// # Fields
+/// - `funding_progress_percent`: 0–100 percentage of funding target met (capped at 100 if overfunded).
+/// - `days_to_maturity`: signed delta in days between maturity timestamp and current ledger time.
+///   Negative means maturity has already passed. 0 when `maturity == 0` (no lock).
+/// - `unique_investor_count`: number of distinct investor addresses with non-zero contributions.
+/// - `average_contribution_size`: `funded_amount / unique_investor_count`; 0 when no investors.
+/// - `estimated_yield_payout`: coupon = `funded_amount × yield_bps / 10_000`; off‑chain pro‑rata
+///   per investor requires the funding‑close snapshot.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub struct StateInconsistencyReport {
-    /// True if `funded_amount > funding_target` but `status < 1` (funded).
-    /// Indicates funding has exceeded target but status was not advanced.
-    pub funded_exceeds_target_not_advanced: bool,
-    /// True if `funded_amount > 0` but `status == 0` (open).
-    /// Indicates funding received but escrow remains in open status.
-    pub funded_amount_positive_status_open: bool,
-    /// True if `funded_amount == 0` but `status >= 1` (funded or beyond).
-    /// Indicates a funded/settled escrow with zero principal.
-    pub zero_funded_amount_advanced_status: bool,
-    /// True if `unique_funder_count > 0` but `status == 0` (open).
-    /// Indicates investors funded but escrow is still open.
-    pub funders_exist_status_open: bool,
-    /// True if `unique_funder_count == 0` but `status >= 1` (funded or beyond).
-    /// Indicates a funded escrow with no recorded funders.
-    pub no_funders_advanced_status: bool,
-    /// True if `funding_close_snapshot` is set but `status < 1` (not yet funded).
-    /// The snapshot should only exist once status reaches funded.
-    pub snapshot_exists_not_funded: bool,
-    /// True if `status > 1` (settled/withdrawn/cancelled) but `funding_close_snapshot` is absent.
-    /// Past the funded point, the snapshot should always be captured.
-    pub snapshot_missing_post_funded: bool,
-    /// True if `status == 2` (settled) but `maturity > 0` and `ledger_time < maturity`.
-    /// Indicates settlement occurred before maturity time lock expired (if configured).
-    /// Note: Returns `false` if maturity is not set (no time lock configured).
-    pub settled_before_maturity_lock: bool,
-    /// True if `funding_target <= 0` or `amount <= 0` (amount must be positive).
-    pub invalid_funding_amounts: bool,
-    /// True if `status < 0` or `status > 4` (valid range is 0..=4).
-    /// Status should always be one of: 0 (open), 1 (funded), 2 (settled), 3 (withdrawn), 4 (cancelled).
-    pub invalid_status_value: bool,
+pub struct EscrowHealthMetrics {
+    /// 0–100: how close the escrow is to the funding target (floor, capped at 100).
+    pub funding_progress_percent: u32,
+    /// Signed ledger‑time delta in whole days.
+    pub days_to_maturity: i64,
+    /// Number of distinct investors.
+    pub unique_investor_count: u32,
+    /// `funded_amount / unique_investor_count`; 0 when there are no investors.
+    pub average_contribution_size: i128,
+    /// `funded_amount × yield_bps / 10_000` (floor); rough total coupon estimate.
+    pub estimated_yield_payout: i128,
 }
 
 // --- Events ---
@@ -1107,15 +1092,106 @@ pub struct InvestorAllowlistChanged {
     pub allowed: u32,
 }
 
-/// Health warning event emitted when an escrow enters a potentially unhealthy state.
-/// **Non-blocking**: warnings do not prevent valid escrow transitions.
-/// Off-chain indexers use warnings for risk alerting and monitoring.
+/// Emitted on every successful [`LiquifactEscrow::fund`] or
+/// [`LiquifactEscrow::fund_with_commitment`] call.
 ///
-/// # Warning Type Codes
-/// - 4001: `LowFundingRatio` — funded amount is < 50% of target
-/// - 4002: `CloseToMaturity` — escrow is < 1 day away from maturity
-/// - 4003: `OverMaturity` — escrow is past maturity timestamp but still unfunded
-/// - 4004: `FundingStalled` — no deposits in extended period (reserved for future use)
+/// Carries the actor (investor) address, ledger timestamp, and all key fields
+/// so indexers get a single self‑contained event for fund reconciliation.
+/// Schema event version = 1.
+#[contractevent]
+pub struct FundReceived {
+    /// Event schema version for forward compatibility.
+    #[topic]
+    pub name: Symbol,
+    /// Escrow invoice identifier.
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Address that authorized the deposit.
+    #[topic]
+    pub actor: Address,
+    /// Ledger timestamp when the deposit was recorded.
+    pub timestamp: u64,
+    /// Deposit amount in base units of the funding token.
+    pub amount: i128,
+    /// Running total funded after this deposit.
+    pub funded_amount: i128,
+    /// Escrow status after this deposit (0 = open, 1 = funded).
+    pub status: u32,
+    /// Effective yield (bps) assigned to this investor.
+    pub investor_effective_yield_bps: i64,
+    /// Lock duration (seconds) matched from the tier table; 0 if no lock.
+    pub tier_lock_secs: u64,
+}
+
+/// Emitted on admin transfer (acceptance) and admin proposal.
+///
+/// Unifies `AdminProposedEvent` + `AdminTransferredEvent` into one versioned
+/// event with ledger timestamp, old and new admin, and the change kind.
+/// Schema event version = 1.
+#[contractevent]
+pub struct AdminChanged {
+    /// Event schema version for forward compatibility.
+    #[topic]
+    pub name: Symbol,
+    /// Escrow invoice identifier.
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Address that triggered the change.
+    #[topic]
+    pub actor: Address,
+    /// Ledger timestamp when the change was recorded.
+    pub timestamp: u64,
+    /// `"proposed"` or `"accepted"`.
+    pub kind: Symbol,
+    /// Previous admin address.
+    pub old_admin: Address,
+    /// New admin (or pending) address.
+    pub new_admin: Address,
+}
+
+/// Emitted when the compliance / legal hold is toggled.
+///
+/// Carries the actor (admin), ledger timestamp, and active flag.
+/// Schema event version = 1.
+#[contractevent]
+pub struct LegalHoldSet {
+    /// Event schema version for forward compatibility.
+    #[topic]
+    pub name: Symbol,
+    /// Escrow invoice identifier.
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Address that toggled the hold (must be admin).
+    #[topic]
+    pub actor: Address,
+    /// Ledger timestamp when the hold was toggled.
+    pub timestamp: u64,
+    /// `1` = hold enabled, `0` = cleared.
+    pub active: u32,
+}
+
+/// Emitted when the admin pauses (or unpauses) the escrow via
+/// [`LiquifactEscrow::set_escrow_paused`].
+///
+/// While paused, all state‑mutating entrypoints are blocked.
+/// Schema event version = 1.
+#[contractevent]
+pub struct EscrowPaused {
+    /// Event schema version for forward compatibility.
+    #[topic]
+    pub name: Symbol,
+    /// Escrow invoice identifier.
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Address that toggled the pause (must be admin).
+    #[topic]
+    pub actor: Address,
+    /// Ledger timestamp when pause was toggled.
+    pub timestamp: u64,
+    /// `1` = paused, `0` = resumed.
+    pub paused: u32,
+}
+
 #[contractevent]
 pub struct EscrowHealthWarning {
     #[topic]
@@ -1310,8 +1386,44 @@ impl LiquifactEscrow {
             .unwrap_or(false)
     }
 
-    /// Compute health metrics and emit a warning event if the escrow is in an unhealthy state.
-    /// Returns the warning type code (0 = no warning, 4001–4004 = warning).
+    /// Whether the escrow is currently paused by the admin.
+    fn escrow_paused_active(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::EscrowPaused)
+            .unwrap_or(false)
+    }
+
+    /// Compute which bucket (0..255) an investor address falls into.
+    ///
+    /// Uses the Soroban host's `Address` to‑bytes serialisation, then a simple
+    /// DJB2‑style hash folded modulo [`INVESTOR_BUCKET_COUNT`]. The hash is
+    /// deterministic within a single ledger but not guaranteed stable across
+    /// network upgrades — bucket indices are soft hints for dashboards, not a
+    /// consensus‑critical invariant.
+    fn investor_bucket_index(env: &Env, addr: &Address) -> u32 {
+        // Use the SDK-supplied `require_auth_for_args` / `Address` to derive
+        // a stable 32-byte contract-internal representation via the host's
+        // `compute_hash_sha256` function. This avoids heap-allocating a String
+        // in no_std and gives us a deterministic seed.
+        //
+        // We take the first 8 bytes of the SHA-256 as a u64 seed and fold
+        // modulo INVESTOR_BUCKET_COUNT.
+        let hash_bytes = env.crypto().sha256(&addr.clone().into());
+        let seed = u64::from_be_bytes([
+            hash_bytes.get(0).unwrap(),
+            hash_bytes.get(1).unwrap(),
+            hash_bytes.get(2).unwrap(),
+            hash_bytes.get(3).unwrap(),
+            hash_bytes.get(4).unwrap(),
+            hash_bytes.get(5).unwrap(),
+            hash_bytes.get(6).unwrap(),
+            hash_bytes.get(7).unwrap(),
+        ]);
+        (seed % (INVESTOR_BUCKET_COUNT as u64)) as u32
+    }
+
+    /// Emit a diagnostic event for an error with recovery guidance.
     ///
     /// # Logic
     /// - **Code 4001 (LowFundingRatio)**: `funded_ratio_bps < 5000` (< 50%) and close to/past maturity.
@@ -1804,6 +1916,11 @@ impl LiquifactEscrow {
             !Self::legal_hold_active(&env),
             EscrowError::LegalHoldBlocksTreasuryDustSweep,
         );
+        ensure(
+            &env,
+            !Self::escrow_paused_active(&env),
+            EscrowError::EscrowIsPaused,
+        );
         ensure(&env, amount > 0, EscrowError::SweepAmountNotPositive);
         ensure(
             &env,
@@ -1950,6 +2067,11 @@ impl LiquifactEscrow {
             &env,
             !Self::legal_hold_active(&env),
             EscrowError::LegalHoldBlocksBeneficiaryRotation,
+        );
+        ensure(
+            &env,
+            !Self::escrow_paused_active(&env),
+            EscrowError::EscrowIsPaused,
         );
 
         let mut escrow = Self::get_escrow(env.clone());
@@ -2205,6 +2327,61 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::UniqueFunderCount)
             .unwrap_or(0)
+    }
+
+    /// Compute and return dashboard‑ready health metrics for the escrow.
+    ///
+    /// Read‑only — **no authorization required**. Intended for dashboards
+    /// and monitoring tools that surface at‑a‑glance escrow health.
+    ///
+    /// # Design notes
+    ///
+    /// - `funding_progress_percent` is computed as `(funded_amount × 100) / funding_target`
+    ///   (floor), capped at 100 when overfunded.
+    /// - `days_to_maturity` uses integer seconds → days conversion (86_400 s/day).
+    ///   Returns 0 when `maturity == 0` (no maturity lock). Negative when maturity
+    ///   has passed (i.e., settlement is already possible).
+    /// - `estimated_yield_payout` is the flat coupon on the whole `funded_amount` —
+    ///   pro‑rata per‑investor breakdown requires the funding‑close snapshot.
+    pub fn get_escrow_health_metrics(env: Env) -> EscrowHealthMetrics {
+        let escrow = Self::get_escrow(env.clone());
+        let unique_investor_count = Self::get_unique_funder_count(env.clone());
+
+        // Funding progress %
+        let funding_progress_percent = if escrow.funding_target > 0 {
+            let pct = (escrow.funded_amount * 100) / escrow.funding_target;
+            pct.min(100) as u32
+        } else {
+            0
+        };
+
+        // Days to maturity
+        let days_to_maturity = if escrow.maturity == 0 {
+            0i64
+        } else {
+            let now = env.ledger().timestamp();
+            let delta_secs = escrow.maturity as i64 - now as i64;
+            delta_secs / 86_400i64
+        };
+
+        // Average contribution
+        let average_contribution_size = if unique_investor_count > 0 {
+            escrow.funded_amount / (unique_investor_count as i128)
+        } else {
+            0i128
+        };
+
+        // Estimated yield payout
+        let estimated_yield_payout =
+            (escrow.funded_amount * escrow.yield_bps as i128) / 10_000i128;
+
+        EscrowHealthMetrics {
+            funding_progress_percent,
+            days_to_maturity,
+            unique_investor_count,
+            average_contribution_size,
+            estimated_yield_payout,
+        }
     }
 
     /// Bundles multiple read-only values to return a comprehensive summary of the escrow state
@@ -3030,6 +3207,52 @@ impl LiquifactEscrow {
             active: if active { 1 } else { 0 },
         }
         .publish(&env);
+
+        // Also emit the versioned LegalHoldSet with timestamp + actor.
+        LegalHoldSet {
+            name: symbol_short!("legal_set"),
+            invoice_id: escrow.invoice_id.clone(),
+            actor: escrow.admin.clone(),
+            timestamp: env.ledger().timestamp(),
+            active: if active { 1 } else { 0 },
+        }
+        .publish(&env);
+    }
+
+    /// Pause or unpause the escrow.
+    ///
+    /// While paused, **all** state‑mutating entrypoints are blocked:
+    /// `fund`, `fund_with_commitment`, `settle`, `withdraw`,
+    /// `claim_investor_payout`, `cancel_funding`, `refund`, `sweep_terminal_dust`,
+    /// `rotate_beneficiary`, `record_sme_collateral_commitment`, and
+    /// `lower_max_unique_investors` / `update_funding_target` / `update_maturity`.
+    ///
+    /// Read‑only entrypoints continue to work. The admin can always unpause.
+    ///
+    /// # Authorization
+    /// Requires the current [`InvoiceEscrow::admin`].
+    pub fn set_escrow_paused(env: Env, paused: bool) {
+        let escrow = Self::load_escrow_require_admin(&env);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowPaused, &paused);
+
+        EscrowPaused {
+            name: symbol_short!("esc_pause"),
+            invoice_id: escrow.invoice_id.clone(),
+            actor: escrow.admin.clone(),
+            timestamp: env.ledger().timestamp(),
+            paused: if paused { 1 } else { 0 },
+        }
+        .publish(&env);
+    }
+
+    /// Read the current paused state.
+    ///
+    /// `true` when the escrow is paused; no authorization required.
+    pub fn is_escrow_paused(env: Env) -> bool {
+        Self::escrow_paused_active(&env)
     }
 
     /// Schedule a compliance hold clear window. The current admin must authorize.
@@ -3203,6 +3426,12 @@ impl LiquifactEscrow {
     }
 
     pub fn update_funding_target(env: Env, new_target: i128) -> InvoiceEscrow {
+        ensure(
+            &env,
+            !Self::escrow_paused_active(&env),
+            EscrowError::EscrowIsPaused,
+        );
+
         let mut escrow = Self::load_escrow_require_admin(&env);
 
         ensure(&env, new_target > 0, EscrowError::TargetNotPositive);
@@ -3241,6 +3470,12 @@ impl LiquifactEscrow {
     /// - If `new_cap` is not strictly lower than the current cap.
     /// - If `new_cap` is below the current unique funder count.
     pub fn lower_max_unique_investors(env: Env, new_cap: u32) -> u32 {
+        ensure(
+            &env,
+            !Self::escrow_paused_active(&env),
+            EscrowError::EscrowIsPaused,
+        );
+
         let escrow = Self::load_escrow_require_admin(&env);
 
         ensure(&env, escrow.status == 0, EscrowError::CapLowerNotOpen);
@@ -3700,6 +3935,11 @@ impl LiquifactEscrow {
         );
         ensure(
             &env,
+            !Self::escrow_paused_active(&env),
+            EscrowError::EscrowIsPaused,
+        );
+        ensure(
+            &env,
             escrow.status == 0,
             EscrowError::EscrowNotOpenForFunding,
         );
@@ -3853,6 +4093,20 @@ impl LiquifactEscrow {
 
         Self::set_persistent_investor_contribution(&env, investor.clone(), new_contribution);
 
+        // Update the bucketed aggregate for dashboard O(1) reads.
+        {
+            let bucket = Self::investor_bucket_index(&env, &investor);
+            let prev_bucket: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::InvestorContributionBucket(bucket))
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::InvestorContributionBucket(bucket),
+                &(prev_bucket + amount),
+            );
+        }
+
         if prev == 0 {
             // Use the hoisted cur_funder_count; no second storage read needed.
             env.storage()
@@ -3889,9 +4143,19 @@ impl LiquifactEscrow {
         }
         .publish(&env);
 
-        // Emit health warning if escrow is in an unhealthy state.
-        let now = env.ledger().timestamp();
-        Self::compute_and_emit_health_warning(&env, &escrow, now);
+        // Also emit the versioned FundReceived with timestamp + actor.
+        FundReceived {
+            name: symbol_short!("fund_recv"),
+            invoice_id: escrow.invoice_id.clone(),
+            actor: investor.clone(),
+            timestamp: env.ledger().timestamp(),
+            amount,
+            funded_amount: escrow.funded_amount,
+            status: escrow.status,
+            investor_effective_yield_bps,
+            tier_lock_secs,
+        }
+        .publish(&env);
 
         escrow
     }
@@ -4025,6 +4289,11 @@ impl LiquifactEscrow {
             !Self::legal_hold_active(&env),
             EscrowError::LegalHoldBlocksSettlement,
         );
+        ensure(
+            &env,
+            !Self::escrow_paused_active(&env),
+            EscrowError::EscrowIsPaused,
+        );
 
         // env.clone(): env is used again after this call for ledger timestamp, storage set, and publish.
         let mut escrow = Self::load_escrow_require_sme(&env);
@@ -4093,6 +4362,11 @@ impl LiquifactEscrow {
             &env,
             !Self::legal_hold_active(&env),
             EscrowError::LegalHoldBlocksWithdrawal,
+        );
+        ensure(
+            &env,
+            !Self::escrow_paused_active(&env),
+            EscrowError::EscrowIsPaused,
         );
 
         let mut escrow = Self::load_escrow_require_sme(&env);
@@ -4178,6 +4452,11 @@ impl LiquifactEscrow {
             &env,
             !Self::legal_hold_active(&env),
             EscrowError::LegalHoldBlocksInvestorClaims,
+        );
+        ensure(
+            &env,
+            !Self::escrow_paused_active(&env),
+            EscrowError::EscrowIsPaused,
         );
 
         investor.require_auth();
@@ -4605,6 +4884,12 @@ impl LiquifactEscrow {
     }
 
     pub fn update_maturity(env: Env, new_maturity: u64) -> InvoiceEscrow {
+        ensure(
+            &env,
+            !Self::escrow_paused_active(&env),
+            EscrowError::EscrowIsPaused,
+        );
+
         let mut escrow = Self::load_escrow_require_admin(&env);
 
         ensure(&env, escrow.status == 0, EscrowError::MaturityUpdateNotOpen);
@@ -4708,6 +4993,18 @@ impl LiquifactEscrow {
         }
         .publish(&env);
 
+        // Also emit the versioned AdminChanged with timestamp + actor.
+        AdminChanged {
+            name: symbol_short!("adm_chg"),
+            invoice_id: escrow.invoice_id.clone(),
+            actor: escrow.admin.clone(),
+            timestamp: env.ledger().timestamp(),
+            kind: symbol_short!("proposed"),
+            old_admin: escrow.admin,
+            new_admin: new_admin.clone(),
+        }
+        .publish(&env);
+
         new_admin
     }
 
@@ -4732,6 +5029,18 @@ impl LiquifactEscrow {
             name: symbol_short!("admin"),
             invoice_id: escrow.invoice_id.clone(),
             new_admin: pending,
+        }
+        .publish(&env);
+
+        // Also emit the versioned AdminChanged with timestamp + actor.
+        AdminChanged {
+            name: symbol_short!("adm_chg"),
+            invoice_id: escrow.invoice_id.clone(),
+            actor: pending.clone(),
+            timestamp: env.ledger().timestamp(),
+            kind: symbol_short!("accepted"),
+            old_admin: escrow.admin.clone(),
+            new_admin: pending.clone(),
         }
         .publish(&env);
 
@@ -4763,6 +5072,11 @@ impl LiquifactEscrow {
             !Self::legal_hold_active(&env),
             EscrowError::LegalHoldBlocksCancelFunding,
         );
+        ensure(
+            &env,
+            !Self::escrow_paused_active(&env),
+            EscrowError::EscrowIsPaused,
+        );
 
         let mut escrow = Self::load_escrow_require_admin(&env);
 
@@ -4791,6 +5105,12 @@ impl LiquifactEscrow {
     /// refundable contribution, initialized token data is missing, or the refund transfer fails
     /// token-balance invariants.
     pub fn refund(env: Env, investor: Address) {
+        ensure(
+            &env,
+            !Self::escrow_paused_active(&env),
+            EscrowError::EscrowIsPaused,
+        );
+
         investor.require_auth();
 
         let escrow = Self::get_escrow(env.clone());
@@ -4804,6 +5124,20 @@ impl LiquifactEscrow {
         env.storage()
             .instance()
             .set(&DataKey::InvestorRefunded(investor.clone()), &true);
+
+        // Decrement the bucketed aggregate so dashboards stay accurate after refunds.
+        {
+            let bucket = Self::investor_bucket_index(&env, &investor);
+            let prev_bucket: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::InvestorContributionBucket(bucket))
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::InvestorContributionBucket(bucket),
+                &prev_bucket.saturating_sub(amount),
+            );
+        }
 
         // Track distributed principal so sweep_terminal_dust can enforce the liability floor.
         let prev_distributed: i128 = env
