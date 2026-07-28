@@ -48,7 +48,7 @@ mod batch_claim;
 mod cap_validation;
 mod chaos;
 mod coverage;
-mod delta_snapshots;
+mod e2e;
 mod external_calls;
 mod external_calls_mocked;
 mod validation;
@@ -58,6 +58,7 @@ mod init;
 mod integration;
 mod legal_hold;
 mod properties;
+mod regressions;
 mod settlement;
 mod state_inconsistency;
 mod token_cache;
@@ -184,6 +185,9 @@ pub fn init_and_fund_with_real_token<'a>(
         &treasury,
         &None,
         &None,
+        &None,
+        &None,
+        &None,        &None,
         &None,
         &None,
         &None,
