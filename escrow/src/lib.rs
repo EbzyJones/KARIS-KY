@@ -546,14 +546,16 @@ pub enum DataKey {
     DistributedPrincipal,
     /// Optional funding deadline (ledger timestamp); after it passes, new funds are rejected.
     FundingDeadline,
-    /// Named state snapshot metadata: stores the timestamp and invoer address for a given snapshot name.
-    /// Stored as `Map<Symbol, SnapshotMetadata>` where the Symbol is the snapshot name.
-    /// Absent ⇒ no snapshots have been created. Limited to [`MAX_STATE_SNAPSHOTS`] total.
-    StateSnapshotMetadata(Symbol),
-    /// Full escrow state stored at the time of snapshot creation (indexed by snapshot name).
-    /// Stored as `Map<Symbol, InvoiceEscrow>` where the Symbol is the snapshot name.
-    /// Paired with [`DataKey::StateSnapshotMetadata`]; reverted by [`LiquifactEscrow::revert_to_snapshot`].
-    StateSnapshotState(Symbol),
+    /// Optional baseline full snapshot for delta chain reconstruction.
+    /// Immutable after set (when status transitions to 1). Absent ⇒ no delta encoding in use.
+    /// **Note:** For now, kept for future use; current implementation stores full escrow at `DataKey::Escrow`.
+    FullSnapshot,
+    /// Head of the delta chain: points to the latest applied delta ID.
+    /// Absent ⇒ no deltas (only full snapshot or no delta encoding).
+    SnapshotDeltaChain,
+    /// Per-delta storage: indexed by delta_id.
+    /// Maps delta ID → [`SnapshotDelta`] struct for incremental state changes.
+    SnapshotDelta(u32),
 }
 
 // --- Data types ---
@@ -605,6 +607,31 @@ pub struct SmeCollateralCommitment {
     pub asset: Symbol,
     pub amount: i128,
     pub recorded_at: u64,
+}
+
+/// Incremental state change record for delta-encoded snapshots.
+/// Stores only the fields that changed from the previous state, enabling storage optimization.
+///
+/// **Immutable** once written; delta chains form an audit trail of state transitions.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotDelta {
+    /// Unique ID of this delta (monotonically increasing).
+    pub delta_id: u32,
+    /// Ledger timestamp when this delta was recorded.
+    pub recorded_at: u64,
+    /// Previous delta ID this one is based on (0 for baseline/first delta).
+    pub based_on_delta_id: u32,
+    /// Change in funded amount (signed; may be negative for reversals).
+    pub funded_amount_delta: i128,
+    /// New maturity value (0 if unchanged).
+    pub maturity: u64,
+    /// New status (255 if unchanged).
+    pub status: u8,
+    /// New admin address (None if unchanged).
+    pub admin: Option<Address>,
+    /// New SME/beneficiary address (None if unchanged).
+    pub sme_address: Option<Address>,
 }
 
 /// One step in an optional tier ladder: investors who commit to at least `min_lock_secs` (on first
@@ -1011,6 +1038,36 @@ pub struct InvestorAllowlistChanged {
     pub allowed: u32,
 }
 
+/// Health warning event emitted when an escrow enters a potentially unhealthy state.
+/// **Non-blocking**: warnings do not prevent valid escrow transitions.
+/// Off-chain indexers use warnings for risk alerting and monitoring.
+///
+/// # Warning Type Codes
+/// - 4001: `LowFundingRatio` — funded amount is < 50% of target
+/// - 4002: `CloseToMaturity` — escrow is < 1 day away from maturity
+/// - 4003: `OverMaturity` — escrow is past maturity timestamp but still unfunded
+/// - 4004: `FundingStalled` — no deposits in extended period (reserved for future use)
+#[contractevent]
+pub struct EscrowHealthWarning {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Warning category: 4001–4004 (0 = no warning, for future use).
+    pub warning_type: u32,
+    /// Current funded principal.
+    pub funded_amount: i128,
+    /// Funding target.
+    pub funding_target: i128,
+    /// Funded ratio in basis points: (funded_amount / funding_target) * 10_000
+    /// (range 0–10_000+). Clamped to i64::MAX if overflow.
+    pub funded_ratio_bps: i64,
+    /// Seconds until maturity (may be negative if past maturity).
+    /// i64::MAX if no maturity constraint (maturity == 0).
+    pub time_to_maturity_secs: i64,
+    pub recorded_at_ledger_timestamp: u64,
+}
+
 #[contractevent]
 pub struct ContractUpgraded {
     #[topic]
@@ -1092,16 +1149,77 @@ impl LiquifactEscrow {
             .unwrap_or(false)
     }
 
-    /// Emit a diagnostic event for an error with recovery guidance.
+    /// Compute health metrics and emit a warning event if the escrow is in an unhealthy state.
+    /// Returns the warning type code (0 = no warning, 4001–4004 = warning).
     ///
-    /// Used by error paths to provide SDKs and integrators with structured error information,
-    /// recovery suggestions, and contextual data (e.g., "can claim in X blocks").
-    fn emit_error_diagnostic(env: &Env, diagnostic: ErrorDiagnostic) {
-        ErrorDiagnosticEmitted {
-            name: symbol_short!("err_diag"),
-            diagnostic,
+    /// # Logic
+    /// - **Code 4001 (LowFundingRatio)**: `funded_ratio_bps < 5000` (< 50%) and close to/past maturity.
+    /// - **Code 4002 (CloseToMaturity)**: `time_to_maturity_secs < 86400` (< 1 day) with healthy funding.
+    /// - **Code 4003 (OverMaturity)**: Escrow is past maturity (`time_to_maturity_secs < 0`) and unfunded.
+    /// - **Code 0**: No warning condition detected.
+    ///
+    /// # Non-blocking
+    /// This function never causes a transaction to fail. If metrics cannot be computed
+    /// (overflow, etc.), it gracefully returns code 0.
+    fn compute_and_emit_health_warning(env: &Env, escrow: &InvoiceEscrow, now: u64) -> u32 {
+        let funded_ratio_bps: i64 = if escrow.funding_target > 0 {
+            // (funded_amount / funding_target) * 10_000
+            // Use saturating arithmetic to avoid panic on overflow.
+            let numerator = (escrow.funded_amount as i128).saturating_mul(10_000);
+            let ratio = numerator / (escrow.funding_target as i128);
+            // Clamp to i64 range.
+            if ratio > i64::MAX as i128 {
+                i64::MAX
+            } else if ratio < 0 {
+                0
+            } else {
+                ratio as i64
+            }
+        } else {
+            10_000_i64 // No target set; assume fully funded.
+        };
+
+        let time_to_maturity_secs: i64 = if escrow.maturity > 0 {
+            let maturity_i64 = escrow.maturity as i64;
+            let now_i64 = now as i64;
+            // Clamp to prevent overflow when computing the delta.
+            maturity_i64.saturating_sub(now_i64)
+        } else {
+            i64::MAX // No maturity constraint.
+        };
+
+        // Determine warning type based on conditions.
+        let warning_type = if time_to_maturity_secs < 0 && escrow.status == 0 && escrow.funded_amount < escrow.funding_target {
+            4003 // OverMaturity: past maturity, still open, and unfunded.
+        } else if time_to_maturity_secs >= 0 && time_to_maturity_secs < 86400 {
+            // Close to maturity (< 1 day away).
+            if funded_ratio_bps < 5000 {
+                4001 // LowFundingRatio near maturity.
+            } else {
+                4002 // CloseToMaturity with healthy funding.
+            }
+        } else if funded_ratio_bps < 5000 && escrow.status == 0 {
+            4001 // LowFundingRatio (open, no immediate time pressure).
+        } else {
+            0 // No warning.
+        };
+
+        // Only emit if a warning was detected.
+        if warning_type != 0 {
+            EscrowHealthWarning {
+                name: symbol_short!("hlth_wrn"),
+                invoice_id: escrow.invoice_id.clone(),
+                warning_type,
+                funded_amount: escrow.funded_amount,
+                funding_target: escrow.funding_target,
+                funded_ratio_bps,
+                time_to_maturity_secs,
+                recorded_at_ledger_timestamp: now,
+            }
+            .publish(env);
         }
-        .publish(env);
+
+        warning_type
     }
 
     /// Read the immutable funding token address, failing with [`EscrowError::FundingTokenNotSet`]
@@ -1760,6 +1878,59 @@ impl LiquifactEscrow {
         }
     }
 
+    /// Read-only health check: compute and return the current health metrics without state mutation.
+    /// Returns `(warning_type, funded_ratio_bps, time_to_maturity_secs)`.
+    ///
+    /// # Returns
+    /// - `warning_type`: 0 = no warning, 4001–4004 = specific warning condition.
+    /// - `funded_ratio_bps`: basis points ratio (0–10_000+, clamped to i64::MAX on overflow).
+    /// - `time_to_maturity_secs`: seconds until maturity (negative if past, i64::MAX if no maturity).
+    ///
+    /// # Authorization
+    /// None — pure read; no auth required.
+    pub fn check_escrow_health(env: Env) -> (u32, i64, i64) {
+        let escrow = Self::get_escrow(env.clone());
+        let now = env.ledger().timestamp();
+
+        let funded_ratio_bps: i64 = if escrow.funding_target > 0 {
+            let numerator = (escrow.funded_amount as i128).saturating_mul(10_000);
+            let ratio = numerator / (escrow.funding_target as i128);
+            if ratio > i64::MAX as i128 {
+                i64::MAX
+            } else if ratio < 0 {
+                0
+            } else {
+                ratio as i64
+            }
+        } else {
+            10_000_i64
+        };
+
+        let time_to_maturity_secs: i64 = if escrow.maturity > 0 {
+            let maturity_i64 = escrow.maturity as i64;
+            let now_i64 = now as i64;
+            maturity_i64.saturating_sub(now_i64)
+        } else {
+            i64::MAX
+        };
+
+        let warning_type = if time_to_maturity_secs < 0 && escrow.status == 0 && escrow.funded_amount < escrow.funding_target {
+            4003
+        } else if time_to_maturity_secs >= 0 && time_to_maturity_secs < 86400 {
+            if funded_ratio_bps < 5000 {
+                4001
+            } else {
+                4002
+            }
+        } else if funded_ratio_bps < 5000 && escrow.status == 0 {
+            4001
+        } else {
+            0
+        };
+
+        (warning_type, funded_ratio_bps, time_to_maturity_secs)
+    }
+
     /// Whether a compliance/legal hold is active (defaults to `false` if unset).
     pub fn get_legal_hold(env: Env) -> bool {
         Self::legal_hold_active(&env)
@@ -2113,6 +2284,164 @@ impl LiquifactEscrow {
 
     pub fn is_investor_claimed(env: Env, investor: Address) -> bool {
         Self::get_persistent_investor_claimed(&env, investor)
+    }
+
+    /// --- Delta-encoded snapshot helpers ---
+
+    /// Reconstruct the full escrow state by applying all deltas in the chain.
+    /// Returns the reconstructed escrow, or None if the chain is broken.
+    ///
+    /// # Logic
+    /// 1. Load baseline full snapshot (or current Escrow as fallback).
+    /// 2. Walk delta chain from head, collecting all deltas.
+    /// 3. Apply deltas in chronological order (oldest to newest).
+    /// 4. Return reconstructed state.
+    fn reconstruct_snapshot_from_deltas(env: &Env) -> Option<InvoiceEscrow> {
+        // Start with the full snapshot if it exists; otherwise use current escrow as baseline.
+        let mut escrow = match env
+            .storage()
+            .instance()
+            .get::<DataKey, InvoiceEscrow>(&DataKey::FullSnapshot)
+        {
+            Some(snap) => snap,
+            None => {
+                // Fall back to current escrow (no delta encoding in use).
+                return env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, InvoiceEscrow>(&DataKey::Escrow);
+            }
+        };
+
+        // Load delta chain head.
+        let Some(mut delta_id) = env
+            .storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::SnapshotDeltaChain)
+        else {
+            // No deltas; return the baseline.
+            return Some(escrow);
+        };
+
+        // Collect all deltas in reverse order (from head to base).
+        let mut deltas: Vec<SnapshotDelta> = Vec::new(env);
+        let max_iterations = 1000; // Safety limit to prevent infinite loops.
+        let mut iterations = 0;
+
+        while delta_id != 0 && iterations < max_iterations {
+            if let Some(delta) = env
+                .storage()
+                .instance()
+                .get::<DataKey, SnapshotDelta>(&DataKey::SnapshotDelta(delta_id))
+            {
+                deltas.push_back(delta);
+                delta_id = delta.based_on_delta_id;
+            } else {
+                return None; // Broken chain.
+            }
+            iterations += 1;
+        }
+
+        // Apply deltas in chronological order (reverse the collected order).
+        let n = deltas.len();
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
+            let delta = deltas.get(i).unwrap();
+
+            // Apply funded_amount_delta.
+            if delta.funded_amount_delta != 0 {
+                escrow.funded_amount = escrow
+                    .funded_amount
+                    .checked_add(delta.funded_amount_delta)
+                    .ok()?;
+            }
+
+            // Apply maturity change.
+            if delta.maturity != 0 {
+                escrow.maturity = delta.maturity;
+            }
+
+            // Apply status change.
+            if delta.status != 255 {
+                escrow.status = delta.status as u32;
+            }
+
+            // Apply admin address change.
+            if let Some(admin) = delta.admin.clone() {
+                escrow.admin = admin;
+            }
+
+            // Apply SME address change.
+            if let Some(sme) = delta.sme_address.clone() {
+                escrow.sme_address = sme;
+            }
+        }
+
+        Some(escrow)
+    }
+
+    /// Record a new state delta to the chain.
+    /// Returns the new delta_id if successful.
+    fn append_snapshot_delta(
+        env: &Env,
+        escrow: &InvoiceEscrow,
+        prev_escrow: &InvoiceEscrow,
+    ) -> u32 {
+        // Compute the delta.
+        let delta = SnapshotDelta {
+            delta_id: 0, // Will be assigned below.
+            recorded_at: env.ledger().timestamp(),
+            based_on_delta_id: env
+                .storage()
+                .instance()
+                .get::<DataKey, u32>(&DataKey::SnapshotDeltaChain)
+                .unwrap_or(0),
+            funded_amount_delta: escrow.funded_amount - prev_escrow.funded_amount,
+            maturity: if escrow.maturity != prev_escrow.maturity {
+                escrow.maturity
+            } else {
+                0
+            },
+            status: if escrow.status != prev_escrow.status {
+                escrow.status as u8
+            } else {
+                255
+            },
+            admin: if escrow.admin != prev_escrow.admin {
+                Some(escrow.admin.clone())
+            } else {
+                None
+            },
+            sme_address: if escrow.sme_address != prev_escrow.sme_address {
+                Some(escrow.sme_address.clone())
+            } else {
+                None
+            },
+        };
+
+        // Assign new delta_id (monotonically increasing).
+        let new_delta_id = env
+            .storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::SnapshotDeltaChain)
+            .unwrap_or(0)
+            + 1;
+
+        let mut delta_with_id = delta;
+        delta_with_id.delta_id = new_delta_id;
+
+        // Store the delta.
+        env.storage()
+            .instance()
+            .set(&DataKey::SnapshotDelta(new_delta_id), &delta_with_id);
+
+        // Update chain head.
+        env.storage()
+            .instance()
+            .set(&DataKey::SnapshotDeltaChain, &new_delta_id);
+
+        new_delta_id
     }
 
     /// Record or replace the optional SME collateral commitment metadata.
@@ -2808,6 +3137,10 @@ impl LiquifactEscrow {
         }
         .publish(&env);
 
+        // Emit health warning if escrow is in an unhealthy state.
+        let now = env.ledger().timestamp();
+        Self::compute_and_emit_health_warning(&env, &escrow, now);
+
         escrow
     }
 
@@ -2963,10 +3296,8 @@ impl LiquifactEscrow {
         }
         .publish(&env);
 
-        // Settlement always succeeds. The settlement notifier (if configured) is
-        // invoked separately via `notify_settlement()` by an off-chain relayer or
-        // indexer watching for `EscrowSettled`. This guarantees graceful failure:
-        // a broken notifier does not block settlement finalization.
+        // Emit health warning if applicable (for audit trail).
+        Self::compute_and_emit_health_warning(&env, &escrow, now);
 
         escrow
     }
@@ -3136,6 +3467,9 @@ impl LiquifactEscrow {
             invoice_id: escrow.invoice_id.clone(),
         }
         .publish(&env);
+
+        // Emit health warning if applicable (for audit trail).
+        Self::compute_and_emit_health_warning(&env, &escrow, now);
     }
 
     /// On-chain read-only pro-rata gross payout for `investor`.
