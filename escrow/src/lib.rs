@@ -751,6 +751,47 @@ pub struct EscrowSummary {
     pub has_primary_attestation: bool,
     /// Number of entries in the attestation append log.
     pub attestation_log_length: u32,
+    /// Reason for the active legal hold, if any (max 256 bytes). Absent when no hold.
+    pub legal_hold_reason: Option<String>,
+}
+
+/// Structured compliance report for regulatory submissions.
+/// Generated on-demand by [`LiquifactEscrow::generate_compliance_report`].
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComplianceReport {
+    /// Invoice identifier for this escrow.
+    pub invoice_id: Symbol,
+    /// Escrow creation ledger timestamp (when init was called).
+    pub created_at_ledger_timestamp: u64,
+    /// Escrow creation ledger sequence number.
+    pub created_at_ledger_sequence: u32,
+    /// Current escrow status (0=open, 1=funded, 2=settled, 3=withdrawn, 4=cancelled).
+    pub status: u32,
+    /// Original invoice amount (funding target at init).
+    pub amount: i128,
+    /// Total principal funded by investors.
+    pub funded_amount: i128,
+    /// Configured base yield in basis points.
+    pub yield_bps: i64,
+    /// Maturity timestamp (0 if no maturity lock).
+    pub maturity: u64,
+    /// Count of unique investors who contributed.
+    pub investor_count: u32,
+    /// True when a legal hold is currently active.
+    pub legal_hold_active: bool,
+    /// Reason for legal hold, if any (max 256 bytes).
+    pub legal_hold_reason: Option<String>,
+    /// Funding close snapshot timestamp (when escrow became fully funded), if applicable.
+    pub funded_at_ledger_timestamp: Option<u64>,
+    /// Settlement timestamp, if settled.
+    pub settled_at_ledger_timestamp: Option<u64>,
+    /// Admin address.
+    pub admin: Address,
+    /// SME (beneficiary) address.
+    pub sme_address: Address,
+    /// Number of investors who have claimed their payout.
+    pub investors_claimed: u32,
 }
 
 /// Dashboard-ready health score for the escrow.
@@ -906,6 +947,8 @@ pub struct LegalHoldChanged {
     pub invoice_id: Symbol,
     /// `1` = hold enabled, `0` = cleared.
     pub active: u32,
+    /// Human-readable reason for the hold (max 256 bytes). Empty when clearing.
+    pub reason: String,
 }
 
 #[contractevent]
@@ -1092,12 +1135,17 @@ pub struct InvestorAllowlistChanged {
     pub allowed: u32,
 }
 
-/// Emitted on every successful [`LiquifactEscrow::fund`] or
-/// [`LiquifactEscrow::fund_with_commitment`] call.
-///
-/// Carries the actor (investor) address, ledger timestamp, and all key fields
-/// so indexers get a single self‑contained event for fund reconciliation.
-/// Schema event version = 1.
+/// Emitted when a compliance report is generated via
+/// [`LiquifactEscrow::generate_compliance_report`].
+#[contractevent]
+pub struct ComplianceReportGenerated {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub report: ComplianceReport,
+}
+
 #[contractevent]
 pub struct FundReceived {
     /// Event schema version for forward compatibility.
@@ -2275,6 +2323,12 @@ impl LiquifactEscrow {
         Self::legal_hold_active(&env)
     }
 
+    /// Returns the reason for the current legal hold, if any.
+    /// Absent when no hold is active or the hold was set without a reason.
+    pub fn get_legal_hold_reason(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::LegalHoldReason)
+    }
+
     /// Configured minimum delay between [`LiquifactEscrow::request_clear_legal_hold`]
     /// and [`LiquifactEscrow::set_legal_hold(env, false)`]. Defaults to `0`.
     pub fn get_legal_hold_clear_delay(env: Env) -> u64 {
@@ -2389,6 +2443,7 @@ impl LiquifactEscrow {
     pub fn get_escrow_summary(env: Env) -> EscrowSummary {
         let escrow = Self::get_escrow(env.clone());
         let legal_hold = Self::get_legal_hold(env.clone());
+        let legal_hold_reason = Self::get_legal_hold_reason(env.clone());
         let funding_close_snapshot_opt = Self::get_funding_close_snapshot(env.clone());
         let unique_funder_count = Self::get_unique_funder_count(env.clone());
         let is_allowlist_active = Self::is_allowlist_active(env.clone());
@@ -2429,7 +2484,8 @@ impl LiquifactEscrow {
             schema_version,
             sme_collateral_commitment,
             has_primary_attestation: primary_attestation_hash.is_some(),
-            attestation_log_length,
+            attestation_log_length: attestation_append_log.len(),
+            legal_hold_reason,
         }
     }
 
@@ -2655,6 +2711,19 @@ impl LiquifactEscrow {
         env.storage()
             .persistent()
             .set(&DataKey::InvestorClaimNotBefore(investor), &value);
+    }
+
+    fn get_persistent_investor_lock_in_until(env: &Env, investor: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InvestorLockInUntil(investor))
+            .unwrap_or(0)
+    }
+
+    fn set_persistent_investor_lock_in_until(env: &Env, investor: Address, value: u64) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::InvestorLockInUntil(investor), &value);
     }
 
     fn get_persistent_investor_claimed(env: &Env, investor: Address) -> bool {
@@ -2934,162 +3003,10 @@ impl LiquifactEscrow {
         Self::get_persistent_investor_claimed(&env, investor)
     }
 
-    /// --- Delta-encoded snapshot helpers ---
-
-    /// Reconstruct the full escrow state by applying all deltas in the chain.
-    /// Returns the reconstructed escrow, or None if the chain is broken.
-    ///
-    /// # Logic
-    /// 1. Load baseline full snapshot (or current Escrow as fallback).
-    /// 2. Walk delta chain from head, collecting all deltas.
-    /// 3. Apply deltas in chronological order (oldest to newest).
-    /// 4. Return reconstructed state.
-    fn reconstruct_snapshot_from_deltas(env: &Env) -> Option<InvoiceEscrow> {
-        // Start with the full snapshot if it exists; otherwise use current escrow as baseline.
-        let mut escrow = match env
-            .storage()
-            .instance()
-            .get::<DataKey, InvoiceEscrow>(&DataKey::FullSnapshot)
-        {
-            Some(snap) => snap,
-            None => {
-                // Fall back to current escrow (no delta encoding in use).
-                return env
-                    .storage()
-                    .instance()
-                    .get::<DataKey, InvoiceEscrow>(&DataKey::Escrow);
-            }
-        };
-
-        // Load delta chain head.
-        let Some(mut delta_id) = env
-            .storage()
-            .instance()
-            .get::<DataKey, u32>(&DataKey::SnapshotDeltaChain)
-        else {
-            // No deltas; return the baseline.
-            return Some(escrow);
-        };
-
-        // Collect all deltas in reverse order (from head to base).
-        let mut deltas: Vec<SnapshotDelta> = Vec::new(env);
-        let max_iterations = 1000; // Safety limit to prevent infinite loops.
-        let mut iterations = 0;
-
-        while delta_id != 0 && iterations < max_iterations {
-            if let Some(delta) = env
-                .storage()
-                .instance()
-                .get::<DataKey, SnapshotDelta>(&DataKey::SnapshotDelta(delta_id))
-            {
-                deltas.push_back(delta);
-                delta_id = delta.based_on_delta_id;
-            } else {
-                return None; // Broken chain.
-            }
-            iterations += 1;
-        }
-
-        // Apply deltas in chronological order (reverse the collected order).
-        let n = deltas.len();
-        let mut i = n;
-        while i > 0 {
-            i -= 1;
-            let delta = deltas.get(i).unwrap();
-
-            // Apply funded_amount_delta.
-            if delta.funded_amount_delta != 0 {
-                escrow.funded_amount = escrow
-                    .funded_amount
-                    .checked_add(delta.funded_amount_delta)
-                    .ok()?;
-            }
-
-            // Apply maturity change.
-            if delta.maturity != 0 {
-                escrow.maturity = delta.maturity;
-            }
-
-            // Apply status change.
-            if delta.status != 255 {
-                escrow.status = delta.status as u32;
-            }
-
-            // Apply admin address change.
-            if let Some(admin) = delta.admin.clone() {
-                escrow.admin = admin;
-            }
-
-            // Apply SME address change.
-            if let Some(sme) = delta.sme_address.clone() {
-                escrow.sme_address = sme;
-            }
-        }
-
-        Some(escrow)
-    }
-
-    /// Record a new state delta to the chain.
-    /// Returns the new delta_id if successful.
-    fn append_snapshot_delta(
-        env: &Env,
-        escrow: &InvoiceEscrow,
-        prev_escrow: &InvoiceEscrow,
-    ) -> u32 {
-        // Compute the delta.
-        let delta = SnapshotDelta {
-            delta_id: 0, // Will be assigned below.
-            recorded_at: env.ledger().timestamp(),
-            based_on_delta_id: env
-                .storage()
-                .instance()
-                .get::<DataKey, u32>(&DataKey::SnapshotDeltaChain)
-                .unwrap_or(0),
-            funded_amount_delta: escrow.funded_amount - prev_escrow.funded_amount,
-            maturity: if escrow.maturity != prev_escrow.maturity {
-                escrow.maturity
-            } else {
-                0
-            },
-            status: if escrow.status != prev_escrow.status {
-                escrow.status as u8
-            } else {
-                255
-            },
-            admin: if escrow.admin != prev_escrow.admin {
-                Some(escrow.admin.clone())
-            } else {
-                None
-            },
-            sme_address: if escrow.sme_address != prev_escrow.sme_address {
-                Some(escrow.sme_address.clone())
-            } else {
-                None
-            },
-        };
-
-        // Assign new delta_id (monotonically increasing).
-        let new_delta_id = env
-            .storage()
-            .instance()
-            .get::<DataKey, u32>(&DataKey::SnapshotDeltaChain)
-            .unwrap_or(0)
-            + 1;
-
-        let mut delta_with_id = delta;
-        delta_with_id.delta_id = new_delta_id;
-
-        // Store the delta.
-        env.storage()
-            .instance()
-            .set(&DataKey::SnapshotDelta(new_delta_id), &delta_with_id);
-
-        // Update chain head.
-        env.storage()
-            .instance()
-            .set(&DataKey::SnapshotDeltaChain, &new_delta_id);
-
-        new_delta_id
+    /// Returns the ledger timestamp until which this investor is locked from claiming
+    /// after funding. Returns 0 if no lock-in was configured.
+    pub fn get_investor_lock_in_until(env: Env, investor: Address) -> u64 {
+        Self::get_persistent_investor_lock_in_until(&env, investor)
     }
 
     /// Record or replace the optional SME collateral commitment metadata.
@@ -3173,8 +3090,15 @@ impl LiquifactEscrow {
     /// hold + key loss cannot strand funds without an off-chain recovery vote that executes
     /// `propose_admin`, `accept_admin`, then `clear_legal_hold`. See
     /// `docs/escrow-legal-hold.md`.
-    pub fn set_legal_hold(env: Env, active: bool) {
+    pub fn set_legal_hold(env: Env, active: bool, reason: String) {
         let escrow = Self::load_escrow_require_admin(&env);
+
+        // Validate reason length (max 256 bytes)
+        ensure(
+            &env,
+            reason.len() <= 256,
+            EscrowError::LegalHoldReasonTooLong,
+        );
 
         if !active && Self::legal_hold_active(&env) {
             let delay = Self::get_legal_hold_clear_delay(env.clone());
@@ -3201,10 +3125,22 @@ impl LiquifactEscrow {
 
         env.storage().instance().set(&DataKey::LegalHold, &active);
 
+        // Store or remove the reason
+        if active && reason.len() > 0 {
+            env.storage()
+                .instance()
+                .set(&DataKey::LegalHoldReason, &reason);
+        } else {
+            env.storage()
+                .instance()
+                .remove(&DataKey::LegalHoldReason);
+        }
+
         LegalHoldChanged {
             name: symbol_short!("legalhld"),
             invoice_id: escrow.invoice_id.clone(),
             active: if active { 1 } else { 0 },
+            reason,
         }
         .publish(&env);
 
@@ -3422,7 +3358,7 @@ impl LiquifactEscrow {
 
     /// Convenience alias for [`LiquifactEscrow::set_legal_hold`] with `active = false`.
     pub fn clear_legal_hold(env: Env) {
-        Self::set_legal_hold(env, false);
+        Self::set_legal_hold(env, false, String::from_str(&env, ""));
     }
 
     pub fn update_funding_target(env: Env, new_target: i128) -> InvoiceEscrow {
@@ -4054,12 +3990,51 @@ impl LiquifactEscrow {
                 );
             }
             Self::set_persistent_investor_claim_not_before(&env, investor.clone(), claim_nb);
+
+            // Set investor lock-in period (separate from tier commitment lock)
+            let lock_in_secs: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::InvestorLockInSecs)
+                .unwrap_or(0);
+            if lock_in_secs > 0 {
+                let lock_until = now
+                    .checked_add(lock_in_secs)
+                    .unwrap_or_else(|| fail(&env, EscrowError::InvestorClaimTimeOverflow));
+                Self::set_persistent_investor_lock_in_until(&env, investor.clone(), lock_until);
+            }
         }
 
         escrow.funded_amount = escrow
             .funded_amount
             .checked_add(amount)
             .unwrap_or_else(|| fail(&env, EscrowError::FundedAmountOverflow));
+
+        // --- Concentration cap check ---
+        if let Some(concentration_cap) = env
+            .storage()
+            .instance()
+            .get::<DataKey, i64>(&DataKey::MaxInvestorConcentration)
+        {
+            if escrow.funded_amount > 0 {
+                // concentration = (investor_contribution * 100) / total_funded
+                let concentration_pct = new_contribution
+                    .checked_mul(100)
+                    .and_then(|v| v.checked_div(escrow.funded_amount))
+                    .unwrap_or(0);
+                if concentration_pct > concentration_cap as i128 {
+                    let diagnostic = ErrorDiagnostic::with_context(
+                        &env,
+                        EscrowError::ConcentrationLimitExceeded as u32,
+                        "Investor concentration exceeds configured cap",
+                        "Reduce funding amount or wait for other investors to fund",
+                        &format!("Current: {}%, Limit: {}%", concentration_pct, concentration_cap),
+                    );
+                    Self::emit_error_diagnostic(&env, diagnostic);
+                    fail(&env, EscrowError::ConcentrationLimitExceeded);
+                }
+            }
+        }
 
         if escrow.status == 0 && escrow.funded_amount >= escrow.funding_target {
             escrow.status = 1;
@@ -4474,9 +4449,26 @@ impl LiquifactEscrow {
             EscrowError::InvestorClaimNotSettled,
         );
 
+        let now = env.ledger().timestamp();
+
+        // --- Investor lock-in period check (separate from tier commitment lock) ---
+        let lock_in_until: u64 =
+            Self::get_persistent_investor_lock_in_until(&env, investor.clone());
+        if lock_in_until > 0 && now < lock_in_until {
+            let blocks_remaining = lock_in_until.saturating_sub(now);
+            let diagnostic = ErrorDiagnostic::with_context(
+                &env,
+                EscrowError::InvestorStillInLockIn as u32,
+                "Investor is still in lock-in period after funding",
+                "Wait for the lock-in period to expire before claiming payout",
+                &format!("{} seconds remaining", blocks_remaining),
+            );
+            Self::emit_error_diagnostic(&env, diagnostic);
+            fail(&env, EscrowError::InvestorStillInLockIn);
+        }
+
         let not_before: u64 =
             Self::get_persistent_investor_claim_not_before(&env, investor.clone());
-        let now = env.ledger().timestamp();
         
         if now < not_before {
             let context_msg = if not_before > 0 {

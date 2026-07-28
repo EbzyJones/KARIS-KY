@@ -514,7 +514,7 @@ fn test_legal_hold_blocks_settle_withdraw_claim_and_fund() {
         &None,
     );
     client.fund(&investor, &TARGET);
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(client.get_legal_hold());
 
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -532,7 +532,7 @@ fn test_legal_hold_blocks_settle_withdraw_claim_and_fund() {
     let settled = client.settle();
     assert_eq!(settled.status, 2);
 
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.claim_investor_payout(&investor);
     }))
@@ -1333,7 +1333,7 @@ fn auth_audit_set_legal_hold_requires_admin() {
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
     env.mock_auths(&[]);
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
 }
 
 #[test]
@@ -1551,7 +1551,7 @@ fn test_rotate_beneficiary_with_legal_hold_fails() {
     let (client, admin, sme) = setup(&env);
     let new_sme = Address::generate(&env);
     default_init(&client, &env, &admin, &sme);
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     client.rotate_beneficiary(&new_sme);
 }
 

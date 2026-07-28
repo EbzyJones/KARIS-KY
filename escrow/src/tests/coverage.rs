@@ -212,9 +212,12 @@ fn escrow_error_discriminants_match_canonical_table() {
         (EscrowError::NewSmeSameAsCurrent, 162),
         (EscrowError::FundingDeadlinePassed, 164),
         (EscrowError::NoPendingAdmin, 163),
-        (EscrowError::EscrowIsPaused, 165),
+        (EscrowError::InvestorStillInLockIn, 165),
+        (EscrowError::ConcentrationLimitExceeded, 166),
+        (EscrowError::ConcentrationInvalidRange, 167),
+        (EscrowError::LegalHoldReasonTooLong, 168),
     ];
-    assert_eq!(TABLE.len(), 85);
+    assert_eq!(TABLE.len(), 88);
     for (variant, code) in TABLE {
         assert_eq!(*variant as u32, *code, "discriminant drift for code {code}");
     }
@@ -626,12 +629,12 @@ fn typed_error_codes_cover_range_boundaries() {
     );
     lh_client.set_legal_hold(&true);
     assert_contract_error(
-        lh_client.try_set_legal_hold(&false),
+        lh_client.try_set_legal_hold(&false, &String::from_str(&env, "")),
         EscrowError::LegalHoldClearRequestMissing,
     );
     lh_client.request_clear_legal_hold();
     assert_contract_error(
-        lh_client.try_set_legal_hold(&false),
+        lh_client.try_set_legal_hold(&false, &String::from_str(&env, "")),
         EscrowError::LegalHoldClearNotReady,
     );
 
@@ -686,7 +689,10 @@ fn typed_error_codes_cover_range_boundaries() {
         &None,
         &None,
         &None,
-    );
+    ,
+    &None,
+    &None,
+);
     rot_token.stellar.mint(&rot_terminal.address, &100);
     rot_terminal.fund(&investor, &100);
     rot_terminal.settle();
@@ -962,7 +968,7 @@ fn test_fund_during_legal_hold() {
         &None,
     );
 
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     let investor = Address::generate(&env);
     client.fund(&investor, &10);
 }
@@ -1695,7 +1701,7 @@ fn test_clear_legal_hold_convenience() {
         &None,
     );
 
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(client.get_legal_hold());
     client.clear_legal_hold();
     assert!(!client.get_legal_hold());
@@ -2278,7 +2284,7 @@ fn test_get_escrow_summary_after_state_changes() {
     client.set_investor_allowlisted(&investor, &true);
     // Fund enough to trigger funded status and capture snapshot
     client.fund(&investor, &1000);
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
 
     let summary = client.get_escrow_summary();
 
@@ -2639,7 +2645,7 @@ fn test_is_settleable_blocked_by_legal_hold() {
     let (client, admin, sme) = setup(&env);
     init_settleable_test(&env, &client, &admin, &sme, 0);
     fund_to_target_stl(&env, &client);
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(!client.is_settleable());
 }
 
@@ -2686,7 +2692,7 @@ fn test_is_settleable_funded_maturity_zero_hold_active_returns_false() {
     let (client, admin, sme) = setup(&env);
     init_settleable_test(&env, &client, &admin, &sme, 0);
     fund_to_target_stl(&env, &client);
-    client.set_legal_hold(&true);
+    client.set_legal_hold(&true, &String::from_str(&env, "compliance"));
     assert!(
         !client.is_settleable(),
         "hold must block settleability even when maturity is 0"
