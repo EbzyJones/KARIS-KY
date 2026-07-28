@@ -56,6 +56,8 @@ fn test_legal_hold_midflow_blocks_and_resumes_with_ordered_events() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     // We will not fund or settle — just exercise legal hold at multiple points.
@@ -159,6 +161,8 @@ fn test_escrow_gold_standard_happy_path_open_overfund_snapshot_settle_claim() {
         &None, // No yield tiers for simplicity
         &None, // No min contribution floor
         &None, // No max investors cap
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -391,6 +395,8 @@ fn test_escrow_tiered_yield_with_commitment_locks() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     let investor_base = Address::generate(&env);
@@ -511,6 +517,8 @@ fn test_collateral_record_is_metadata_only_and_does_not_invoke_token_contract() 
         &funding,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -748,6 +756,8 @@ fn test_legal_hold_midflow_blocks_then_resumes_with_ordered_events() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     // Initial funding succeeds while hold is off.
@@ -871,6 +881,8 @@ fn setup_withdraw_with_token(
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     let investor = soroban_sdk::Address::generate(env);
@@ -890,12 +902,14 @@ fn withdraw_transfers_funded_amount_to_sme() {
     env.mock_all_auths();
 
     let target = 50_000_000i128;
-    let (client, escrow_id, token, sme) =
-        setup_withdraw_with_token(&env, target, "WD_BAL001");
+    let (client, escrow_id, token, sme) = setup_withdraw_with_token(&env, target, "WD_BAL001");
 
     let sme_before = token.balance(&sme);
     let contract_before = token.balance(&escrow_id);
-    assert_eq!(contract_before, target, "escrow must hold exactly funded_amount before withdraw");
+    assert_eq!(
+        contract_before, target,
+        "escrow must hold exactly funded_amount before withdraw"
+    );
 
     client.withdraw();
 
@@ -911,7 +925,11 @@ fn withdraw_transfers_funded_amount_to_sme() {
         contract_after, 0,
         "escrow contract balance must be zero after disbursement"
     );
-    assert_eq!(client.get_escrow().status, 3u32, "status must be 3 after withdraw");
+    assert_eq!(
+        client.get_escrow().status,
+        3u32,
+        "status must be 3 after withdraw"
+    );
 }
 
 /// `withdraw` increments `DistributedPrincipal` by `funded_amount`.
@@ -921,8 +939,7 @@ fn withdraw_updates_distributed_principal() {
     env.mock_all_auths();
 
     let target = 20_000_000i128;
-    let (client, _escrow_id, _token, _sme) =
-        setup_withdraw_with_token(&env, target, "WD_DP001");
+    let (client, _escrow_id, _token, _sme) = setup_withdraw_with_token(&env, target, "WD_DP001");
 
     client.withdraw();
 
@@ -982,6 +999,8 @@ fn withdraw_rejected_wrong_status_open() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     // No funding — status is 0.
     client.withdraw(); // must panic: WithdrawalNotFunded
@@ -1023,6 +1042,8 @@ fn withdraw_rejected_insufficient_contract_balance() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     let investor = soroban_sdk::Address::generate(&env);
@@ -1058,8 +1079,7 @@ fn withdraw_event_includes_recipient() {
     env.mock_all_auths();
 
     let target = 5_000_000i128;
-    let (client, escrow_id, _token, sme) =
-        setup_withdraw_with_token(&env, target, "WD_EV001");
+    let (client, escrow_id, _token, sme) = setup_withdraw_with_token(&env, target, "WD_EV001");
 
     client.withdraw();
 
@@ -1074,9 +1094,9 @@ fn withdraw_event_includes_recipient() {
     .to_xdr(&env, &escrow_id);
 
     let all_events = env.events().all().filter_by_contract(&escrow_id);
-    let found = all_events
-        .events()
-        .iter()
-        .any(|e| *e == expected_xdr);
-    assert!(found, "SmeWithdrew event with correct recipient and amount must be emitted");
+    let found = all_events.events().iter().any(|e| *e == expected_xdr);
+    assert!(
+        found,
+        "SmeWithdrew event with correct recipient and amount must be emitted"
+    );
 }
