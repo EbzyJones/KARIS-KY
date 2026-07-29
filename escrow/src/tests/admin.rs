@@ -1253,7 +1253,7 @@ fn auth_audit_bind_primary_attestation_requires_admin() {
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
     env.mock_auths(&[]);
-    client.bind_primary_attestation_hash(&soroban_sdk::BytesN::from_array(&env, &[0u8; 32]));
+    client.bind_primary_attestation_hash(&soroban_sdk::Bytes::from_array(&env, &[0u8; 32]));
 }
 
 #[test]
@@ -1516,4 +1516,203 @@ fn test_rotate_beneficiary_then_withdraw_goes_to_new_sme() {
     client.rotate_beneficiary(&new_sme);
     client.withdraw();
     assert_eq!(token.stellar.balance(&new_sme), TARGET);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #208: Collateral record update_timestamp tracking and post-settlement guard
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Initial record: recorded_at and updated_at are both set to the current ledger timestamp.
+#[test]
+fn test_208_initial_record_timestamps_equal() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env); // sets ledger.timestamp = 12345
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "C208A"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let commitment = client.record_sme_collateral_commitment(&symbol_short!("GOLD"), &5000i128);
+
+    assert_eq!(commitment.recorded_at, 12345, "recorded_at must be set on first write");
+    assert_eq!(commitment.updated_at, 12345, "updated_at must equal recorded_at on first write");
+    assert_eq!(commitment.amount, 5000);
+}
+
+/// Update: recorded_at is preserved from the first write; updated_at advances.
+#[test]
+fn test_208_update_preserves_recorded_at_and_advances_updated_at() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env); // ledger.timestamp = 12345
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "C208B"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // First write at timestamp 12345.
+    client.record_sme_collateral_commitment(&symbol_short!("GOLD"), &5000i128);
+
+    // Advance time and update.
+    env.ledger().with_mut(|li| li.timestamp = 99999);
+    let updated = client.record_sme_collateral_commitment(&symbol_short!("GOLD"), &9000i128);
+
+    // recorded_at stays at the original write time.
+    assert_eq!(updated.recorded_at, 12345, "recorded_at must not change on update");
+    // updated_at reflects the update time.
+    assert_eq!(updated.updated_at, 99999, "updated_at must reflect the update timestamp");
+    assert_eq!(updated.amount, 9000);
+
+    // Persisted state must match the returned struct.
+    let stored = client.get_sme_collateral_commitment().unwrap();
+    assert_eq!(stored.recorded_at, 12345);
+    assert_eq!(stored.updated_at, 99999);
+    assert_eq!(stored.amount, 9000);
+}
+
+/// Record, fund to target (funded), update should still succeed (status == 1 < 2).
+#[test]
+fn test_208_update_allowed_before_settlement() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "C208C"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Record while open (status 0).
+    client.record_sme_collateral_commitment(&symbol_short!("GOLD"), &1000i128);
+
+    // Fund to target — escrow transitions to funded (status 1).
+    client.fund(&investor, &TARGET);
+    assert_eq!(client.get_escrow().status, 1);
+
+    // Advance time; update must still succeed when status == 1.
+    env.ledger().with_mut(|li| li.timestamp = 99999);
+    let updated = client.record_sme_collateral_commitment(&symbol_short!("GOLD"), &2000i128);
+    assert_eq!(updated.amount, 2000);
+    assert_eq!(updated.updated_at, 99999);
+    assert_eq!(updated.recorded_at, 12345);
+}
+
+/// After settlement (status == 2), updates must be rejected with CollateralUpdateAfterSettlement (63).
+#[test]
+fn test_208_update_blocked_after_settlement() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "C208D"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Record initial commitment.
+    client.record_sme_collateral_commitment(&symbol_short!("GOLD"), &5000i128);
+
+    // Fund and settle.
+    client.fund(&investor, &TARGET);
+    client.settle();
+    assert_eq!(client.get_escrow().status, 2);
+
+    // Attempt update — must fail with typed error code 63.
+    assert_contract_error(
+        client.try_record_sme_collateral_commitment(&symbol_short!("GOLD"), &9000i128),
+        EscrowError::CollateralUpdateAfterSettlement,
+    );
+
+    // State unchanged.
+    let stored = client.get_sme_collateral_commitment().unwrap();
+    assert_eq!(stored.amount, 5000, "collateral must not change after rejected update");
+}
+
+/// First-time record on a settled escrow is also blocked (prior == None means it's an insert, not update;
+/// but the status check applies to any write after settlement).
+/// NOTE: Current logic only blocks when a prior commitment exists. First-time records are allowed
+/// regardless of status (they're initial metadata, not corrections). This test documents that intent.
+#[test]
+fn test_208_first_record_on_settled_escrow_is_allowed() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "C208E"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.fund(&investor, &TARGET);
+    client.settle();
+    assert_eq!(client.get_escrow().status, 2);
+
+    // First-time record after settlement must succeed (no prior commitment to guard against).
+    let commitment = client.record_sme_collateral_commitment(&symbol_short!("BOND"), &1000i128);
+    assert_eq!(commitment.amount, 1000);
+    assert!(client.get_sme_collateral_commitment().is_some());
 }

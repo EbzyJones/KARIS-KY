@@ -99,7 +99,7 @@ fn typed_error_codes_cover_allowlist_attestation_and_dust_guards() {
         EscrowError::InvestorNotAllowlisted,
     );
 
-    let digest = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    let digest = soroban_sdk::Bytes::from_array(&env, &[1u8; 32]);
     client.bind_primary_attestation_hash(&digest);
     assert_contract_error(
         client.try_bind_primary_attestation_hash(&digest),
@@ -379,9 +379,9 @@ fn typed_error_codes_cover_range_boundaries() {
         &None,
     );
     let digest = BytesN::from_array(&env, &[1u8; 32]);
-    attest_client.bind_primary_attestation_hash(&digest);
+    attest_client.bind_primary_attestation_hash(&soroban_sdk::Bytes::from_array(&env, &[1u8; 32]));
     assert_contract_error(
-        attest_client.try_bind_primary_attestation_hash(&digest),
+        attest_client.try_bind_primary_attestation_hash(&soroban_sdk::Bytes::from_array(&env, &[1u8; 32])),
         EscrowError::PrimaryAttestationAlreadyBound,
     );
     for i in 0u8..MAX_ATTESTATION_APPEND_ENTRIES as u8 {
@@ -1072,11 +1072,14 @@ fn test_attestations_happy_path() {
         &None,
     );
 
-    let hash1 = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    let hash1 = soroban_sdk::Bytes::from_array(&env, &[1u8; 32]);
     let hash2 = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
 
     client.bind_primary_attestation_hash(&hash1);
-    assert_eq!(client.get_primary_attestation_hash(), Some(hash1.clone()));
+    assert_eq!(
+        client.get_primary_attestation_hash(),
+        Some(soroban_sdk::BytesN::from_array(&env, &[1u8; 32]))
+    );
 
     client.append_attestation_digest(&hash2);
     let log = client.get_attestation_append_log();
@@ -1109,7 +1112,7 @@ fn test_bind_primary_attestation_twice() {
         &None,
     );
 
-    let hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    let hash = soroban_sdk::Bytes::from_array(&env, &[1u8; 32]);
     client.bind_primary_attestation_hash(&hash);
     client.bind_primary_attestation_hash(&hash);
 }
@@ -1569,7 +1572,10 @@ fn test_sme_collateral_replacement_preserves_prior_amount() {
 
     let second = client.record_sme_collateral_commitment(&asset, &7000);
     assert_eq!(second.amount, 7000);
-    assert_eq!(second.recorded_at, 20000);
+    // recorded_at is preserved from the original write (setup sets timestamp=12345).
+    assert_eq!(second.recorded_at, 12345);
+    // updated_at reflects the most recent write timestamp.
+    assert_eq!(second.updated_at, 20000);
 
     let stored = client.get_sme_collateral_commitment().unwrap();
     assert_eq!(stored.amount, 7000);
@@ -2109,7 +2115,7 @@ fn test_get_escrow_summary_happy_path() {
     assert_eq!(summary.funding_close_snapshot, EscrowCloseSnapshot::None);
     assert_eq!(summary.unique_funder_count, 0);
     assert!(!summary.is_allowlist_active);
-    assert_eq!(summary.schema_version, 6);
+    assert_eq!(summary.schema_version, 7);
     assert_eq!(
         summary.sme_collateral_commitment,
         CollateralCommitmentSnapshot::None

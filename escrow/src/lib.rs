@@ -116,7 +116,7 @@ extern crate std;
 use core::{clone::Clone, default::Default};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
-    symbol_short, token::TokenClient, Address, BytesN, Env, String, Symbol, Vec,
+    symbol_short, token::TokenClient, Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 pub mod external_calls;
@@ -133,9 +133,10 @@ pub mod external_calls;
 /// | 4 | Added `PrimaryAttestationHash`, `AttestationAppendLog` | Additive keys — no `migrate` call required |
 /// | 5 | Added `YieldTierTable`, `RegistryRef`, `Treasury`; `fund_with_commitment` | **Redeploy required** if `InvoiceEscrow` XDR changed |
 /// | 6 | Per-investor keys moved to **persistent** storage (see ADR-007) | **Redeploy required** — no `migrate` path (addresses not enumerable) |
+/// | 7 | Added `updated_at` to `SmeCollateralCommitment`; `bind_primary_attestation_hash` now accepts `Bytes` with explicit length validation (#207, #208) | **Redeploy required** — `SmeCollateralCommitment` XDR shape changed |
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
@@ -245,6 +246,8 @@ pub enum EscrowError {
     PrimaryAttestationAlreadyBound = 50,
     /// [`LiquifactEscrow::append_attestation_digest`] exceeded [`MAX_ATTESTATION_APPEND_ENTRIES`].
     AttestationAppendLogCapacityReached = 51,
+    /// [`LiquifactEscrow::bind_primary_attestation_hash`] received a digest that is not exactly 32 bytes.
+    InvalidAttestationHashLength = 52,
 
     /// [`LiquifactEscrow::record_sme_collateral_commitment`] received a non-positive amount.
     CollateralAmountNotPositive = 60,
@@ -252,6 +255,9 @@ pub enum EscrowError {
     CollateralAssetEmpty = 61,
     /// [`LiquifactEscrow::record_sme_collateral_commitment`] received a timestamp before the stored record.
     CollateralTimestampBackwards = 62,
+    /// [`LiquifactEscrow::record_sme_collateral_commitment`] called after settlement; updates are not
+    /// permitted once the escrow has reached settled (2), withdrawn (3), or cancelled (4) status.
+    CollateralUpdateAfterSettlement = 63,
 
     /// [`LiquifactEscrow::set_investors_allowlisted`] received an empty batch.
     InvestorBatchEmpty = 70,
@@ -530,7 +536,10 @@ pub struct InvoiceEscrow {
 /// # Fields
 /// - `asset`: The off-chain asset symbol (cannot be empty).
 /// - `amount`: The reported collateral amount (must be positive).
-/// - `recorded_at`: The Soroban ledger timestamp when this record was written.
+/// - `recorded_at`: The Soroban ledger timestamp when this record was **first** written. Immutable
+///   after the initial call; subsequent updates preserve this value.
+/// - `updated_at`: The Soroban ledger timestamp of the most recent write (including the initial
+///   write). Equals `recorded_at` when no update has occurred.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 /// SME collateral commitment metadata (record-only).
@@ -542,7 +551,10 @@ pub struct InvoiceEscrow {
 pub struct SmeCollateralCommitment {
     pub asset: Symbol,
     pub amount: i128,
+    /// Ledger timestamp of the **first** record call. Never mutated after initial write.
     pub recorded_at: u64,
+    /// Ledger timestamp of the most recent write (initial or update). Always >= `recorded_at`.
+    pub updated_at: u64,
 }
 
 /// One step in an optional tier ladder: investors who commit to at least `min_lock_secs` (on first
@@ -1533,10 +1545,26 @@ impl LiquifactEscrow {
     /// **Authorization:** [`InvoiceEscrow::admin`]. **Frontrunning:** whichever binding transaction lands
     /// first wins; observers must read on-chain state (or parse events) after finality—there is no replay lock.
     ///
+    /// # Validation
+    /// The `digest` must be exactly 32 bytes. Shorter or longer inputs are rejected with a typed error
+    /// rather than an opaque panic, giving callers a recoverable signal.
+    ///
     /// # Errors
-    /// Emits typed [`EscrowError`] codes when the escrow is uninitialized or the primary digest has
-    /// already been bound.
-    pub fn bind_primary_attestation_hash(env: Env, digest: BytesN<32>) {
+    /// - [`EscrowError::InvalidAttestationHashLength`] if `digest.len() != 32`.
+    /// - [`EscrowError::PrimaryAttestationAlreadyBound`] if a primary hash already exists.
+    /// - [`EscrowError::EscrowNotInitialized`] if called before `init`.
+    pub fn bind_primary_attestation_hash(env: Env, digest: Bytes) {
+        // Length validation: must be exactly 32 bytes (e.g. SHA-256).
+        // Emits a typed error so callers receive error code 52 instead of an opaque panic.
+        ensure(
+            &env,
+            digest.len() == 32,
+            EscrowError::InvalidAttestationHashLength,
+        );
+        let digest: BytesN<32> = digest
+            .try_into()
+            .unwrap_or_else(|_| fail(&env, EscrowError::InvalidAttestationHashLength));
+
         let escrow = Self::load_escrow_require_admin(&env);
         ensure(
             &env,
@@ -1752,6 +1780,9 @@ impl LiquifactEscrow {
     /// - [`EscrowError::CollateralAmountNotPositive`] if `amount <= 0`.
     /// - [`EscrowError::CollateralAssetEmpty`] if `asset` is empty.
     /// - [`EscrowError::CollateralTimestampBackwards`] if the replacement timestamp is in the past.
+    /// - [`EscrowError::CollateralUpdateAfterSettlement`] if the escrow has already settled,
+    ///   been withdrawn, or been cancelled (status >= 2). Initial records on open or funded
+    ///   escrows are always permitted.
     /// - Standard uninitialized check via `load_escrow_require_sme`.
     pub fn record_sme_collateral_commitment(
         env: Env,
@@ -1768,23 +1799,37 @@ impl LiquifactEscrow {
         // env.clone(): env is used again after this call for storage read/write, timestamp, and publish.
         let escrow = Self::load_escrow_require_sme(&env);
 
+        // Block updates once the escrow has reached a terminal or post-settlement state.
+        // Initial records (no prior commitment) are allowed regardless of status; this guard
+        // only applies when a prior commitment exists and the SME is attempting to overwrite it.
         let now = env.ledger().timestamp();
         let prior: Option<SmeCollateralCommitment> =
             env.storage().instance().get(&DataKey::SmeCollateralPledge);
         let prior_amount = prior.as_ref().map(|c| c.amount).unwrap_or(0);
 
         if let Some(ref existing) = prior {
+            // Updates are not permitted after settlement (status >= 2: settled, withdrawn, cancelled).
             ensure(
                 &env,
-                now >= existing.recorded_at,
+                escrow.status < 2,
+                EscrowError::CollateralUpdateAfterSettlement,
+            );
+            ensure(
+                &env,
+                now >= existing.updated_at,
                 EscrowError::CollateralTimestampBackwards,
             );
         }
 
+        // On first write: recorded_at = updated_at = now (both timestamps are the same).
+        // On update: recorded_at is preserved from the original write; updated_at advances.
+        let recorded_at = prior.as_ref().map(|c| c.recorded_at).unwrap_or(now);
+
         let commitment = SmeCollateralCommitment {
             asset,
             amount,
-            recorded_at: now,
+            recorded_at,
+            updated_at: now,
         };
         env.storage()
             .instance()
@@ -2729,15 +2774,28 @@ impl LiquifactEscrow {
                 .unwrap_or(escrow.yield_bps);
 
         // coupon = total_principal × effective_yield_bps / 10_000  (floor)
-        let coupon = total_principal
-            .checked_mul(effective_yield_bps as i128)
-            .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
-            .checked_div(10_000)
-            .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+        // Guard: if yield is zero the coupon is 0 and the settle pool equals total_principal;
+        // skip the multiply/divide to avoid any potential platform-specific edge case and to
+        // make the zero-yield path explicit and auditable.
+        let coupon = if effective_yield_bps == 0 {
+            0i128
+        } else {
+            total_principal
+                .checked_mul(effective_yield_bps as i128)
+                .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
+                .checked_div(10_000)
+                .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
+        };
 
         let settle_pool = total_principal
             .checked_add(coupon)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+
+        // Guard: if settle_pool is zero (impossible in practice given total_principal > 0, but
+        // defensively checked so checked_div never receives a zero divisor from this path).
+        if settle_pool <= 0 {
+            return 0;
+        }
 
         // gross_payout = contribution × settle_pool / total_principal  (floor)
         contribution
