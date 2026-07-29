@@ -146,11 +146,14 @@ include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 /// | 7 | Added `DisputePaused` state for temporary dispute resolution freezes (separate from legal hold) | Additive keys — no `migrate` call required |
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
 pub const MAX_ATTESTATION_APPEND_ENTRIES: u32 = 32;
+
+/// Upper bound on reinvestment audit log entries to keep storage bounded.
+pub const MAX_REINVESTMENT_AUDIT_ENTRIES: u32 = 100;
 
 /// Upper bound on batch allowlist mutation entries to keep storage/CPU bounded.
 /// Mirrors the spirit of `MAX_ATTESTATION_APPEND_ENTRIES` to limit per-call work.
@@ -546,7 +549,24 @@ pub enum DataKey {
     /// Blocks `fund`, `settle`, and `withdraw`. Stores [`DisputePauseState`].
     /// Absent ⇒ no dispute pause active.
     DisputePaused,
-}
+    /// Amount that has been settled in a partial settlement. When this equals `funded_amount`, 
+    /// the escrow is fully settled. Absent ⇒ 0 (no partial settlement).
+    SettledAmount,
+    /// Whether an investor has elected to reinvest their yield (when settling).
+    /// **Persistent** storage. Absent ⇒ `false` (no reinvestment). One entry per investor address.
+    InvestorReinvestElection(Address),
+    /// Target escrow contract address for reinvestment (investor may reinvest in different escrow).
+    /// **Persistent** storage. Absent ⇒ reinvest in same escrow. One entry per investor address.
+    /// Used with [`DataKey::InvestorReinvestElection`].
+    InvestorReinvestTarget(Address),
+    /// Cumulative yield reinvested for this investor (becomes additional principal).
+    /// **Persistent** storage. Absent ⇒ `0`. One entry per investor address.
+    /// Tracking separate from [`DataKey::InvestorContribution`] to distinguish original vs reinvested.
+    InvestorReinvestedAmount(Address),
+    /// Append-only audit log of reinvestment events for all investors.
+    /// Bounded by [`MAX_REINVESTMENT_AUDIT_ENTRIES`].
+    /// Absent ⇒ empty log.
+    ReinvestmentAuditLog,
 
 // --- Data types ---
 
@@ -851,6 +871,20 @@ pub struct EscrowSettled {
 }
 
 #[contractevent]
+pub struct EscrowPartiallySettled {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub funded_amount: i128,
+    pub settled_amount: i128,
+    pub yield_bps: i64,
+    pub maturity: u64,
+    /// Ledger timestamp at which the partial settlement occurred.
+    pub settled_at_ledger_timestamp: u64,
+}
+
+#[contractevent]
 pub struct MaturityUpdatedEvent {
     #[topic]
     pub name: Symbol,
@@ -1121,6 +1155,52 @@ pub struct ProtocolFeeCollected {
     pub fee_amount: i128,
     /// Net yield after fee deduction.
     pub net_coupon: i128,
+}
+
+/// Audit log entry for reinvestment elections and events.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ReinvestmentAuditEntry {
+    /// Investor address that made the reinvestment election
+    pub investor: Address,
+    /// Current escrow's invoice ID
+    pub invoice_id: Symbol,
+    /// Target escrow contract for reinvestment (None = same escrow)
+    pub target_escrow: Option<Address>,
+    /// Yield amount being reinvested into principal
+    pub reinvested_amount: i128,
+    /// Ledger timestamp when reinvestment was elected
+    pub elected_at_ledger_timestamp: u64,
+    /// Ledger sequence when reinvestment was elected
+    pub elected_at_ledger_sequence: u32,
+}
+
+/// Emitted when an investor elects to reinvest their yield.
+#[contractevent]
+pub struct YieldReinvestmentElected {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub investor: Address,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Target escrow address (if reinvesting to different escrow)
+    pub target_escrow: Option<Address>,
+}
+
+/// Emitted when yield is automatically reinvested as principal.
+#[contractevent]
+pub struct YieldReinvested {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub investor: Address,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Amount of yield being converted to principal
+    pub reinvested_amount: i128,
+    /// New total principal (original + reinvested)
+    pub new_total_principal: i128,
 }
 
 /// Emitted when funding is paused, either automatically due to a velocity breach
@@ -4397,7 +4477,7 @@ impl LiquifactEscrow {
         .publish(&env);
     }
 
-    pub fn settle(env: Env) -> InvoiceEscrow {
+    pub fn settle(env: Env, partial_amount: Option<i128>) -> InvoiceEscrow {
         ensure(
             &env,
             !Self::legal_hold_active(&env),
@@ -4418,6 +4498,8 @@ impl LiquifactEscrow {
         ensure(&env, escrow.status == 1, EscrowError::SettlementNotFunded);
 
         let now = env.ledger().timestamp();
+        // Maturity check applies to all settlements (full or partial)
+        // Settlement cannot occur before the configured maturity timestamp
         if escrow.maturity > 0 {
             if now < escrow.maturity {
                 let seconds_remaining = escrow.maturity.saturating_sub(now);
@@ -4433,21 +4515,58 @@ impl LiquifactEscrow {
             }
         }
 
-        escrow.status = 2;
+        // Handle partial settlement
+        let current_settled_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SettledAmount)
+            .unwrap_or(0);
+        
+        let new_settled_amount = match partial_amount {
+            Some(amount) => {
+                // Validate partial amount
+                ensure(&env, amount > 0, EscrowError::SettlementNotPositive);
+                ensure(&env, amount <= escrow.funded_amount, EscrowError::SettlementExceedsFunded);
+                ensure(&env, amount + current_settled_amount <= escrow.funded_amount, EscrowError::SettlementExceedsFunded);
+                
+                current_settled_amount + amount
+            }
+            None => escrow.funded_amount, // Full settlement
+        };
+
+        // Update settled amount in storage
+        env.storage()
+            .instance()
+            .set(&DataKey::SettledAmount, &new_settled_amount);
+
+        // Determine if this is a full or partial settlement
+        let is_full_settlement = new_settled_amount == escrow.funded_amount;
+        
+        if is_full_settlement {
+            escrow.status = 2;
+        }
+        // For partial settlement, status remains 1 (funded)
 
         // ── Protocol fee collection ──
         // Compute gross coupon, deduct protocol fee, transfer fee to treasury.
         // Fee is computed as: gross_coupon * fee_pct / 10_000 (floor division).
+        // For partial settlement, calculate fees only on the settled portion.
         let fee_percentage: i64 = env
             .storage()
             .instance()
             .get(&DataKey::FeePercentage)
             .unwrap_or(0);
         if fee_percentage > 0 {
-            let total_principal = escrow.funded_amount;
-            if total_principal > 0 {
-                // Gross coupon = total_principal * yield_bps / 10_000
-                let gross_coupon = total_principal
+            let settlement_basis = if is_full_settlement {
+                escrow.funded_amount
+            } else {
+                // For partial settlement, use only the amount being settled now
+                new_settled_amount - current_settled_amount
+            };
+            
+            if settlement_basis > 0 {
+                // Gross coupon = settlement_basis * yield_bps / 10_000
+                let gross_coupon = settlement_basis
                     .checked_mul(escrow.yield_bps as i128)
                     .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
                     .checked_div(10_000)
@@ -4496,15 +4615,28 @@ impl LiquifactEscrow {
 
         let settled_at = now;
 
-        EscrowSettled {
-            name: symbol_short!("escrow_sd"),
-            invoice_id: escrow.invoice_id.clone(),
-            funded_amount: escrow.funded_amount,
-            yield_bps: escrow.yield_bps,
-            maturity: escrow.maturity,
-            settled_at_ledger_timestamp: settled_at,
+        if is_full_settlement {
+            EscrowSettled {
+                name: symbol_short!("escrow_sd"),
+                invoice_id: escrow.invoice_id.clone(),
+                funded_amount: escrow.funded_amount,
+                yield_bps: escrow.yield_bps,
+                maturity: escrow.maturity,
+                settled_at_ledger_timestamp: settled_at,
+            }
+            .publish(&env);
+        } else {
+            EscrowPartiallySettled {
+                name: symbol_short!("escrow_psd"),
+                invoice_id: escrow.invoice_id.clone(),
+                funded_amount: escrow.funded_amount,
+                settled_amount: new_settled_amount,
+                yield_bps: escrow.yield_bps,
+                maturity: escrow.maturity,
+                settled_at_ledger_timestamp: settled_at,
+            }
+            .publish(&env);
         }
-        .publish(&env);
 
         // Emit health warning if applicable (for audit trail).
         Self::compute_and_emit_health_warning(&env, &escrow, now);
@@ -4784,9 +4916,19 @@ impl LiquifactEscrow {
 
         // env.clone(): env is used again after this call for storage reads, ledger timestamp, and publish.
         let escrow = Self::get_escrow(env.clone());
+        
+        // For partial settlement: allow claims if there's a settled amount (status 1 with SettledAmount)
+        // For full settlement: require status 2
+        let settled_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SettledAmount)
+            .unwrap_or(0);
+        
+        let is_claimable = escrow.status == 2 || (escrow.status == 1 && settled_amount > 0);
         ensure(
             &env,
-            escrow.status == 2,
+            is_claimable,
             EscrowError::InvestorClaimNotSettled,
         );
 
@@ -4837,6 +4979,83 @@ impl LiquifactEscrow {
 
         // Mark before emit — prevents re-emission on any re-entrant path.
         Self::set_persistent_investor_claimed(&env, investor.clone(), true);
+
+        // Check if investor elected to reinvest their yield
+        let has_reinvestment_election: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InvestorReinvestElection(investor.clone()))
+            .unwrap_or(false);
+
+        if has_reinvestment_election {
+            // Calculate the yield portion of the payout
+            let total_payout = Self::compute_investor_payout(env.clone(), investor.clone());
+            let original_contribution: i128 = Self::get_persistent_investor_contribution(&env, investor.clone());
+            let yield_amount = total_payout.saturating_sub(original_contribution);
+            
+            if yield_amount > 0 {
+                // Add yield to reinvested amount (becomes new principal)
+                let current_reinvested: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::InvestorReinvestedAmount(investor.clone()))
+                    .unwrap_or(0);
+                
+                let new_reinvested = current_reinvested
+                    .checked_add(yield_amount)
+                    .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+                
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::InvestorReinvestedAmount(investor.clone()), &new_reinvested);
+                
+                // Update audit log with reinvestment event
+                let mut audit_log: Vec<ReinvestmentAuditEntry> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::ReinvestmentAuditLog)
+                    .unwrap_or(Vec::new(&env));
+                
+                // Find and update the most recent entry for this investor, or add new one
+                let mut found = false;
+                for i in (0..audit_log.len()).rev() {
+                    let entry = audit_log.get(i).unwrap();
+                    if entry.investor == investor {
+                        let mut updated_entry = entry.clone();
+                        updated_entry.reinvested_amount = yield_amount;
+                        audit_log.set(i, updated_entry);
+                        found = true;
+                        break;
+                    }
+                }
+                
+                if !found && (audit_log.len() as u32) < MAX_REINVESTMENT_AUDIT_ENTRIES {
+                    let entry = ReinvestmentAuditEntry {
+                        investor: investor.clone(),
+                        invoice_id: escrow.invoice_id.clone(),
+                        target_escrow: None,
+                        reinvested_amount: yield_amount,
+                        elected_at_ledger_timestamp: now,
+                        elected_at_ledger_sequence: env.ledger().sequence(),
+                    };
+                    audit_log.push_back(entry);
+                }
+                
+                env.storage()
+                    .instance()
+                    .set(&DataKey::ReinvestmentAuditLog, &audit_log);
+                
+                // Emit reinvestment event
+                YieldReinvested {
+                    name: symbol_short!("yield_reinv_evt"),
+                    investor: investor.clone(),
+                    invoice_id: escrow.invoice_id.clone(),
+                    reinvested_amount: yield_amount,
+                    new_total_principal: new_reinvested + original_contribution,
+                }
+                .publish(&env);
+            }
+        }
 
         // Real-time slippage detection: compare expected vs actual yield
         Self::detect_yield_slippage(&env, investor.clone(), &escrow);
@@ -5035,9 +5254,19 @@ impl LiquifactEscrow {
 
         // env.clone(): used for escrow read and ledger timestamp.
         let escrow = Self::get_escrow(env.clone());
+        
+        // For partial settlement: allow claims if there's a settled amount (status 1 with SettledAmount)
+        // For full settlement: require status 2
+        let settled_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SettledAmount)
+            .unwrap_or(0);
+        
+        let is_claimable = escrow.status == 2 || (escrow.status == 1 && settled_amount > 0);
         ensure(
             &env,
-            escrow.status == 2,
+            is_claimable,
             EscrowError::InvestorClaimNotSettled,
         );
 
@@ -5134,6 +5363,98 @@ impl LiquifactEscrow {
         .publish(&env);
     }
 
+    /// Investor elects to automatically reinvest their yield as principal when claimed.
+    ///
+    /// # Authorization
+    /// - Requires the signature of the investor (via `investor.require_auth()`).
+    ///
+    /// # Parameters
+    /// - `investor`: The investor address making the election.
+    /// - `target_escrow`: Optional target escrow contract for reinvestment. If `None`, reinvests in the same escrow.
+    ///
+    /// # Behavior
+    /// - Sets [`DataKey::InvestorReinvestElection`] to `true` for the investor.
+    /// - Sets [`DataKey::InvestorReinvestTarget`] if reinvesting to a different escrow.
+    /// - Records the election in [`DataKey::ReinvestmentAuditLog`].
+    /// - When the investor claims their payout, their yield is automatically added to their contribution
+    ///   instead of being transferred. This reinvested amount becomes new principal earning yield.
+    ///
+    /// # Errors
+    /// - [`EscrowError::ReinvestElectionAlreadyActive`] if investor already has an active reinvestment election.
+    /// - [`EscrowError::ReinvestmentAuditLogFull`] if audit log capacity is reached.
+    ///
+    /// # Events
+    /// - Emits [`YieldReinvestmentElected`] event.
+    pub fn reinvest_yield(env: Env, investor: Address, target_escrow: Option<Address>) {
+        investor.require_auth();
+
+        // Check if investor already has a reinvestment election
+        let has_election: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InvestorReinvestElection(investor.clone()))
+            .unwrap_or(false);
+        
+        ensure(
+            &env,
+            !has_election,
+            EscrowError::ReinvestElectionAlreadyActive,
+        );
+
+        // Set reinvestment election
+        env.storage()
+            .persistent()
+            .set(&DataKey::InvestorReinvestElection(investor.clone()), &true);
+
+        // Set target escrow if specified (None means reinvest in same escrow)
+        if let Some(target) = target_escrow {
+            env.storage()
+                .persistent()
+                .set(&DataKey::InvestorReinvestTarget(investor.clone()), &target);
+        }
+
+        // Get current escrow info for audit log
+        let escrow = Self::get_escrow(env.clone());
+        let now = env.ledger().timestamp();
+        let sequence = env.ledger().sequence();
+
+        // Add to audit log (bounded by MAX_REINVESTMENT_AUDIT_ENTRIES)
+        let mut audit_log: Vec<ReinvestmentAuditEntry> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReinvestmentAuditLog)
+            .unwrap_or(Vec::new(&env));
+        
+        ensure(
+            &env,
+            (audit_log.len() as u32) < MAX_REINVESTMENT_AUDIT_ENTRIES,
+            EscrowError::ReinvestmentAuditLogFull,
+        );
+
+        let entry = ReinvestmentAuditEntry {
+            investor: investor.clone(),
+            invoice_id: escrow.invoice_id.clone(),
+            target_escrow: target_escrow.clone(),
+            reinvested_amount: 0i128,  // Will be set when claim happens
+            elected_at_ledger_timestamp: now,
+            elected_at_ledger_sequence: sequence,
+        };
+        
+        audit_log.push_back(entry);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReinvestmentAuditLog, &audit_log);
+
+        // Emit event
+        YieldReinvestmentElected {
+            name: symbol_short!("yield_reinv"),
+            investor,
+            invoice_id: escrow.invoice_id,
+            target_escrow,
+        }
+        .publish(&env);
+    }
+
     /// On-chain read-only pro-rata gross payout for `investor`.
     ///
     /// Derives the **gross payout** (principal share plus `InvestorEffectiveYield`-adjusted
@@ -5176,6 +5497,18 @@ impl LiquifactEscrow {
             return 0;
         }
 
+        // Get reinvested amount (if any)
+        let reinvested_amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InvestorReinvestedAmount(investor.clone()))
+            .unwrap_or(0);
+        
+        // Total principal includes both original contribution and any reinvested yield
+        let total_investor_principal = contribution
+            .checked_add(reinvested_amount)
+            .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+
         // Snapshot must exist (written when escrow first reaches status == 1).
         let Some(snap) = env
             .storage()
@@ -5190,6 +5523,18 @@ impl LiquifactEscrow {
             return 0;
         }
 
+        // Get settled amount (if any partial settlement has occurred)
+        let settled_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SettledAmount)
+            .unwrap_or(0);
+        
+        // If no settlement has occurred yet, return 0
+        if settled_amount == 0 {
+            return 0;
+        }
+
         // Resolve effective yield: investor-specific tier (set at first deposit) or escrow base.
         // env.clone(): env is used again after this call for InvestorEffectiveYield read.
         let escrow = Self::get_escrow(env.clone());
@@ -5197,8 +5542,9 @@ impl LiquifactEscrow {
             Self::get_persistent_investor_effective_yield(&env, investor.clone())
                 .unwrap_or(escrow.yield_bps);
 
-        // coupon = total_principal × effective_yield_bps / 10_000  (floor)
-        let gross_coupon = total_principal
+        // Calculate coupon based on settled amount (not total principal)
+        // coupon = settled_amount × effective_yield_bps / 10_000  (floor)
+        let gross_coupon = settled_amount
             .checked_mul(effective_yield_bps as i128)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
             .checked_div(10_000)
@@ -5221,15 +5567,28 @@ impl LiquifactEscrow {
             gross_coupon
         };
 
-        let settle_pool = total_principal
+        let settle_pool = settled_amount
             .checked_add(net_coupon)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
 
-        // gross_payout = contribution × settle_pool / total_principal  (floor)
-        contribution
-            .checked_mul(settle_pool)
+        // Calculate investor's share of the settled amount using total principal (original + reinvested)
+        // settled_share = total_investor_principal × settled_amount / total_principal  (floor)
+        let settled_share = total_investor_principal
+            .checked_mul(settled_amount)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
             .checked_div(total_principal)
+            .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+
+        // Calculate payout for the settled share
+        // payout = settled_share × settle_pool / settled_amount  (floor)
+        if settled_share == 0 || settled_amount == 0 {
+            return 0;
+        }
+        
+        settled_share
+            .checked_mul(settle_pool)
+            .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
+            .checked_div(settled_amount)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
     }
 
