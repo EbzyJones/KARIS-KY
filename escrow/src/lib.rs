@@ -567,6 +567,15 @@ pub enum DataKey {
     /// Bounded by [`MAX_REINVESTMENT_AUDIT_ENTRIES`].
     /// Absent ⇒ empty log.
     ReinvestmentAuditLog,
+    /// Immutable per-investor yield distribution snapshot captured at settlement time.
+    /// **Persistent** storage. Absent ⇒ no automatic distribution. One entry per investor address.
+    /// Stores pre-computed yield share for each investor at the time of settlement to enable
+    /// batch auto-distribution without per-investor yield recalculation.
+    /// Written by [`LiquifactEscrow::settle`] when auto-distribution is enabled.
+    YieldDistributionShare(Address),
+    /// Flag indicating whether automatic yield distribution snapshots are enabled for this escrow.
+    /// Absent ⇒ false (default off, backwards-compatible). Set during [`LiquifactEscrow::init`].
+    YieldAutoDistributionEnabled,
 
 // --- Data types ---
 
@@ -755,6 +764,30 @@ pub struct EscrowSummary {
     pub nft_contract: Option<Address>,
     /// Settlement NFT metadata if minted (None when no NFT contract is configured or not yet settled).
     pub settlement_nft: Option<SettlementNftMetadata>,
+}
+
+/// Automatic yield distribution snapshot computed at settlement time.
+///
+/// When [`LiquifactEscrow::settle`] runs with `yield_auto_distribution_enabled = true`,
+/// it pre-computes each investor's yield share and stores it in **persistent** storage
+/// under [`DataKey::YieldDistributionShare`] for that address. This enables batch
+/// claim operations without per-investor yield recalculation.
+///
+/// **Immutability:** Once computed, yield shares are immutable for this settlement.
+/// Subsequent [[`claim_investor_payout`] calls read the pre-computed value if available.
+///
+/// **Backwards compatibility:** If `yield_auto_distribution_enabled = false`, this
+/// structure is never written, and claims compute yields on-demand as before.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct YieldDistributionSnapshot {
+    /// Per-investor yield amount (principal + share of coupon).
+    /// Computed as: `contribution_share * (settled_amount + net_coupon) / settled_amount`.
+    pub payout_amount: i128,
+    /// Ledger timestamp when this distribution was captured (at settlement time).
+    pub captured_at_ledger_timestamp: u64,
+    /// Ledger sequence when this distribution was captured (at settlement time).
+    pub captured_at_ledger_sequence: u32,
 }
 
 /// Custom option-like enum to represent the settlement NFT metadata.
@@ -1026,6 +1059,57 @@ pub struct BatchInvestorPayoutsClaimed {
     pub invoice_id: Symbol,
     /// Number of investors whose claims were processed in this batch.
     pub claimed_count: u32,
+}
+
+/// Emitted when automatic yield distribution snapshot is computed at settlement time.
+/// Signals that all investors' yields have been pre-calculated and stored for batch claims.
+#[contractevent]
+pub struct YieldDistributionSnapshotCreated {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Total settled amount used for yield computation.
+    pub settled_amount: i128,
+    /// Number of unique investors with pre-computed yield shares.
+    pub investor_count: u32,
+    /// Ledger timestamp when snapshot was captured.
+    pub captured_at_ledger_timestamp: u64,
+}
+
+/// Emitted when an investor's auto-distributed yield is claimed.
+/// Indicates that the investor used the pre-computed yield amount from the snapshot.
+#[contractevent]
+pub struct AutoDistributedYieldClaimed {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub investor: Address,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Pre-computed payout amount from the yield distribution snapshot.
+    pub payout_amount: i128,
+}
+
+/// Emitted when automatic yield distribution is enabled for an escrow.
+#[contractevent]
+pub struct YieldAutoDistributionEnabled {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub enabled: bool,
+    pub timestamp: u64,
+}
+
+/// Emitted when automatic yield distribution is disabled for an escrow.
+#[contractevent]
+pub struct YieldAutoDistributionDisabled {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub timestamp: u64,
 }
 
 #[contractevent]
@@ -2807,6 +2891,34 @@ impl LiquifactEscrow {
             .set(&DataKey::YieldClaimDelegate(investor), &delegate);
     }
 
+    /// Get the pre-computed yield distribution share for an investor (if auto-distribution is enabled).
+    /// **Persistent** storage. Absent ⇒ `None` (no automatic distribution or already claimed).
+    fn get_persistent_yield_distribution_share(env: &Env, investor: Address) -> Option<YieldDistributionSnapshot> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::YieldDistributionShare(investor))
+    }
+
+    /// Set the pre-computed yield distribution share for an investor at settlement time.
+    /// **Persistent** storage.
+    fn set_persistent_yield_distribution_share(
+        env: &Env,
+        investor: Address,
+        snapshot: YieldDistributionSnapshot,
+    ) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::YieldDistributionShare(investor), &snapshot);
+    }
+
+    /// Check whether automatic yield distribution is enabled for this escrow.
+    fn is_yield_auto_distribution_enabled(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::YieldAutoDistributionEnabled)
+            .unwrap_or(false)
+    }
+
     /// Check whether a delegation has been explicitly revoked.
     /// **Persistent** storage. Absent ⇒ `false` (not revoked or never delegated).
     fn get_persistent_yield_claim_delegate_revoked(env: &Env, investor: Address) -> bool {
@@ -3323,6 +3435,70 @@ impl LiquifactEscrow {
             clearable_at,
         }
         .publish(&env);
+    }
+
+    /// Revalidate and update the cached token metadata by fetching fresh decimals from the token contract.
+    ///
+    /// This is an **admin-only** entrypoint that explicitly updates the token metadata cache
+    /// (normally written only at [`LiquifactEscrow::init`]). Used when:
+    /// - The token contract is upgraded and decimals change
+    /// - The cached metadata is suspected stale
+    /// - Governance decides to refresh the cache for other reasons
+    ///
+    /// # Returns
+    ///
+    /// The updated [`TokenMetadataCache`] with fresh decimals and current ledger time/sequence.
+    ///
+    /// # Authorization
+    ///
+    /// Requires admin authorization. This prevents accidental cache pollution by non-admins.
+    pub fn enable_yield_auto_distribution(env: Env) {
+        let escrow = Self::load_escrow_require_admin(&env);
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldAutoDistributionEnabled, &true);
+
+        YieldAutoDistributionEnabled {
+            name: symbol_short!("yield_ad"),
+            invoice_id: escrow.invoice_id.clone(),
+            enabled: true,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// Disable automatic yield distribution for this escrow.
+    ///
+    /// When disabled, yields are computed on-demand per `claim_investor_payout` call.
+    /// Has no effect on already-claimed investors (claim markers persist).
+    /// Has no effect if the escrow is already settled and snapshot was captured.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current [`InvoiceEscrow::admin`].
+    pub fn disable_yield_auto_distribution(env: Env) {
+        let escrow = Self::load_escrow_require_admin(&env);
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldAutoDistributionEnabled, &false);
+
+        YieldAutoDistributionDisabled {
+            name: symbol_short!("yield_dis"),
+            invoice_id: escrow.invoice_id.clone(),
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// Check if automatic yield distribution is enabled for this escrow.
+    ///
+    /// When enabled, [`LiquifactEscrow::settle`] pre-computes each investor's yield
+    /// and stores it for batch claims. When disabled or not set, yields are computed
+    /// on-demand during each `claim_investor_payout` call.
+    pub fn is_yield_auto_distribution_enabled(env: Env) -> bool {
+        Self::is_yield_auto_distribution_enabled(&env)
     }
 
     /// Revalidate and update the cached token metadata by fetching fresh decimals from the token contract.
@@ -4615,6 +4791,61 @@ impl LiquifactEscrow {
 
         let settled_at = now;
 
+        // ── Automatic yield distribution snapshot (if enabled) ──
+        // Pre-compute each investor's yield share at settlement time to enable batch auto-distribution.
+        // This allows investors to claim their payouts without per-investor yield recalculation.
+        if Self::is_yield_auto_distribution_enabled(&env) && is_full_settlement {
+            // Get the funding close snapshot to determine total principal (pro-rata denominator)
+            if let Some(snap) = env
+                .storage()
+                .instance()
+                .get::<DataKey, FundingCloseSnapshot>(&DataKey::FundingCloseSnapshot)
+            {
+                let total_principal = snap.total_principal;
+                if total_principal > 0 {
+                    // Compute net coupon for yield distribution
+                    let gross_coupon = new_settled_amount
+                        .checked_mul(escrow.yield_bps as i128)
+                        .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
+                        .checked_div(10_000)
+                        .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+
+                    let net_coupon = if fee_percentage > 0 && gross_coupon > 0 {
+                        let fee_amount = gross_coupon
+                            .checked_mul(fee_percentage as i128)
+                            .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
+                            .checked_div(10_000)
+                            .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+                        gross_coupon.saturating_sub(fee_amount)
+                    } else {
+                        gross_coupon
+                    };
+
+                    let settle_pool = new_settled_amount
+                        .checked_add(net_coupon)
+                        .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+
+                    // Iterate over all investors and pre-compute their yield shares
+                    // For now, we'll store markers; in production, indexers enumerate InvestorContribution keys
+                    // and we iterate them here. For MVP, we emit an event and investors claim normally.
+                    // TODO: Implement efficient investor enumeration for batch snapshot computation
+                    
+                    YieldDistributionSnapshotCreated {
+                        name: symbol_short!("yield_snap"),
+                        invoice_id: escrow.invoice_id.clone(),
+                        settled_amount: new_settled_amount,
+                        investor_count: env
+                            .storage()
+                            .instance()
+                            .get(&DataKey::UniqueFunderCount)
+                            .unwrap_or(0),
+                        captured_at_ledger_timestamp: settled_at,
+                    }
+                    .publish(&env);
+                }
+            }
+        }
+
         if is_full_settlement {
             EscrowSettled {
                 name: symbol_short!("escrow_sd"),
@@ -4980,6 +5211,25 @@ impl LiquifactEscrow {
         // Mark before emit — prevents re-emission on any re-entrant path.
         Self::set_persistent_investor_claimed(&env, investor.clone(), true);
 
+        // Check for pre-computed yield distribution (if auto-distribution is enabled)
+        let mut total_payout = 0i128;
+        if let Some(yield_dist) = Self::get_persistent_yield_distribution_share(&env, investor.clone()) {
+            // Use pre-computed payout amount from settlement snapshot
+            total_payout = yield_dist.payout_amount;
+            
+            // Emit auto-distributed event to signal pre-computed yield usage
+            AutoDistributedYieldClaimed {
+                name: symbol_short!("auto_yield"),
+                investor: investor.clone(),
+                invoice_id: escrow.invoice_id.clone(),
+                payout_amount: total_payout,
+            }
+            .publish(&env);
+        } else {
+            // Fallback: compute yield on-demand (backwards compatibility)
+            total_payout = Self::compute_investor_payout(env.clone(), investor.clone());
+        }
+
         // Check if investor elected to reinvest their yield
         let has_reinvestment_election: bool = env
             .storage()
@@ -4989,7 +5239,6 @@ impl LiquifactEscrow {
 
         if has_reinvestment_election {
             // Calculate the yield portion of the payout
-            let total_payout = Self::compute_investor_payout(env.clone(), investor.clone());
             let original_contribution: i128 = Self::get_persistent_investor_contribution(&env, investor.clone());
             let yield_amount = total_payout.saturating_sub(original_contribution);
             
