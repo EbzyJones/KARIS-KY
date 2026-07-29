@@ -1781,3 +1781,68 @@ fn test_dispute_pause_auto_expiration() {
     assert!(client.is_dispute_paused() == false);
     assert!(client.get_dispute_pause().is_none());
 }
+
+#[test]
+fn test_dispute_pause_blocks_claim_investor_payout() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let investor = Address::generate(&env);
+    client.fund(&investor, &TARGET); // Reach funded status
+    client.settle(); // Mark as settled so claim is eligible
+
+    let ticket = soroban_sdk::String::from_str(&env, "TICKET-009");
+    let duration = 86400u64;
+    client.pause_dispute(&ticket, &duration);
+
+    // Try to claim while pause is active
+    let result = client.try_claim_investor_payout(&investor);
+    assert_contract_error(
+        result,
+        crate::EscrowError::DisputePausedBlocksInvestorClaims,
+    );
+
+    // Verify pause can be resumed and claim works
+    client.resume_dispute();
+    assert!(client.is_dispute_paused() == false);
+    
+    // Claim should now succeed
+    client.claim_investor_payout(&investor);
+}
+
+#[test]
+fn test_dispute_pause_auto_resume_allows_operations() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let investor = Address::generate(&env);
+    let ticket = soroban_sdk::String::from_str(&env, "TICKET-010");
+    let duration = 100u64; // Short duration
+    let initial_timestamp = env.ledger().timestamp();
+
+    // Pause the escrow
+    client.pause_dispute(&ticket, &duration);
+    assert!(client.is_dispute_paused() == true);
+
+    // Try to fund while paused
+    let result = client.try_fund(&investor, &500i128);
+    assert_contract_error(
+        result,
+        crate::EscrowError::DisputePausedBlocksFunding,
+    );
+
+    // Advance ledger time to auto-expire the pause
+    let mut ledger_info = env.ledger().get();
+    ledger_info.timestamp = initial_timestamp + duration + 1; // Past expiration
+    env.ledger().set(ledger_info);
+
+    // Verify pause is now inactive
+    assert!(client.is_dispute_paused() == false);
+    
+    // Funding should now succeed
+    client.fund(&investor, &500i128);
+}

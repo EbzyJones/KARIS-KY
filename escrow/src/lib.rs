@@ -409,24 +409,16 @@ pub enum EscrowError {
     DisputePausedBlocksSettlement = 166,
     /// [`LiquifactEscrow::withdraw`] blocked while a dispute pause is active.
     DisputePausedBlocksWithdrawal = 167,
+    /// [`LiquifactEscrow::claim_investor_payout`] blocked while a dispute pause is active.
+    DisputePausedBlocksInvestorClaims = 168,
     /// [`LiquifactEscrow::pause_dispute`] received a non-positive pause duration in seconds.
-    DisputePauseDurationNotPositive = 168,
+    DisputePauseDurationNotPositive = 169,
     /// [`LiquifactEscrow::pause_dispute`] received an empty dispute ticket reference.
-    DisputeTicketIdEmpty = 169,
+    DisputeTicketIdEmpty = 170,
     /// [`LiquifactEscrow::resume_dispute`] called when no dispute pause is active.
-    NoPauseActive = 170,
+    NoPauseActive = 171,
     /// Computed ledger timestamp would overflow (e.g., `now + duration > u64::MAX`).
-    LedgerTimestampOverflow = 171,
-    /// [`LiquifactEscrow::settle`] received a non-positive partial amount.
-    SettlementNotPositive = 172,
-    /// [`LiquifactEscrow::settle`] partial amount exceeds funded amount.
-    SettlementExceedsFunded = 173,
-    /// [`LiquifactEscrow::reinvest_yield`] received a non-positive target escrow address.
-    ReinvestTargetInvalid = 174,
-    /// [`LiquifactEscrow::reinvest_yield`] tried to reinvest in same escrow after already electing reinvestment.
-    ReinvestElectionAlreadyActive = 175,
-    /// Reinvestment audit log capacity reached.
-    ReinvestmentAuditLogFull = 176,
+    LedgerTimestampOverflow = 172,
 }
 
 #[inline(always)]
@@ -4911,8 +4903,8 @@ impl LiquifactEscrow {
         );
         ensure(
             &env,
-            !Self::escrow_paused_active(&env),
-            EscrowError::EscrowIsPaused,
+            !Self::is_dispute_paused(&env),
+            EscrowError::DisputePausedBlocksInvestorClaims,
         );
 
         investor.require_auth();
@@ -5122,6 +5114,11 @@ impl LiquifactEscrow {
             !Self::legal_hold_active(&env),
             EscrowError::LegalHoldBlocksInvestorClaims,
         );
+        ensure(
+            &env,
+            !Self::is_dispute_paused(&env),
+            EscrowError::DisputePausedBlocksInvestorClaims,
+        );
 
         let escrow = Self::get_escrow(env.clone());
         ensure(
@@ -5218,6 +5215,11 @@ impl LiquifactEscrow {
             &env,
             !Self::legal_hold_active(&env),
             EscrowError::LegalHoldBlocksInvestorClaims,
+        );
+        ensure(
+            &env,
+            !Self::is_dispute_paused(&env),
+            EscrowError::DisputePausedBlocksInvestorClaims,
         );
 
         // Verify investor has a contribution.
