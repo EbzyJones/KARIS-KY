@@ -3405,3 +3405,186 @@ fn test_fund_batch_preserves_event_semantics() {
     // Each event corresponds to a fund operation
     // (Detailed event field verification depends on EscrowFunded structure)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #205: max_unique_investors cap enforced at fund() time
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Cap of 2: first two investors succeed; the third receives UniqueInvestorCapReached (107).
+///
+/// Verifies that `fund_impl` enforces the cap with a typed error, not a silent
+/// allow-through or an unclassified panic.
+#[test]
+fn test_205_unique_investor_cap_typed_error_on_third_investor() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+
+    // Large target so the escrow stays open (status 0) after 2 partial investors.
+    client.init(
+        &admin,
+        &String::from_str(&env, "BUG205"),
+        &sme,
+        &300_000_000_000i128, // 300B — well above inv1 + inv2
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &Some(2u32), // cap = 2 distinct investors
+        &None,
+        &None,
+        &None,
+    );
+
+    let inv1 = Address::generate(&env);
+    let inv2 = Address::generate(&env);
+    let inv3 = Address::generate(&env);
+
+    // First two investors must succeed.
+    client.fund(&inv1, &50_000_000_000i128);
+    assert_eq!(client.get_unique_funder_count(), 1);
+
+    client.fund(&inv2, &50_000_000_000i128);
+    assert_eq!(client.get_unique_funder_count(), 2);
+
+    // Escrow must still be open (status 0) so the cap check is exercised, not
+    // EscrowNotOpenForFunding.
+    assert_eq!(client.get_escrow().status, 0);
+
+    // Third investor must be rejected with the specific typed error (code 107).
+    assert_contract_error(
+        client.try_fund(&inv3, &50_000_000_000i128),
+        EscrowError::UniqueInvestorCapReached,
+    );
+
+    // State must be unchanged — unique count is still 2, inv3 has no contribution.
+    assert_eq!(client.get_unique_funder_count(), 2);
+    assert_eq!(client.get_contribution(&inv3), 0);
+}
+
+/// Existing investor follow-on fund must not be blocked by the cap — only new addresses count.
+#[test]
+fn test_205_existing_investor_followon_bypasses_cap() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+
+    client.init(
+        &admin,
+        &String::from_str(&env, "BUG205B"),
+        &sme,
+        &300_000_000_000i128,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &Some(1u32), // cap = 1
+        &None,
+        &None,
+        &None,
+    );
+
+    let inv1 = Address::generate(&env);
+    client.fund(&inv1, &10_000_000_000i128);
+    assert_eq!(client.get_unique_funder_count(), 1);
+
+    // Second deposit from same investor — must succeed even though cap==1 is "full".
+    client.fund(&inv1, &10_000_000_000i128);
+    assert_eq!(client.get_unique_funder_count(), 1);
+    assert_eq!(client.get_contribution(&inv1), 20_000_000_000i128);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #206: Zero-yield payout guard — settle with yield_bps == 0
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// When funded_amount == funding_target and yield_bps == 0, compute_investor_payout
+/// must return exactly the investor's contribution (principal only, no coupon).
+///
+/// This is the regression test for the zero-yield guard in `compute_investor_payout`.
+/// The path: coupon = 0, settle_pool = total_principal, payout = contribution.
+#[test]
+fn test_206_zero_yield_payout_equals_contribution() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+    let target = 100_000_000i128;
+
+    client.init(
+        &admin,
+        &String::from_str(&env, "BUG206"),
+        &sme,
+        &target,
+        &0i64, // zero yield
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Fund exactly to target so funded_amount == funding_target.
+    client.fund(&investor, &target);
+    assert_eq!(client.get_escrow().status, 1); // funded
+
+    // Settle.
+    client.settle();
+    assert_eq!(client.get_escrow().status, 2); // settled
+
+    // With zero yield: coupon = 0, settle_pool = total_principal = target,
+    // payout = contribution × target / target = contribution exactly.
+    let payout = client.compute_investor_payout(&investor);
+    assert_eq!(
+        payout, target,
+        "zero-yield payout must equal investor contribution (no coupon)"
+    );
+}
+
+/// Two investors each contributing half, zero yield — each gets exactly their share back.
+#[test]
+fn test_206_zero_yield_two_investors_pro_rata() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    let inv_a = Address::generate(&env);
+    let inv_b = Address::generate(&env);
+    let target = 100_000_000i128;
+    let half = target / 2;
+
+    client.init(
+        &admin,
+        &String::from_str(&env, "BUG206B"),
+        &sme,
+        &target,
+        &0i64, // zero yield
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.fund(&inv_a, &half);
+    client.fund(&inv_b, &half);
+    assert_eq!(client.get_escrow().status, 1);
+    client.settle();
+
+    // Each investor contributed half the principal; with zero yield each gets their half back.
+    let payout_a = client.compute_investor_payout(&inv_a);
+    let payout_b = client.compute_investor_payout(&inv_b);
+    assert_eq!(payout_a, half, "inv_a payout must equal contribution with zero yield");
+    assert_eq!(payout_b, half, "inv_b payout must equal contribution with zero yield");
+}

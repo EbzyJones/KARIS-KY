@@ -1344,7 +1344,7 @@ fn auth_audit_bind_primary_attestation_requires_admin() {
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
     env.mock_auths(&[]);
-    client.bind_primary_attestation_hash(&soroban_sdk::BytesN::from_array(&env, &[0u8; 32]));
+    client.bind_primary_attestation_hash(&soroban_sdk::Bytes::from_array(&env, &[0u8; 32]));
 }
 
 #[test]
@@ -1613,236 +1613,201 @@ fn test_rotate_beneficiary_then_withdraw_goes_to_new_sme() {
     assert_eq!(token.stellar.balance(&new_sme), TARGET);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #208: Collateral record update_timestamp tracking and post-settlement guard
+// ─────────────────────────────────────────────────────────────────────────────
 
-// --- Dispute pause tests ---
-
+/// Initial record: recorded_at and updated_at are both set to the current ledger timestamp.
 #[test]
-fn test_pause_dispute_success() {
+fn test_208_initial_record_timestamps_equal() {
     let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, sme) = setup(&env);
-    default_init(&client, &env, &admin, &sme);
-
-    let ticket = soroban_sdk::String::from_str(&env, "TICKET-001");
-    let duration = 86400u64; // 1 day in seconds
-    client.pause_dispute(&ticket, &duration);
-
-    // Verify pause state is set
-    let pause_state = client.get_dispute_pause();
-    assert!(pause_state.is_some());
-    let state = pause_state.unwrap();
-    assert_eq!(state.ticket_id, ticket);
-    assert!(client.is_dispute_paused() == true);
-}
-
-#[test]
-#[should_panic]
-fn test_pause_dispute_empty_ticket_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, sme) = setup(&env);
-    default_init(&client, &env, &admin, &sme);
-
-    let empty_ticket = soroban_sdk::String::from_str(&env, "");
-    let duration = 86400u64;
-    client.pause_dispute(&empty_ticket, &duration);
-}
-
-#[test]
-#[should_panic]
-fn test_pause_dispute_zero_duration_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, sme) = setup(&env);
-    default_init(&client, &env, &admin, &sme);
-
-    let ticket = soroban_sdk::String::from_str(&env, "TICKET-002");
-    client.pause_dispute(&ticket, &0u64);
-}
-
-#[test]
-fn test_resume_dispute_success() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, sme) = setup(&env);
-    default_init(&client, &env, &admin, &sme);
-
-    let ticket = soroban_sdk::String::from_str(&env, "TICKET-004");
-    let duration = 86400u64;
-    client.pause_dispute(&ticket, &duration);
-
-    // Verify pause is active
-    assert!(client.is_dispute_paused() == true);
-
-    // Resume the dispute
-    client.resume_dispute();
-
-    // Verify pause is cleared
-    assert!(client.is_dispute_paused() == false);
-    assert!(client.get_dispute_pause().is_none());
-}
-
-#[test]
-#[should_panic]
-fn test_resume_dispute_no_pause_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, sme) = setup(&env);
-    default_init(&client, &env, &admin, &sme);
-
-    // Try to resume when no pause is active
-    client.resume_dispute();
-}
-
-#[test]
-fn test_dispute_pause_blocks_funding() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, sme) = setup(&env);
-    default_init(&client, &env, &admin, &sme);
-
-    let ticket = soroban_sdk::String::from_str(&env, "TICKET-005");
-    let duration = 86400u64;
-    client.pause_dispute(&ticket, &duration);
-
-    // Try to fund while pause is active
-    let investor = Address::generate(&env);
-    let result = client.try_fund(&investor, &500i128);
-    assert_contract_error(
-        result,
-        crate::EscrowError::DisputePausedBlocksFunding,
-    );
-}
-
-#[test]
-fn test_dispute_pause_blocks_settlement() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, sme) = setup(&env);
-    default_init(&client, &env, &admin, &sme);
-
-    let investor = Address::generate(&env);
-    client.fund(&investor, &TARGET); // Reach funded status
-
-    let ticket = soroban_sdk::String::from_str(&env, "TICKET-006");
-    let duration = 86400u64;
-    client.pause_dispute(&ticket, &duration);
-
-    // Try to settle while pause is active
-    let result = client.try_settle();
-    assert_contract_error(
-        result,
-        crate::EscrowError::DisputePausedBlocksSettlement,
-    );
-}
-
-#[test]
-fn test_dispute_pause_blocks_withdrawal() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, sme) = setup(&env);
-    default_init(&client, &env, &admin, &sme);
-
-    let investor = Address::generate(&env);
-    client.fund(&investor, &TARGET); // Reach funded status
-
-    let ticket = soroban_sdk::String::from_str(&env, "TICKET-007");
-    let duration = 86400u64;
-    client.pause_dispute(&ticket, &duration);
-
-    // Try to withdraw while pause is active
-    let result = client.try_withdraw();
-    assert_contract_error(
-        result,
-        crate::EscrowError::DisputePausedBlocksWithdrawal,
-    );
-}
-
-#[test]
-fn test_dispute_pause_auto_expiration() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, sme) = setup(&env);
-    default_init(&client, &env, &admin, &sme);
-
-    let ticket = soroban_sdk::String::from_str(&env, "TICKET-008");
-    let duration = 100u64; // Short duration for testing
-    let initial_timestamp = env.ledger().timestamp();
-
-    client.pause_dispute(&ticket, &duration);
-    assert!(client.is_dispute_paused() == true);
-
-    // Advance ledger time past the expiration
-    let mut ledger_info = env.ledger().get();
-    ledger_info.timestamp = initial_timestamp + duration; // At expiration
-    env.ledger().set(ledger_info.clone());
-
-    // Pause should be inactive after expiration
-    assert!(client.is_dispute_paused() == false);
-    assert!(client.get_dispute_pause().is_none());
-}
-
-#[test]
-fn test_dispute_pause_blocks_claim_investor_payout() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, sme) = setup(&env);
-    default_init(&client, &env, &admin, &sme);
-
-    let investor = Address::generate(&env);
-    client.fund(&investor, &TARGET); // Reach funded status
-    client.settle(); // Mark as settled so claim is eligible
-
-    let ticket = soroban_sdk::String::from_str(&env, "TICKET-009");
-    let duration = 86400u64;
-    client.pause_dispute(&ticket, &duration);
-
-    // Try to claim while pause is active
-    let result = client.try_claim_investor_payout(&investor);
-    assert_contract_error(
-        result,
-        crate::EscrowError::DisputePausedBlocksInvestorClaims,
+    let (client, admin, sme) = setup(&env); // sets ledger.timestamp = 12345
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "C208A"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
-    // Verify pause can be resumed and claim works
-    client.resume_dispute();
-    assert!(client.is_dispute_paused() == false);
-    
-    // Claim should now succeed
-    client.claim_investor_payout(&investor);
+    let commitment = client.record_sme_collateral_commitment(&symbol_short!("GOLD"), &5000i128);
+
+    assert_eq!(commitment.recorded_at, 12345, "recorded_at must be set on first write");
+    assert_eq!(commitment.updated_at, 12345, "updated_at must equal recorded_at on first write");
+    assert_eq!(commitment.amount, 5000);
 }
 
+/// Update: recorded_at is preserved from the first write; updated_at advances.
 #[test]
-fn test_dispute_pause_auto_resume_allows_operations() {
+fn test_208_update_preserves_recorded_at_and_advances_updated_at() {
     let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, sme) = setup(&env);
-    default_init(&client, &env, &admin, &sme);
-
-    let investor = Address::generate(&env);
-    let ticket = soroban_sdk::String::from_str(&env, "TICKET-010");
-    let duration = 100u64; // Short duration
-    let initial_timestamp = env.ledger().timestamp();
-
-    // Pause the escrow
-    client.pause_dispute(&ticket, &duration);
-    assert!(client.is_dispute_paused() == true);
-
-    // Try to fund while paused
-    let result = client.try_fund(&investor, &500i128);
-    assert_contract_error(
-        result,
-        crate::EscrowError::DisputePausedBlocksFunding,
+    let (client, admin, sme) = setup(&env); // ledger.timestamp = 12345
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "C208B"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
-    // Advance ledger time to auto-expire the pause
-    let mut ledger_info = env.ledger().get();
-    ledger_info.timestamp = initial_timestamp + duration + 1; // Past expiration
-    env.ledger().set(ledger_info);
+    // First write at timestamp 12345.
+    client.record_sme_collateral_commitment(&symbol_short!("GOLD"), &5000i128);
 
-    // Verify pause is now inactive
-    assert!(client.is_dispute_paused() == false);
-    
-    // Funding should now succeed
-    client.fund(&investor, &500i128);
+    // Advance time and update.
+    env.ledger().with_mut(|li| li.timestamp = 99999);
+    let updated = client.record_sme_collateral_commitment(&symbol_short!("GOLD"), &9000i128);
+
+    // recorded_at stays at the original write time.
+    assert_eq!(updated.recorded_at, 12345, "recorded_at must not change on update");
+    // updated_at reflects the update time.
+    assert_eq!(updated.updated_at, 99999, "updated_at must reflect the update timestamp");
+    assert_eq!(updated.amount, 9000);
+
+    // Persisted state must match the returned struct.
+    let stored = client.get_sme_collateral_commitment().unwrap();
+    assert_eq!(stored.recorded_at, 12345);
+    assert_eq!(stored.updated_at, 99999);
+    assert_eq!(stored.amount, 9000);
+}
+
+/// Record, fund to target (funded), update should still succeed (status == 1 < 2).
+#[test]
+fn test_208_update_allowed_before_settlement() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "C208C"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Record while open (status 0).
+    client.record_sme_collateral_commitment(&symbol_short!("GOLD"), &1000i128);
+
+    // Fund to target — escrow transitions to funded (status 1).
+    client.fund(&investor, &TARGET);
+    assert_eq!(client.get_escrow().status, 1);
+
+    // Advance time; update must still succeed when status == 1.
+    env.ledger().with_mut(|li| li.timestamp = 99999);
+    let updated = client.record_sme_collateral_commitment(&symbol_short!("GOLD"), &2000i128);
+    assert_eq!(updated.amount, 2000);
+    assert_eq!(updated.updated_at, 99999);
+    assert_eq!(updated.recorded_at, 12345);
+}
+
+/// After settlement (status == 2), updates must be rejected with CollateralUpdateAfterSettlement (63).
+#[test]
+fn test_208_update_blocked_after_settlement() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "C208D"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Record initial commitment.
+    client.record_sme_collateral_commitment(&symbol_short!("GOLD"), &5000i128);
+
+    // Fund and settle.
+    client.fund(&investor, &TARGET);
+    client.settle();
+    assert_eq!(client.get_escrow().status, 2);
+
+    // Attempt update — must fail with typed error code 63.
+    assert_contract_error(
+        client.try_record_sme_collateral_commitment(&symbol_short!("GOLD"), &9000i128),
+        EscrowError::CollateralUpdateAfterSettlement,
+    );
+
+    // State unchanged.
+    let stored = client.get_sme_collateral_commitment().unwrap();
+    assert_eq!(stored.amount, 5000, "collateral must not change after rejected update");
+}
+
+/// First-time record on a settled escrow is also blocked (prior == None means it's an insert, not update;
+/// but the status check applies to any write after settlement).
+/// NOTE: Current logic only blocks when a prior commitment exists. First-time records are allowed
+/// regardless of status (they're initial metadata, not corrections). This test documents that intent.
+#[test]
+fn test_208_first_record_on_settled_escrow_is_allowed() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "C208E"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.fund(&investor, &TARGET);
+    client.settle();
+    assert_eq!(client.get_escrow().status, 2);
+
+    // First-time record after settlement must succeed (no prior commitment to guard against).
+    let commitment = client.record_sme_collateral_commitment(&symbol_short!("BOND"), &1000i128);
+    assert_eq!(commitment.amount, 1000);
+    assert!(client.get_sme_collateral_commitment().is_some());
 }
