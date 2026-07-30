@@ -2571,6 +2571,10 @@ impl LiquifactEscrow {
     /// **Authorization:** [`InvoiceEscrow::admin`]. **Frontrunning:** whichever binding transaction lands
     /// first wins; observers must read on-chain state (or parse events) after finality—there is no replay lock.
     ///
+    /// Once bound, the primary attestation hash is immutable for this escrow instance. A second call
+    /// fails with [`EscrowError::PrimaryAttestationAlreadyBound`]. Use
+    /// [`LiquifactEscrow::append_attestation_digest`] for additional attestation history.
+    ///
     /// # Errors
     /// Emits typed [`EscrowError`] codes when the escrow is uninitialized or the primary digest has
     /// already been bound.
