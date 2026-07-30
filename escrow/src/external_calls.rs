@@ -103,6 +103,11 @@ use soroban_sdk::{token::TokenClient, Address, Env, MuxedAddress};
 /// fee-on-transfer, rebasing, or hook behaviors. Non-compliant tokens will cause this
 /// function to fail with a typed error, serving as a safety boundary. Such tokens should be
 /// excluded through governance allowlists and integration review processes.
+///
+/// Note: this wrapper is not designed to provide constant-time execution. The escrow
+/// contract does not handle secret-dependent inputs in its current design, so timing
+/// resistance is not the relevant threat model here. Its primary goal is value-transfer
+/// integrity across SEP-41 calls.
 pub fn transfer_funding_token_with_balance_checks(
     env: &Env,
     token_addr: &Address,

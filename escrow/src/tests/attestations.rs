@@ -81,6 +81,19 @@ fn test_bind_primary_hash_different_digest_panics() {
     client.bind_primary_attestation_hash(&digest(&env, 0x02));
 }
 
+/// A second bind must fail with a typed contract error for the immutability contract.
+#[test]
+fn test_bind_primary_hash_second_call_fails_with_primary_attestation_already_bound() {
+    let env = Env::default();
+    let (client, _) = setup_with_init(&env);
+    let d = digest(&env, 0xAB);
+    client.bind_primary_attestation_hash(&d);
+    assert_contract_error(
+        client.try_bind_primary_attestation_hash(&d),
+        EscrowError::PrimaryAttestationAlreadyBound,
+    );
+}
+
 /// Non-admin caller must not be able to bind the primary hash.
 #[test]
 #[should_panic]
