@@ -116,7 +116,7 @@ extern crate std;
 use core::{clone::Clone, default::Default};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
-    symbol_short, token::TokenClient, Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    symbol_short, token::TokenClient, Address, Bytes, BytesN, Env, Map, String, Symbol, Vec,
 };
 
 pub mod external_calls;
@@ -148,12 +148,38 @@ include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
 pub const SCHEMA_VERSION: u32 = 9;
 
+/// Contract interface version — identifies the ABI surface exposed to callers.
+///
+/// This constant is returned by [`LiquifactEscrow::get_interface_version`] and is **distinct**
+/// from [`SCHEMA_VERSION`]:
+///
+/// - [`SCHEMA_VERSION`] tracks the on-chain storage layout (XDR structs, `DataKey` variants).
+/// - `CONTRACT_INTERFACE_VERSION` tracks the **public entrypoint surface** (function names,
+///   parameter lists, return types, event shapes).
+///
+/// See `docs/escrow-interface-versioning.md` for the full policy and examples.
+pub const CONTRACT_INTERFACE_VERSION: u32 = 2;
+
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
 pub const MAX_ATTESTATION_APPEND_ENTRIES: u32 = 32;
 
 /// Upper bound on reinvestment audit log entries to keep storage bounded.
 pub const MAX_REINVESTMENT_AUDIT_ENTRIES: u32 = 100;
+
+/// Upper bound on [`DataKey::InvestorFundingHistory`] entries per investor to keep
+/// per-address persistent storage bounded. Once reached, further checkpoints are not
+/// appended (existing history is preserved; see [`LiquifactEscrow::get_investor_history`]).
+pub const MAX_INVESTOR_HISTORY_ENTRIES: u32 = 128;
+
+/// Upper bound on [`DataKey::AdminRoles`] entries to keep instance storage/CPU bounded.
+pub const MAX_ADMIN_ROLES: u32 = 16;
+
+/// Upper bound on [`MultisigPolicy::signers`] to keep instance storage/CPU bounded.
+pub const MAX_MULTISIG_SIGNERS: u32 = 16;
+
+/// Upper bound on [`MultisigPolicy::operations`] to keep instance storage/CPU bounded.
+pub const MAX_MULTISIG_OPERATIONS: u32 = 16;
 
 /// Upper bound on batch allowlist mutation entries to keep storage/CPU bounded.
 /// Mirrors the spirit of `MAX_ATTESTATION_APPEND_ENTRIES` to limit per-call work.
@@ -419,6 +445,32 @@ pub enum EscrowError {
     NoPauseActive = 171,
     /// Computed ledger timestamp would overflow (e.g., `now + duration > u64::MAX`).
     LedgerTimestampOverflow = 172,
+
+    /// [`LiquifactEscrow::fund`] / [`LiquifactEscrow::fund_with_commitment`] rejected an investor
+    /// that is not verified by the configured [`DataKey::KycProviderContract`].
+    InvestorNotVerified = 173,
+
+    /// Caller's effective [`AdminRole`] (from [`DataKey::AdminRoles`], or the implicit `Full`
+    /// fallback for [`InvoiceEscrow::admin`]) does not meet the entrypoint's minimum required role.
+    InsufficientAdminRole = 174,
+    /// [`LiquifactEscrow::set_admin_roles`] received an empty or oversized role list, or a
+    /// duplicate address within it.
+    InvalidAdminRoleList = 175,
+
+    /// [`LiquifactEscrow::init_multisig_policy`] received a `threshold` of zero or greater than
+    /// the number of configured signers.
+    MultisigThresholdInvalid = 176,
+    /// [`LiquifactEscrow::init_multisig_policy`] received an empty, oversized, or
+    /// duplicate-containing `signers` list.
+    MultisigSignerListInvalid = 177,
+    /// [`LiquifactEscrow::init_multisig_policy`] received an empty `operations` list.
+    MultisigOperationsListEmpty = 178,
+    /// A multisig-gated entrypoint received fewer distinct policy-member signatures than the
+    /// configured [`MultisigPolicy::threshold`].
+    MultisigInsufficientSigners = 179,
+    /// A multisig-gated entrypoint received a signer address that is not a member of the
+    /// configured [`MultisigPolicy::signers`], or the same signer listed more than once.
+    MultisigSignerNotAuthorized = 180,
 }
 
 #[inline(always)]
@@ -968,6 +1020,21 @@ pub struct LegalHoldChanged {
     pub reason: String,
 }
 
+/// Emitted by [`LiquifactEscrow::set_legal_hold_multisig`] instead of [`LegalHoldChanged`].
+#[contractevent]
+pub struct LegalHoldChangedMultisig {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// `1` = hold enabled, `0` = cleared.
+    pub active: u32,
+    /// Human-readable reason for the hold. Empty when clearing.
+    pub reason: String,
+    /// Number of distinct co-signers that authorized this call.
+    pub signer_count: u32,
+}
+
 #[contractevent]
 pub struct LegalHoldClearRequested {
     #[topic]
@@ -1257,6 +1324,80 @@ pub struct ReinvestmentAuditEntry {
     pub elected_at_ledger_timestamp: u64,
     /// Ledger sequence when reinvestment was elected
     pub elected_at_ledger_sequence: u32,
+}
+
+/// One checkpoint entry in an investor's [`DataKey::InvestorFundingHistory`] audit trail.
+///
+/// Recorded at each contribution ([`LiquifactEscrow::fund`] /
+/// [`LiquifactEscrow::fund_with_commitment`]) and at settlement claim
+/// ([`LiquifactEscrow::claim_investor_payout`]). `checkpoint` distinguishes the kind of
+/// event: `"deposit"`, `"funding_close"` (the deposit that closed funding), or `"settlement"`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InvestorFundingRecord {
+    /// Kind of checkpoint: `"deposit"`, `"funding_close"`, or `"settlement"`.
+    pub checkpoint: Symbol,
+    /// Ledger timestamp when this checkpoint was recorded.
+    pub timestamp: u64,
+    /// Amount associated with this checkpoint (deposit amount, or payout amount at settlement).
+    pub amount: i128,
+    /// Investor's cumulative principal contribution as of this checkpoint.
+    pub cumulative_total: i128,
+}
+
+/// Tiered admin privilege level stored in [`DataKey::AdminRoles`].
+///
+/// ## Role capabilities matrix
+///
+/// | Role | Full-admin ops (via `load_escrow_require_admin`) | Settlement-tier ops | Audit / read-only |
+/// |------|:--:|:--:|:--:|
+/// | [`AdminRole::Full`] | ✅ | ✅ | ✅ |
+/// | [`AdminRole::SettlementOnly`] | ❌ | ✅ | ✅ |
+/// | [`AdminRole::AuditOnly`] | ❌ | ❌ | ✅ |
+///
+/// All public getters are unauthenticated reads and available to every role (and to callers
+/// with no role at all). [`InvoiceEscrow::admin`] is always implicitly [`AdminRole::Full`]
+/// unless explicitly demoted via [`LiquifactEscrow::set_admin_roles`].
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminRole {
+    /// Read-only / record-keeping tier: no mutating admin privileges.
+    AuditOnly,
+    /// May authorize settlement-tier operations (e.g. [`LiquifactEscrow::partial_settle`]) in
+    /// addition to [`AdminRole::AuditOnly`] capabilities.
+    SettlementOnly,
+    /// All admin capabilities, including operations gated by
+    /// [`LiquifactEscrow::load_escrow_require_admin`] (legal hold, allowlist, caps, migrations, …).
+    Full,
+}
+
+impl AdminRole {
+    /// Privilege ordering for [`AdminRole`] comparisons: higher ⇒ more capable.
+    fn level(&self) -> u32 {
+        match self {
+            AdminRole::AuditOnly => 1,
+            AdminRole::SettlementOnly => 2,
+            AdminRole::Full => 3,
+        }
+    }
+}
+
+/// Multisig policy gating critical operations, configured by
+/// [`LiquifactEscrow::init_multisig_policy`] and stored at [`DataKey::MultisigPolicy`].
+///
+/// `operations` names the operation tags covered by this policy (see
+/// [`LiquifactEscrow::set_legal_hold_multisig`] / [`LiquifactEscrow::release_large_claim_multisig`]
+/// for the tags each entrypoint checks). An operation **not** listed here falls back to requiring
+/// only the single [`InvoiceEscrow::admin`] signature.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultisigPolicy {
+    /// Operation tags this policy covers (e.g. `"legal_hold"`, `"large_claim"`).
+    pub operations: Vec<Symbol>,
+    /// Addresses eligible to co-sign a covered operation.
+    pub signers: Vec<Address>,
+    /// Minimum number of distinct `signers` members that must authorize a covered call.
+    pub threshold: u32,
 }
 
 /// Emitted when an investor elects to reinvest their yield.
@@ -1802,6 +1943,8 @@ impl LiquifactEscrow {
         max_funding_rate: Option<u64>,
         yield_slippage_threshold: Option<i64>,
         settlement_notifier_contract: Option<Address>,
+        kyc_provider_contract: Option<Address>,
+        admin_roles: Option<Vec<(Address, AdminRole)>>,
     ) -> InvoiceEscrow {
         admin.require_auth();
 
@@ -1885,6 +2028,18 @@ impl LiquifactEscrow {
         if let Some(ref r) = registry {
             env.storage().instance().set(&DataKey::RegistryRef, r);
         }
+
+        // Optional KYC registry: when set, `fund` / `fund_with_commitment` require the investor
+        // to be verified. See `LiquifactEscrow::check_kyc` for the expected contract interface.
+        if let Some(ref kyc) = kyc_provider_contract {
+            env.storage().instance().set(&DataKey::KycProviderContract, kyc);
+        }
+
+        // Optional tiered admin roles. Absent ⇒ `admin` is implicit `AdminRole::Full`.
+        if let Some(roles) = admin_roles {
+            Self::store_admin_roles(&env, &roles);
+        }
+
         if let Some(ref tiers) = yield_tiers {
             if !tiers.is_empty() {
                 env.storage()
@@ -2299,14 +2454,18 @@ impl LiquifactEscrow {
     /// Load the current escrow and require admin authorization in one step.
     ///
     /// Consolidates the repeated `let escrow = Self::get_escrow(env.clone()); escrow.admin.require_auth();`
-    /// pattern used across multiple admin-gated entrypoints.
+    /// pattern used across multiple admin-gated entrypoints. Since #153, this also enforces
+    /// [`AdminRole::Full`] via [`LiquifactEscrow::require_admin_role`]: a no-op for deployments
+    /// that never configured [`DataKey::AdminRoles`] (the `admin` field is implicitly `Full`),
+    /// but correctly rejects the call if an operator explicitly demoted `admin`'s own role.
     fn load_escrow_require_admin(env: &Env) -> InvoiceEscrow {
         let escrow: InvoiceEscrow = env
             .storage()
             .instance()
             .get(&DataKey::Escrow)
             .unwrap_or_else(|| fail(env, EscrowError::EscrowNotInitialized));
-        escrow.admin.require_auth();
+        let admin = escrow.admin.clone();
+        Self::require_admin_role(env, &escrow, &admin, AdminRole::Full);
         escrow
     }
 
@@ -2655,6 +2814,10 @@ impl LiquifactEscrow {
     /// **Authorization:** [`InvoiceEscrow::admin`]. **Frontrunning:** whichever binding transaction lands
     /// first wins; observers must read on-chain state (or parse events) after finality—there is no replay lock.
     ///
+    /// Once bound, the primary attestation hash is immutable for this escrow instance. A second call
+    /// fails with [`EscrowError::PrimaryAttestationAlreadyBound`]. Use
+    /// [`LiquifactEscrow::append_attestation_digest`] for additional attestation history.
+    ///
     /// # Errors
     /// Emits typed [`EscrowError`] codes when the escrow is uninitialized or the primary digest has
     /// already been bound.
@@ -2936,6 +3099,377 @@ impl LiquifactEscrow {
             .set(&DataKey::YieldClaimDelegateRevoked(investor), &revoked);
     }
 
+    /// Read an investor's funding checkpoint history.
+    /// **Persistent** storage. Absent ⇒ empty vector.
+    fn get_persistent_investor_history(env: &Env, investor: Address) -> Vec<InvestorFundingRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InvestorFundingHistory(investor))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Append a checkpoint record to an investor's funding history, bounded by
+    /// [`MAX_INVESTOR_HISTORY_ENTRIES`]. Silently stops appending once the cap is
+    /// reached — the audit trail is a best-effort convenience, not the source of
+    /// truth for principal (that remains [`DataKey::InvestorContribution`]).
+    fn append_investor_history_record(
+        env: &Env,
+        investor: Address,
+        checkpoint: Symbol,
+        amount: i128,
+        cumulative_total: i128,
+    ) {
+        let mut history = Self::get_persistent_investor_history(env, investor.clone());
+        if (history.len() as u32) < MAX_INVESTOR_HISTORY_ENTRIES {
+            history.push_back(InvestorFundingRecord {
+                checkpoint,
+                timestamp: env.ledger().timestamp(),
+                amount,
+                cumulative_total,
+            });
+            env.storage()
+                .persistent()
+                .set(&DataKey::InvestorFundingHistory(investor), &history);
+        }
+    }
+
+    // --- KYC gating (see #155) ---
+
+    /// Checks `investor` against the configured [`DataKey::KycProviderContract`], if any.
+    ///
+    /// No-op when no KYC provider is configured (KYC gating is opt-in via
+    /// [`LiquifactEscrow::init`]'s `kyc_provider_contract` parameter).
+    ///
+    /// # KYC provider contract interface
+    /// The configured contract **must** expose an entrypoint with this shape:
+    /// ```text
+    /// fn is_verified(env: Env, investor: Address) -> bool
+    /// ```
+    /// returning `true` only for addresses that have completed the provider's off-chain
+    /// identity/KYC checks. Any other return type, a panic, or a missing entrypoint causes
+    /// this call (and therefore the funding call) to fail.
+    fn check_kyc(env: &Env, investor: &Address) {
+        let provider: Option<Address> = env.storage().instance().get(&DataKey::KycProviderContract);
+        if let Some(provider) = provider {
+            let args = soroban_sdk::vec![env, investor.to_val()];
+            let verified: bool =
+                env.invoke_contract(&provider, &Symbol::new(env, "is_verified"), args);
+            ensure(env, verified, EscrowError::InvestorNotVerified);
+        }
+    }
+
+    // --- Tiered admin roles (see #153) ---
+
+    /// Validates and stores an admin role list into [`DataKey::AdminRoles`]. Used by both
+    /// [`LiquifactEscrow::init`] and [`LiquifactEscrow::set_admin_roles`].
+    fn store_admin_roles(env: &Env, roles: &Vec<(Address, AdminRole)>) {
+        ensure(env, !roles.is_empty(), EscrowError::InvalidAdminRoleList);
+        ensure(
+            env,
+            (roles.len() as u32) <= MAX_ADMIN_ROLES,
+            EscrowError::InvalidAdminRoleList,
+        );
+        let mut map: Map<Address, AdminRole> = Map::new(env);
+        for i in 0..roles.len() {
+            let (addr, role) = roles.get(i).unwrap();
+            ensure(
+                env,
+                !map.contains_key(addr.clone()),
+                EscrowError::InvalidAdminRoleList,
+            );
+            map.set(addr, role);
+        }
+        env.storage().instance().set(&DataKey::AdminRoles, &map);
+    }
+
+    /// Resolves `addr`'s effective [`AdminRole`]: an explicit [`DataKey::AdminRoles`] entry if
+    /// present, else implicit [`AdminRole::Full`] when `addr == escrow.admin` (backward-compatible
+    /// default for deployments that never configured tiered roles), else [`None`].
+    fn effective_admin_role(env: &Env, escrow: &InvoiceEscrow, addr: &Address) -> Option<AdminRole> {
+        let roles: Option<Map<Address, AdminRole>> =
+            env.storage().instance().get(&DataKey::AdminRoles);
+        if let Some(roles) = roles {
+            if let Some(role) = roles.get(addr.clone()) {
+                return Some(role);
+            }
+        }
+        if addr == &escrow.admin {
+            Some(AdminRole::Full)
+        } else {
+            None
+        }
+    }
+
+    /// Requires `caller` to authorize and hold at least `min_role` (see the capabilities matrix
+    /// on [`AdminRole`]).
+    fn require_admin_role(env: &Env, escrow: &InvoiceEscrow, caller: &Address, min_role: AdminRole) {
+        caller.require_auth();
+        let role = Self::effective_admin_role(env, escrow, caller)
+            .unwrap_or_else(|| fail(env, EscrowError::InsufficientAdminRole));
+        ensure(
+            env,
+            role.level() >= min_role.level(),
+            EscrowError::InsufficientAdminRole,
+        );
+    }
+
+    /// Returns `addr`'s effective [`AdminRole`], or [`None`] if it holds no configured role and
+    /// is not the escrow's [`InvoiceEscrow::admin`].
+    pub fn get_admin_role(env: Env, addr: Address) -> Option<AdminRole> {
+        let escrow = Self::get_escrow(env.clone());
+        Self::effective_admin_role(&env, &escrow, &addr)
+    }
+
+    /// Replaces the configured [`DataKey::AdminRoles`] table.
+    ///
+    /// # Authorization
+    /// Full-admin gated: requires the current effective [`AdminRole::Full`] holder (the
+    /// [`InvoiceEscrow::admin`] by default, or any address already promoted to `Full` in the
+    /// existing table).
+    ///
+    /// # Errors
+    /// [`EscrowError::InvalidAdminRoleList`] if `roles` is empty, exceeds
+    /// [`MAX_ADMIN_ROLES`], or contains a duplicate address.
+    pub fn set_admin_roles(env: Env, roles: Vec<(Address, AdminRole)>) {
+        Self::load_escrow_require_admin(&env);
+        Self::store_admin_roles(&env, &roles);
+    }
+
+    // --- Multisig policy for critical operations (see #154) ---
+
+    /// Requires either (a) a configured [`DataKey::MultisigPolicy`] covering `operation`, with
+    /// at least `threshold` distinct policy-member `signers` each authorizing this call, or
+    /// (b) when no policy covers `operation`, the single [`InvoiceEscrow::admin`] signature
+    /// (unchanged single-admin fallback behavior).
+    fn require_multisig_or_admin(
+        env: &Env,
+        escrow: &InvoiceEscrow,
+        operation: Symbol,
+        signers: Vec<Address>,
+    ) {
+        let policy: Option<MultisigPolicy> = env.storage().instance().get(&DataKey::MultisigPolicy);
+
+        let covered = match &policy {
+            Some(p) => {
+                let mut found = false;
+                for i in 0..p.operations.len() {
+                    if p.operations.get(i).unwrap() == operation {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            }
+            None => false,
+        };
+
+        if !covered {
+            escrow.admin.require_auth();
+            return;
+        }
+        let policy = policy.unwrap();
+
+        ensure(
+            env,
+            (signers.len() as u32) >= policy.threshold,
+            EscrowError::MultisigInsufficientSigners,
+        );
+
+        let mut seen: Vec<Address> = Vec::new(env);
+        for i in 0..signers.len() {
+            let signer = signers.get(i).unwrap();
+            let mut is_member = false;
+            for j in 0..policy.signers.len() {
+                if policy.signers.get(j).unwrap() == signer {
+                    is_member = true;
+                    break;
+                }
+            }
+            ensure(env, is_member, EscrowError::MultisigSignerNotAuthorized);
+            for j in 0..seen.len() {
+                ensure(
+                    env,
+                    seen.get(j).unwrap() != signer,
+                    EscrowError::MultisigSignerNotAuthorized,
+                );
+            }
+            signer.require_auth();
+            seen.push_back(signer);
+        }
+    }
+
+    /// Configures the [`MultisigPolicy`] gating critical operations, stored at
+    /// [`DataKey::MultisigPolicy`]. Operations not listed continue to require only the single
+    /// [`InvoiceEscrow::admin`] signature ("fallback to single admin if no policy set").
+    ///
+    /// Currently checked by [`LiquifactEscrow::set_legal_hold_multisig`] (operation
+    /// `"legal_hold"`) and [`LiquifactEscrow::release_large_claim_multisig`] (operation
+    /// `"large_claim"`).
+    ///
+    /// # Authorization
+    /// Full-admin gated (see [`LiquifactEscrow::load_escrow_require_admin`]).
+    ///
+    /// # Errors
+    /// - [`EscrowError::MultisigOperationsListEmpty`] if `operations` is empty or exceeds
+    ///   [`MAX_MULTISIG_OPERATIONS`].
+    /// - [`EscrowError::MultisigSignerListInvalid`] if `signers` is empty, exceeds
+    ///   [`MAX_MULTISIG_SIGNERS`], or contains a duplicate address.
+    /// - [`EscrowError::MultisigThresholdInvalid`] if `threshold` is zero or exceeds
+    ///   `signers.len()`.
+    pub fn init_multisig_policy(
+        env: Env,
+        operations: Vec<Symbol>,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) {
+        Self::load_escrow_require_admin(&env);
+
+        ensure(
+            &env,
+            !operations.is_empty() && (operations.len() as u32) <= MAX_MULTISIG_OPERATIONS,
+            EscrowError::MultisigOperationsListEmpty,
+        );
+
+        ensure(
+            &env,
+            !signers.is_empty() && (signers.len() as u32) <= MAX_MULTISIG_SIGNERS,
+            EscrowError::MultisigSignerListInvalid,
+        );
+        for i in 0..signers.len() {
+            for j in (i + 1)..signers.len() {
+                ensure(
+                    &env,
+                    signers.get(i).unwrap() != signers.get(j).unwrap(),
+                    EscrowError::MultisigSignerListInvalid,
+                );
+            }
+        }
+
+        ensure(
+            &env,
+            threshold > 0 && threshold <= signers.len() as u32,
+            EscrowError::MultisigThresholdInvalid,
+        );
+
+        let policy = MultisigPolicy {
+            operations,
+            signers,
+            threshold,
+        };
+        env.storage().instance().set(&DataKey::MultisigPolicy, &policy);
+    }
+
+    /// Multisig-gated variant of [`LiquifactEscrow::set_legal_hold`] for operators using
+    /// [`LiquifactEscrow::init_multisig_policy`] to require multiple co-signers for legal hold
+    /// changes. Checks operation tag `"legal_hold"`; falls back to the single
+    /// [`InvoiceEscrow::admin`] signature when no policy covers it. Applies the same
+    /// two-phase clear-delay gate as [`LiquifactEscrow::set_legal_hold`].
+    pub fn set_legal_hold_multisig(env: Env, signers: Vec<Address>, active: bool, reason: String) {
+        let escrow = Self::get_escrow(env.clone());
+        Self::require_multisig_or_admin(
+            &env,
+            &escrow,
+            Symbol::new(&env, "legal_hold"),
+            signers.clone(),
+        );
+
+        if !active && Self::legal_hold_active(&env) {
+            let delay = Self::get_legal_hold_clear_delay(env.clone());
+            if delay > 0 {
+                let clearable_at: Option<u64> =
+                    env.storage().instance().get(&DataKey::LegalHoldClearableAt);
+                ensure(
+                    &env,
+                    clearable_at.is_some(),
+                    EscrowError::LegalHoldClearRequestMissing,
+                );
+                let now = env.ledger().timestamp();
+                ensure(
+                    &env,
+                    now >= clearable_at.unwrap(),
+                    EscrowError::LegalHoldClearNotReady,
+                );
+            }
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::LegalHoldClearableAt);
+        env.storage().instance().set(&DataKey::LegalHold, &active);
+
+        LegalHoldChangedMultisig {
+            name: symbol_short!("lh_ms"),
+            invoice_id: escrow.invoice_id.clone(),
+            active: if active { 1 } else { 0 },
+            reason,
+            signer_count: signers.len(),
+        }
+        .publish(&env);
+    }
+
+    /// Multisig-gated release of `investor`'s settlement payout, for large claims that
+    /// operators want to require multiple co-signers for (see
+    /// [`LiquifactEscrow::init_multisig_policy`]). Checks operation tag `"large_claim"`; falls
+    /// back to the single [`InvoiceEscrow::admin`] signature when no policy covers it. Performs
+    /// the same idempotency and funding-history bookkeeping as
+    /// [`LiquifactEscrow::claim_investor_payout`], on `investor`'s behalf, and returns the
+    /// computed payout.
+    pub fn release_large_claim_multisig(env: Env, signers: Vec<Address>, investor: Address) -> i128 {
+        ensure(
+            &env,
+            !Self::legal_hold_active(&env),
+            EscrowError::LegalHoldBlocksInvestorClaims,
+        );
+        ensure(
+            &env,
+            !Self::is_dispute_paused(&env),
+            EscrowError::DisputePausedBlocksInvestorClaims,
+        );
+
+        let escrow = Self::get_escrow(env.clone());
+        Self::require_multisig_or_admin(
+            &env,
+            &escrow,
+            Symbol::new(&env, "large_claim"),
+            signers,
+        );
+
+        let contribution: i128 = Self::get_persistent_investor_contribution(&env, investor.clone());
+        ensure(&env, contribution > 0, EscrowError::NoContributionToClaim);
+
+        let settled_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SettledAmount)
+            .unwrap_or(0);
+        let is_claimable = escrow.status == 2 || (escrow.status == 1 && settled_amount > 0);
+        ensure(&env, is_claimable, EscrowError::InvestorClaimNotSettled);
+
+        if Self::get_persistent_investor_claimed(&env, investor.clone()) {
+            return Self::compute_investor_payout(env.clone(), investor.clone());
+        }
+
+        Self::set_persistent_investor_claimed(&env, investor.clone(), true);
+
+        let payout = Self::compute_investor_payout(env.clone(), investor.clone());
+        Self::append_investor_history_record(
+            &env,
+            investor.clone(),
+            symbol_short!("settle"),
+            payout,
+            contribution,
+        );
+
+        InvestorPayoutClaimed {
+            name: symbol_short!("inv_claim"),
+            investor,
+            invoice_id: escrow.invoice_id.clone(),
+        }
+        .publish(&env);
+
+        payout
+    }
+
     /// Verify that a delegation is valid (exists and is not revoked).
     /// Returns `true` if a valid delegation exists; `false` if no delegation or revoked.
     fn delegation_is_valid(env: &Env, investor: Address) -> bool {
@@ -2956,6 +3490,17 @@ impl LiquifactEscrow {
     /// Public API: contribution recorded for `investor` (persistent storage).
     pub fn get_contribution(env: Env, investor: Address) -> i128 {
         Self::get_persistent_investor_contribution(&env, investor)
+    }
+
+    /// Returns `investor`'s funding checkpoint history ([`DataKey::InvestorFundingHistory`]).
+    ///
+    /// Each entry is a snapshot recorded at a checkpoint: a deposit via
+    /// [`LiquifactEscrow::fund`] / [`LiquifactEscrow::fund_with_commitment`] (`"deposit"`,
+    /// or `"funding_close"` for the deposit that closes funding), or a settlement claim via
+    /// [`LiquifactEscrow::claim_investor_payout`] (`"settle"`). Bounded by
+    /// [`MAX_INVESTOR_HISTORY_ENTRIES`]; returns an empty vector if `investor` never funded.
+    pub fn get_investor_history(env: Env, investor: Address) -> Vec<InvestorFundingRecord> {
+        Self::get_persistent_investor_history(&env, investor)
     }
 
     /// Pro-rata denominator captured when the escrow first became **funded**; [`None`] until then.
@@ -4295,6 +4840,9 @@ impl LiquifactEscrow {
         // Sanctions screening: check investor against configured sanctions provider
         Self::check_sanctions(&env, &investor);
 
+        // KYC gating: reject funding from unverified investors when a KYC registry is configured.
+        Self::check_kyc(&env, &investor);
+
         let prev: i128 = Self::get_persistent_investor_contribution(&env, investor.clone());
         let new_contribution: i128 = prev
             .checked_add(amount)
@@ -4463,6 +5011,21 @@ impl LiquifactEscrow {
 
         Self::set_persistent_investor_contribution(&env, investor.clone(), new_contribution);
 
+        // Record a funding-history checkpoint for this deposit (see #148). `escrow.status`
+        // already reflects the funded-status transition (if any) computed above.
+        let history_checkpoint = if escrow.status == 1 {
+            symbol_short!("fnd_close")
+        } else {
+            symbol_short!("deposit")
+        };
+        Self::append_investor_history_record(
+            &env,
+            investor.clone(),
+            history_checkpoint,
+            amount,
+            new_contribution,
+        );
+
         // Update the bucketed aggregate for dashboard O(1) reads.
         {
             let bucket = Self::investor_bucket_index(&env, &investor);
@@ -4552,8 +5115,12 @@ impl LiquifactEscrow {
 
         let mut escrow = Self::get_escrow(env.clone());
 
+        // Since #153: also permit any address holding >= AdminRole::SettlementOnly.
+        let has_settlement_role = Self::effective_admin_role(&env, &escrow, &caller)
+            .map(|r| r.level() >= AdminRole::SettlementOnly.level())
+            .unwrap_or(false);
         assert!(
-            caller == escrow.sme_address || caller == escrow.admin,
+            caller == escrow.sme_address || caller == escrow.admin || has_settlement_role,
             "Unauthorized caller for partial settlement"
         );
 
@@ -4640,7 +5207,7 @@ impl LiquifactEscrow {
             escrow.yield_bps,
             now
         ];
-        env.invoke_contract(¬ifier, &symbol_short!("on_settle"), args);
+        env.invoke_contract(&notifier, &symbol_short!("on_settle"), args);
 
         SettlementNotifierInvoked {
             name: symbol_short!("notify_ok"),
@@ -4999,6 +5566,11 @@ impl LiquifactEscrow {
             max_per_investor_cap,
             legal_hold_clear_delay,
             funding_deadline,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
 
         // Emit clone event.
@@ -5407,6 +5979,16 @@ impl LiquifactEscrow {
             // Mark claimed.
             Self::set_persistent_investor_claimed(&env, investor.clone(), true);
 
+            // Record the settlement checkpoint (see #148).
+            let settlement_payout = Self::compute_investor_payout(env.clone(), investor.clone());
+            Self::append_investor_history_record(
+                &env,
+                investor.clone(),
+                symbol_short!("settle"),
+                settlement_payout,
+                contribution,
+            );
+
             // Yield slippage detection.
             Self::detect_yield_slippage(&env, investor.clone(), &escrow);
 
@@ -5535,6 +6117,16 @@ impl LiquifactEscrow {
 
         // Mark before emit — prevents re-emission on any re-entrant path.
         Self::set_persistent_investor_claimed(&env, investor.clone(), true);
+
+        // Record the settlement checkpoint (see #148).
+        let settlement_payout = Self::compute_investor_payout(env.clone(), investor.clone());
+        Self::append_investor_history_record(
+            &env,
+            investor.clone(),
+            symbol_short!("settle"),
+            settlement_payout,
+            contribution,
+        );
 
         InvestorPayoutClaimed {
             name: symbol_short!("inv_claim"),
