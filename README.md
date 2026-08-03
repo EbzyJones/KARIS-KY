@@ -335,6 +335,8 @@ cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only -p kari
 
 | Resource | Description |
 |----------|-------------|
+| [State Machine Diagram](docs/state-machine.md) | Mermaid UML diagram of all states (0–5), valid transitions, blocked operations per state, and legal hold / dispute pause overlays |
+| [Token Integration Guide](docs/token-integration-guide.md) | USDC/USDT/EURC stablecoin examples, fee-on-transfer warning, rebasing pitfalls, and pre-integration test script |
 | [Init Parameter Reference](docs/escrow-init-parameters.md) | Every init parameter, valid ranges, conservative vs. aggressive examples, gas costs |
 | [Local Environment Script](scripts/local-env.sh) | One-command local Soroban dev environment setup |
 | [Deployer Script](scripts/deploy.sh) | Config-driven contract deployment with .env support |

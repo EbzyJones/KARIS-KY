@@ -58,6 +58,7 @@ mod init;
 mod integration;
 mod legal_hold;
 mod properties;
+mod properties_funding;
 mod secure_rng;
 mod settlement;
 mod tokenomics;
