@@ -1294,6 +1294,85 @@ fn test_sweep_terminal_dust_happy_path() {
 }
 
 #[test]
+fn test_sweep_terminal_dust_handles_one_unit_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let token = crate::tests::install_stellar_asset_token(&env);
+    let treasury = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "T1"),
+        &sme,
+        &100,
+        &10,
+        &10,
+        &token.id,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.fund(&Address::generate(&env), &100);
+    env.ledger().with_mut(|li| li.timestamp = 200);
+    client.settle();
+
+    token.stellar.mint(&client.address, &1);
+
+    let swept = client.sweep_terminal_dust(&1);
+    assert_eq!(swept, 1);
+    assert_eq!(token.token.balance(&treasury), 1);
+}
+
+#[test]
+fn test_sweep_terminal_dust_handles_sub_cap_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let token = crate::tests::install_stellar_asset_token(&env);
+    let treasury = Address::generate(&env);
+    let dust_amount = MAX_DUST_SWEEP_AMOUNT - 1;
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "T2"),
+        &sme,
+        &100,
+        &10,
+        &10,
+        &token.id,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.fund(&Address::generate(&env), &100);
+    env.ledger().with_mut(|li| li.timestamp = 200);
+    client.settle();
+
+    token.stellar.mint(&client.address, &dust_amount);
+
+    let swept = client.sweep_terminal_dust(&dust_amount);
+    assert_eq!(swept, dust_amount);
+    assert_eq!(token.token.balance(&treasury), dust_amount);
+}
+
+#[test]
 fn test_bump_ttl_covers_persistent_investor_keys() {
     let env = Env::default();
     env.mock_all_auths();
