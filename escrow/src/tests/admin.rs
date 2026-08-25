@@ -1811,3 +1811,454 @@ fn test_208_first_record_on_settled_escrow_is_allowed() {
     assert_eq!(commitment.amount, 1000);
     assert!(client.get_sme_collateral_commitment().is_some());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEST-007: Dispute pause auto-expiry
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Verifies that a dispute pause configured with `duration_secs` auto-expires when
+// the ledger timestamp advances past `paused_at + duration_secs`, allowing
+// settlement and other operations to proceed **without** an explicit `resume_dispute`
+// call. Tests cover:
+// - Settle succeeds after auto-expiry
+// - Settle blocked before expiry
+// - Boundary conditions (exactly at expiry timestamp)
+
+/// Happy path: pause a funded escrow with a 1-hour duration, advance time past
+/// the expiry, and verify settle succeeds without calling `resume_dispute`.
+#[test]
+fn test_dispute_pause_auto_expire_then_settle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "DISPAUTO1"),
+        &sme,
+        &100_000i128,
+        &500i64,
+        &0u64, // no maturity constraint
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Fund the escrow so settle is available.
+    client.fund(&investor, &100_000i128);
+    assert_eq!(client.get_escrow().status, 1); // funded
+
+    // Pause the escrow for 1 hour (3600 seconds).
+    let pause_duration = 3600u64;
+    client.pause_dispute(
+        &soroban_sdk::String::from_str(&env, "ticket-auto-001"),
+        &pause_duration,
+    );
+
+    // Verify the pause is currently active.
+    assert!(
+        client.is_dispute_paused(),
+        "dispute pause must be active immediately after pause_dispute"
+    );
+
+    // Attempt settle before expiry — must fail with DisputePausedBlocksSettlement.
+    assert_contract_error(
+        client.try_settle(),
+        EscrowError::DisputePausedBlocksSettlement,
+    );
+
+    // Advance ledger time to exactly at expiry (now = paused_at + duration).
+    let ledger_at_pause = env.ledger().timestamp();
+    let expiry_ts = ledger_at_pause + pause_duration;
+    env.ledger().set_timestamp(expiry_ts);
+
+    // The pause is no longer active (is_dispute_paused checks now >= expires_at).
+    assert!(
+        !client.is_dispute_paused(),
+        "dispute pause must be inactive at/after expiry"
+    );
+
+    // Settle must succeed without an explicit resume_dispute call.
+    client.settle();
+    assert_eq!(client.get_escrow().status, 2); // settled
+}
+
+/// Boundary condition: settle blocked 1 second **before** expiry, succeeds
+/// exactly **at** expiry.
+#[test]
+fn test_dispute_pause_expiry_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "DISPBOUND1"),
+        &sme,
+        &50_000i128,
+        &300i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.fund(&investor, &50_000i128);
+    let pause_duration = 7200u64; // 2 hours
+    let paused_at = env.ledger().timestamp();
+    client.pause_dispute(
+        &soroban_sdk::String::from_str(&env, "ticket-boundary-001"),
+        &pause_duration,
+    );
+
+    // Advance to 1 second **before** expiry.
+    let one_before_expiry = paused_at + pause_duration - 1;
+    env.ledger().set_timestamp(one_before_expiry);
+
+    // is_dispute_paused must still return true because now < expires_at.
+    assert!(
+        client.is_dispute_paused(),
+        "pause must still be active 1 second before expiry"
+    );
+
+    // Settle must be blocked.
+    assert_contract_error(
+        client.try_settle(),
+        EscrowError::DisputePausedBlocksSettlement,
+    );
+
+    // Advance to exactly the expiry timestamp.
+    let expiry_ts = paused_at + pause_duration;
+    env.ledger().set_timestamp(expiry_ts);
+
+    // Pause is now inactive (now >= expires_at).
+    assert!(
+        !client.is_dispute_paused(),
+        "pause must be inactive exactly at expiry"
+    );
+
+    // Settle must succeed.
+    client.settle();
+    assert_eq!(client.get_escrow().status, 2);
+}
+
+/// Fund, withdraw, and claim operations are also blocked during an active pause
+/// and auto-unblocked after expiry.
+#[test]
+fn test_dispute_pause_blocks_fund_auto_expires() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "DISPFUND1"),
+        &sme,
+        &100_000i128,
+        &400i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Pause the escrow before funding.
+    let pause_duration = 1800u64; // 30 minutes
+    let paused_at = env.ledger().timestamp();
+    client.pause_dispute(
+        &soroban_sdk::String::from_str(&env, "ticket-fund-001"),
+        &pause_duration,
+    );
+
+    // fund() must be blocked while pause is active.
+    assert_contract_error(
+        client.try_fund(&investor, &100_000i128),
+        EscrowError::DisputePausedBlocksFunding,
+    );
+
+    // Advance time past expiry.
+    env.ledger().set_timestamp(paused_at + pause_duration);
+
+    // fund() must now succeed.
+    client.fund(&investor, &100_000i128);
+    assert_eq!(client.get_escrow().funded_amount, 100_000i128);
+}
+
+/// Withdraw is blocked during an active pause and auto-unblocked after expiry.
+#[test]
+fn test_dispute_pause_blocks_withdraw_auto_expires() {
+    use crate::tests::install_stellar_asset_token;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_id, admin, sme) = (deploy_id(&env), Address::generate(&env), Address::generate(&env));
+    let client = LiquifactEscrowClient::new(&env, &client_id);
+    let investor = Address::generate(&env);
+    let token_setup = install_stellar_asset_token(&env);
+    let treasury = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "DISPWD1"),
+        &sme,
+        &50_000i128,
+        &200i64,
+        &0u64,
+        &token_setup.id,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Fund with real token so withdraw can actually transfer.
+    token_setup.stellar.mint(&investor, &50_000i128);
+    token_setup.token.approve(&investor, &client_id, &50_000i128, &999_999);
+    client.fund(&investor, &50_000i128);
+    // Mint the escrow's balance so withdraw has tokens to send.
+    token_setup.stellar.mint(&client_id, &50_000i128);
+
+    // Pause after funded.
+    let pause_duration = 600u64; // 10 minutes
+    let paused_at = env.ledger().timestamp();
+    client.pause_dispute(
+        &soroban_sdk::String::from_str(&env, "ticket-wd-001"),
+        &pause_duration,
+    );
+
+    // withdraw() is blocked.
+    assert_contract_error(
+        client.try_withdraw(),
+        EscrowError::DisputePausedBlocksWithdrawal,
+    );
+
+    // Advance past expiry.
+    env.ledger().set_timestamp(paused_at + pause_duration);
+
+    // withdraw() succeeds.
+    client.withdraw();
+    assert_eq!(client.get_escrow().status, 3); // withdrawn
+}
+
+/// Investor claims are blocked during an active pause and auto-unblocked after expiry.
+#[test]
+fn test_dispute_pause_blocks_claim_auto_expires() {
+    use crate::tests::install_stellar_asset_token;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_id, admin, sme) = (deploy_id(&env), Address::generate(&env), Address::generate(&env));
+    let client = LiquifactEscrowClient::new(&env, &client_id);
+    let investor = Address::generate(&env);
+    let token_setup = install_stellar_asset_token(&env);
+    let treasury = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "DISPCLAIM1"),
+        &sme,
+        &60_000i128,
+        &500i64,
+        &0u64,
+        &token_setup.id,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Fund, mint tokens for claim payout, settle.
+    token_setup.stellar.mint(&investor, &60_000i128);
+    token_setup.token.approve(&investor, &client_id, &60_000i128, &999_999);
+    client.fund(&investor, &60_000i128);
+    token_setup.stellar.mint(&client_id, &63_000i128); // principal + yield
+    client.settle();
+
+    // Pause after settlement.
+    let pause_duration = 900u64; // 15 minutes
+    let paused_at = env.ledger().timestamp();
+    client.pause_dispute(
+        &soroban_sdk::String::from_str(&env, "ticket-claim-001"),
+        &pause_duration,
+    );
+
+    // claim_investor_payout() is blocked.
+    assert_contract_error(
+        client.try_claim_investor_payout(&investor),
+        EscrowError::DisputePausedBlocksInvestorClaims,
+    );
+
+    // Advance past expiry.
+    env.ledger().set_timestamp(paused_at + pause_duration);
+
+    // claim_investor_payout() succeeds.
+    client.claim_investor_payout(&investor);
+    assert!(client.is_investor_claimed(&investor));
+}
+
+/// Manual resume clears the pause before auto-expiry. Verify that settle succeeds
+/// after resume, even if the expiry timestamp has not been reached.
+#[test]
+fn test_dispute_pause_manual_resume_before_expiry() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "DISPRES1"),
+        &sme,
+        &40_000i128,
+        &600i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.fund(&investor, &40_000i128);
+
+    // Pause for 1 hour.
+    let pause_duration = 3600u64;
+    let paused_at = env.ledger().timestamp();
+    client.pause_dispute(
+        &soroban_sdk::String::from_str(&env, "ticket-manual-001"),
+        &pause_duration,
+    );
+
+    // Advance only halfway to expiry.
+    env.ledger().set_timestamp(paused_at + 1800);
+    assert!(
+        client.is_dispute_paused(),
+        "pause must still be active before expiry"
+    );
+
+    // Admin manually resumes the pause.
+    client.resume_dispute();
+
+    // Pause is now cleared.
+    assert!(
+        !client.is_dispute_paused(),
+        "pause must be inactive after manual resume"
+    );
+
+    // Settle succeeds immediately.
+    client.settle();
+    assert_eq!(client.get_escrow().status, 2);
+}
+
+/// get_dispute_pause returns Some(state) while active, None after auto-expiry.
+#[test]
+fn test_get_dispute_pause_returns_none_after_expiry() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, sme) = setup(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "DISPGET1"),
+        &sme,
+        &10_000i128,
+        &100i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let pause_duration = 1200u64; // 20 minutes
+    let paused_at = env.ledger().timestamp();
+    client.pause_dispute(
+        &soroban_sdk::String::from_str(&env, "ticket-get-001"),
+        &pause_duration,
+    );
+
+    // get_dispute_pause returns Some while active.
+    let state = client.get_dispute_pause();
+    assert!(state.is_some(), "get_dispute_pause must return Some while active");
+    let state = state.unwrap();
+    assert_eq!(state.expires_at_ledger_timestamp, paused_at + pause_duration);
+
+    // Advance past expiry.
+    env.ledger().set_timestamp(paused_at + pause_duration);
+
+    // get_dispute_pause returns None (the pause is logically expired).
+    let state_after = client.get_dispute_pause();
+    assert!(
+        state_after.is_none(),
+        "get_dispute_pause must return None after auto-expiry"
+    );
+}
