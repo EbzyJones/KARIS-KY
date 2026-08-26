@@ -464,6 +464,10 @@ pub enum EscrowError {
     /// A multisig-gated entrypoint received a signer address that is not a member of the
     /// configured [`MultisigPolicy::signers`], or the same signer listed more than once.
     MultisigSignerNotAuthorized = 180,
+      /// Funding would exceed the configured `funding_target`.
+    FundingTargetExceeded = 181,
+      /// Invariant violation: `funded_amount > funding_target` detected.
+    InvariantViolation = 182,
 }
 
 #[inline(always)]
@@ -1986,6 +1990,12 @@ impl LiquifactEscrow {
             maturity,
             status: 0,
         };
+
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
         env.storage()
@@ -4262,6 +4272,8 @@ impl LiquifactEscrow {
         Self::set_legal_hold(env, false, String::from_str(&env, ""));
     }
 
+
+
     pub fn update_funding_target(env: Env, new_target: i128) -> InvoiceEscrow {
         ensure(
             &env,
@@ -4281,6 +4293,12 @@ impl LiquifactEscrow {
 
         let old_target = escrow.funding_target;
         escrow.funding_target = new_target;
+
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
@@ -4970,10 +4988,17 @@ impl LiquifactEscrow {
             }
         }
 
-        escrow.funded_amount = escrow
+        let new_funded = escrow
             .funded_amount
             .checked_add(amount)
             .unwrap_or_else(|| fail(&env, EscrowError::FundedAmountOverflow));
+
+        ensure!(
+            new_funded <= escrow.funding_target,
+            EscrowError::FundingTargetExceeded
+        );
+
+        escrow.funded_amount = new_funded;
 
         // --- Concentration cap check ---
         if let Some(concentration_cap) = env
@@ -5182,6 +5207,14 @@ impl LiquifactEscrow {
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
+
+        env.storage().instance().set(&DataKey::Escrow, &escrow);
+
         EscrowPartialSettle {
             name: symbol_short!("part_set"),
             invoice_id: escrow.invoice_id.clone(),
@@ -5190,6 +5223,7 @@ impl LiquifactEscrow {
         .publish(&env);
 
         escrow
+
     }
 
     /// Retry / standalone settlement notification. Invokes the configured
@@ -5241,6 +5275,8 @@ impl LiquifactEscrow {
         }
         .publish(&env);
     }
+
+
 
     pub fn settle(env: Env, partial_amount: Option<i128>) -> InvoiceEscrow {
         ensure(
@@ -5375,6 +5411,12 @@ impl LiquifactEscrow {
                 }
             }
         }
+
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
@@ -5630,6 +5672,8 @@ impl LiquifactEscrow {
     /// - [`EscrowError::LegalHoldBlocksWithdrawal`] — hold is active.
     /// - [`EscrowError::WithdrawalNotFunded`] — escrow not in funded state.
     /// - [`EscrowError::InsufficientContractBalance`] — contract holds less than `funded_amount`.
+
+
     pub fn withdraw(env: Env) -> InvoiceEscrow {
         ensure(
             &env,
@@ -5666,6 +5710,13 @@ impl LiquifactEscrow {
 
         // State transition and accounting (checks-effects-interactions).
         escrow.status = 3;
+
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
+
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
         let prev_distributed: i128 = env
