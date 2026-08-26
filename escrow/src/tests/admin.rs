@@ -1810,4 +1810,146 @@ fn test_208_first_record_on_settled_escrow_is_allowed() {
     let commitment = client.record_sme_collateral_commitment(&symbol_short!("BOND"), &1000i128);
     assert_eq!(commitment.amount, 1000);
     assert!(client.get_sme_collateral_commitment().is_some());
+
+
+    // ──────────────────────────────────────────────────────────────────────────────
+    // Legal hold state machine – Issue #406
+    // ──────────────────────────────────────────────────────────────────────────────
+
+    /// Helper: activate legal hold
+    fn activate_hold(client: &LiquifactEscrowClient<'_>, env: &Env) {
+        client.set_legal_hold(&true, &String::from_str(env, "Test hold"));
+    }
+
+    /// Helper: check that a panic contains a given contract error code
+    fn assert_panic_contains_error_code(result: std::thread::Result<()>, expected_code: u32) {
+        let err = result.err().unwrap();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains(&format!("ContractError({})", expected_code)),
+            "Expected error code {} but got: {}",
+            expected_code,
+            msg
+        );
+    }
+
+    /// Test: fund is blocked during legal hold with error LegalHoldBlocksFunding (102)
+    #[test]
+    fn test_fund_blocked_during_legal_hold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, sme) = setup(&env);
+        default_init(&client, &env, &admin, &sme);
+
+        activate_hold(&client, &env);
+
+        let investor = Address::generate(&env);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.fund(&investor, &1_000i128);
+        }));
+        assert_panic_contains_error_code(result, 102); // LegalHoldBlocksFunding
+    }
+
+    /// Test: settle is blocked during legal hold with error LegalHoldBlocksSettlement (120)
+    #[test]
+    fn test_settle_blocked_during_legal_hold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, sme) = setup(&env);
+        default_init(&client, &env, &admin, &sme);
+
+        fund_to_target(&client, &env);
+
+        activate_hold(&client, &env);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.settle(&None);
+        }));
+        assert_panic_contains_error_code(result, 120); // LegalHoldBlocksSettlement
+    }
+
+    /// Test: withdraw is blocked during legal hold with error LegalHoldBlocksWithdrawal (123)
+    #[test]
+    fn test_withdraw_blocked_during_legal_hold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, sme) = setup(&env);
+        default_init(&client, &env, &admin, &sme);
+
+        // We need to fund and mint tokens so withdraw can attempt to transfer
+        let token = install_stellar_asset_token(&env);
+        let contract_id = client.address.clone();
+        token.stellar.mint(&contract_id, &TARGET);
+
+        fund_to_target(&client, &env);
+
+        activate_hold(&client, &env);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.withdraw();
+        }));
+        assert_panic_contains_error_code(result, 123); // LegalHoldBlocksWithdrawal
+    }
+
+    /// Test: claim_investor_payout is blocked during legal hold with error LegalHoldBlocksInvestorClaims (125)
+    #[test]
+    fn test_claim_investor_payout_blocked_during_legal_hold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, sme) = setup(&env);
+        default_init(&client, &env, &admin, &sme);
+
+        let investor = settle_escrow(&client, &env);
+
+        activate_hold(&client, &env);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.claim_investor_payout(&investor);
+        }));
+        assert_panic_contains_error_code(result, 125); // LegalHoldBlocksInvestorClaims
+    }
+
+    /// Test: sweep_terminal_dust is blocked during legal hold with error LegalHoldBlocksTreasuryDustSweep (30)
+    #[test]
+    fn test_sweep_terminal_dust_blocked_during_legal_hold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, sme) = setup(&env);
+        default_init(&client, &env, &admin, &sme);
+
+        let investor = settle_escrow(&client, &env);
+
+        // Mint dust into the contract so sweep can attempt to transfer
+        let token = install_stellar_asset_token(&env);
+        let contract_id = client.address.clone();
+        token.stellar.mint(&contract_id, &10i128);
+
+        activate_hold(&client, &env);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.sweep_terminal_dust(&10i128);
+        }));
+        assert_panic_contains_error_code(result, 30); // LegalHoldBlocksTreasuryDustSweep
+    }
+
+    /// Test: resume_dispute is allowed during legal hold (no error)
+    #[test]
+    fn test_resume_dispute_allowed_during_legal_hold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, sme) = setup(&env);
+        default_init(&client, &env, &admin, &sme);
+
+        activate_hold(&client, &env);
+
+        // First, create a dispute pause so there is something to resume
+        client.pause_dispute(&String::from_str(&env, "TICKET-001"), &3600u64);
+
+        // resume_dispute must not panic even with legal hold active
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.resume_dispute();
+        }));
+        assert!(result.is_ok(), "resume_dispute should succeed during legal hold");
+    }
+
 }
