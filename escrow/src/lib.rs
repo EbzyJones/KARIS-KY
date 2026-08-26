@@ -116,7 +116,7 @@ extern crate std;
 use core::{clone::Clone, default::Default};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
-    symbol_short, token::TokenClient, Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    symbol_short, token::TokenClient, Address, Bytes, BytesN, Env, Executable, String, Symbol, Vec,
 };
 
 pub mod external_calls;
@@ -147,6 +147,12 @@ include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
 pub const SCHEMA_VERSION: u32 = 7;
+
+/// Contract interface version: incremented when the public entrypoint ABI
+/// (parameter names, types, or return types) changes in a backward-incompatible way.
+/// Surfaced by [`LiquifactEscrow::get_interface_version`] and embedded into the WASM
+/// artifact by `build.rs` via `BUILD_INTERFACE_VERSION`.
+pub const CONTRACT_INTERFACE_VERSION: u32 = 1;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
@@ -464,6 +470,10 @@ pub enum EscrowError {
     /// A multisig-gated entrypoint received a signer address that is not a member of the
     /// configured [`MultisigPolicy::signers`], or the same signer listed more than once.
     MultisigSignerNotAuthorized = 180,
+    /// [`LiquifactEscrow::init`] received a contract address as `admin` and the caller
+    /// set `reject_contract_admin = true`. Use a regular account address (keypair / multisig)
+    /// or omit the flag to allow contract admins with a warning event instead.
+    ContractAdminRejected = 181,
 }
 
 #[inline(always)]
@@ -621,6 +631,7 @@ pub enum DataKey {
     /// Flag indicating whether automatic yield distribution snapshots are enabled for this escrow.
     /// Absent ⇒ false (default off, backwards-compatible). Set during [`LiquifactEscrow::init`].
     YieldAutoDistributionEnabled,
+}
 
 // --- Data types ---
 
@@ -995,6 +1006,25 @@ pub struct AdminProposedEvent {
     pub invoice_id: Symbol,
     pub current_admin: Address,
     pub pending_admin: Address,
+}
+
+/// Emitted by [`LiquifactEscrow::init`] when the supplied `admin` address resolves to a
+/// deployed contract rather than a regular account (keypair).
+///
+/// A contract admin is not inherently unsafe — it is the standard pattern for multisig and
+/// DAO governance — but it widens the attack surface compared to a simple account. Indexers
+/// and monitoring tools should surface this event to operators for manual review.
+///
+/// If the caller passed `reject_contract_admin = Some(true)`, [`LiquifactEscrow::init`] fails
+/// with [`EscrowError::ContractAdminRejected`] (code 181) **instead** of emitting this event.
+#[contractevent]
+pub struct AdminIsContractWarning {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// The contract address that was supplied as `admin`.
+    pub admin: Address,
 }
 
 #[contractevent]
@@ -1944,8 +1974,41 @@ impl LiquifactEscrow {
         settlement_notifier_contract: Option<Address>,
         kyc_provider_contract: Option<Address>,
         admin_roles: Option<Vec<(Address, AdminRole)>>,
+        reject_contract_admin: Option<bool>,
     ) -> InvoiceEscrow {
         admin.require_auth();
+
+        // ── Contract-admin detection ──────────────────────────────────────────
+        // A contract address as admin is legitimate (multisig, DAO timelock) but
+        // widens the attack surface relative to a plain account. Detect it via
+        // Address::executable(): Account ⇒ None or Executable::Account,
+        // deployed contract ⇒ Executable::Wasm(_) or Executable::StellarAsset.
+        //
+        // If reject_contract_admin = Some(true) the call fails immediately.
+        // Otherwise we emit AdminIsContractWarning so indexers can surface it.
+        //
+        // NOTE: executable() returns None when the address does not yet exist on
+        // the ledger (e.g. a pre-funded account that has not been activated, or a
+        // contract not yet deployed). We conservatively treat None as non-contract
+        // so legitimate accounts that are merely unfunded are not falsely warned.
+        let admin_is_contract = matches!(
+            admin.executable(),
+            Some(Executable::Wasm(_)) | Some(Executable::StellarAsset)
+        );
+        if admin_is_contract {
+            if reject_contract_admin.unwrap_or(false) {
+                fail(&env, EscrowError::ContractAdminRejected);
+            }
+            // Emit warning — callers can watch for symbol "adm_warn" in event logs.
+            // The invoice_id is not yet validated at this point so we emit a
+            // placeholder; the full id will appear in EscrowInitialized immediately after.
+            AdminIsContractWarning {
+                name: symbol_short!("adm_warn"),
+                invoice_id: symbol_short!("pending"),
+                admin: admin.clone(),
+            }
+            .publish(&env);
+        }
 
         ensure(&env, amount > 0, EscrowError::AmountMustBePositive);
         ensure(
