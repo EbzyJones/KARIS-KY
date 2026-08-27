@@ -901,6 +901,87 @@ fn claim_investor_payout_non_participant_panics() {
     client.claim_investor_payout(&stranger);
 }
 
+/// `settle` with `maturity > 0` succeeds one ledger after the configured timestamp.
+#[test]
+fn settle_one_second_after_maturity_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    let maturity: u64 = 20_000;
+    client.init(
+        &admin,
+        &String::from_str(&env, "INV_MAT_004"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &maturity,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    fund_to_target(&client, &env);
+
+    // Advance ledger to one second after maturity
+    env.ledger().with_mut(|l| l.timestamp = maturity + 1);
+    let settled = client.settle();
+    assert_eq!(settled.status, 2, "settle after maturity must succeed");
+}
+
+/// `settle` must still succeed when ledger time is slightly ahead (clock skew).
+#[test]
+fn settle_with_ledger_clock_skew_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    let maturity: u64 = 20_000;
+    client.init(
+        &admin,
+        &String::from_str(&env, "INV_MAT_005"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &maturity,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    fund_to_target(&client, &env);
+
+    // Simulate clock skew: ledger time is 5 seconds ahead of maturity
+    env.ledger().with_mut(|l| l.timestamp = maturity + 5);
+    let settled = client.settle();
+    assert_eq!(settled.status, 2, "clock skew must not break settlement");
+}
+
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Terminal dust sweep
 // ──────────────────────────────────────────────────────────────────────────────
