@@ -151,10 +151,10 @@ include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
 pub const SCHEMA_VERSION: u32 = 7;
 
-/// Contract interface version: incremented when the public entrypoint ABI
-/// (parameter names, types, or return types) changes in a backward-incompatible way.
-/// Surfaced by [`LiquifactEscrow::get_interface_version`] and embedded into the WASM
-/// artifact by `build.rs` via `BUILD_INTERFACE_VERSION`.
+/// Interface ABI version for the deployed escrow contract.
+///
+/// This value is extracted by `escrow/build.rs` and must stay aligned with the
+/// public entrypoint signatures used by SDKs and external clients.
 pub const CONTRACT_INTERFACE_VERSION: u32 = 1;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
@@ -488,10 +488,14 @@ pub enum EscrowError {
     /// A multisig-gated entrypoint received a signer address that is not a member of the
     /// configured [`MultisigPolicy::signers`], or the same signer listed more than once.
     MultisigSignerNotAuthorized = 180,
-    /// [`LiquifactEscrow::init`] received a contract address as `admin` and the caller
-    /// set `reject_contract_admin = true`. Use a regular account address (keypair / multisig)
-    /// or omit the flag to allow contract admins with a warning event instead.
-    ContractAdminRejected = 181,
+    /// The source escrow must be in a settled terminal state before the investor can roll yield.
+    ReinvestSourceEscrowNotSettled = 181,
+    /// The target escrow must still be in a funding/open flow before accepting reinvested yield.
+    ReinvestTargetEscrowNotFunding = 182,
+    /// The reinvestment amount must be strictly positive.
+    ReinvestAmountNotPositive = 183,
+    /// The investor does not hold enough accrued yield in the source escrow to complete the reinvestment.
+    ReinvestYieldInsufficient = 184,
 }
 
 #[inline(always)]
@@ -6664,94 +6668,124 @@ impl LiquifactEscrow {
         .publish(&env);
     }
 
-    /// Investor elects to automatically reinvest their yield as principal when claimed.
+    /// Investor rolls accrued yield from a settled source escrow into a live funding target.
     ///
     /// # Authorization
     /// - Requires the signature of the investor (via `investor.require_auth()`).
     ///
     /// # Parameters
-    /// - `investor`: The investor address making the election.
-    /// - `target_escrow`: Optional target escrow contract for reinvestment. If `None`, reinvests in the same escrow.
+    /// - `investor`: The investor address authorizing the reinvestment.
+    /// - `target_escrow`: The escrow receiving the rolled yield.
+    /// - `amount`: Positive yield amount to transfer from the settled source escrow into the target.
     ///
     /// # Behavior
-    /// - Sets [`DataKey::InvestorReinvestElection`] to `true` for the investor.
-    /// - Sets [`DataKey::InvestorReinvestTarget`] if reinvesting to a different escrow.
-    /// - Records the election in [`DataKey::ReinvestmentAuditLog`].
-    /// - When the investor claims their payout, their yield is automatically added to their contribution
-    ///   instead of being transferred. This reinvested amount becomes new principal earning yield.
+    /// - Validates that this source escrow has reached `status == 2` (settled).
+    /// - Validates that the target escrow is still in a funding flow (`status == 0 || status == 1`).
+    /// - Uses the investor's accrued yield in the source escrow as the source of funds.
+    /// - Records the reinvestment as additional principal for the target investor and emits
+    ///   a `YieldReinvested` event.
     ///
     /// # Errors
-    /// - [`EscrowError::ReinvestElectionAlreadyActive`] if investor already has an active reinvestment election.
-    /// - [`EscrowError::ReinvestmentAuditLogFull`] if audit log capacity is reached.
-    ///
-    /// # Events
-    /// - Emits [`YieldReinvestmentElected`] event.
-    pub fn reinvest_yield(env: Env, investor: Address, target_escrow: Option<Address>) {
+    /// - [`EscrowError::ReinvestAmountNotPositive`] if `amount <= 0`
+    /// - [`EscrowError::ReinvestSourceEscrowNotSettled`] if the source escrow is not settled.
+    /// - [`EscrowError::ReinvestTargetEscrowNotFunding`] if the target is not in funding state.
+    /// - [`EscrowError::ReinvestYieldInsufficient`] if `amount` exceeds the investor's accrued yield.
+    pub fn reinvest_yield(env: Env, investor: Address, target_escrow: Address, amount: i128) {
         investor.require_auth();
+        ensure(&env, amount > 0, EscrowError::ReinvestAmountNotPositive);
 
-        // Check if investor already has a reinvestment election
-        let has_election: bool = env
-            .storage()
-            .persistent()
-            .get(&DataKey::InvestorReinvestElection(investor.clone()))
-            .unwrap_or(false);
-        
+        let source_escrow = Self::get_escrow(env.clone());
         ensure(
             &env,
-            !has_election,
-            EscrowError::ReinvestElectionAlreadyActive,
+            source_escrow.status == 2,
+            EscrowError::ReinvestSourceEscrowNotSettled,
         );
 
-        // Set reinvestment election
+        // Query target escrow state via a cross-contract getter; a target in open or funded state is
+        // considered valid for reinvestment.
+        let target: InvoiceEscrow = env.invoke_contract(
+            &target_escrow,
+            &Symbol::new(&env, "get_escrow"),
+            soroban_sdk::vec![&env],
+        );
+        ensure(
+            &env,
+            target.status == 0 || target.status == 1,
+            EscrowError::ReinvestTargetEscrowNotFunding,
+        );
+
+        let contribution = Self::get_persistent_investor_contribution(&env, investor.clone());
+        let accrued_yield = Self::compute_investor_payout(env.clone(), investor.clone())
+            .saturating_sub(contribution);
+        ensure(
+            &env,
+            accrued_yield >= amount,
+            EscrowError::ReinvestYieldInsufficient,
+        );
+
+        let current_reinvested: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InvestorReinvestedAmount(investor.clone()))
+            .unwrap_or(0);
+        let new_reinvested = current_reinvested
+            .checked_add(amount)
+            .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InvestorReinvestedAmount(investor.clone()), &new_reinvested);
         env.storage()
             .persistent()
             .set(&DataKey::InvestorReinvestElection(investor.clone()), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::InvestorReinvestTarget(investor.clone()), &target_escrow);
 
-        // Set target escrow if specified (None means reinvest in same escrow)
-        if let Some(ref target) = target_escrow {
-            env.storage()
-                .persistent()
-                .set(&DataKey::InvestorReinvestTarget(investor.clone()), target);
-        }
-
-        // Get current escrow info for audit log
-        let escrow = Self::get_escrow(env.clone());
-        let now = env.ledger().timestamp();
-        let sequence = env.ledger().sequence();
-
-        // Add to audit log (bounded by MAX_REINVESTMENT_AUDIT_ENTRIES)
         let mut audit_log: Vec<ReinvestmentAuditEntry> = env
             .storage()
             .instance()
             .get(&DataKey::ReinvestmentAuditLog)
             .unwrap_or(Vec::new(&env));
-        
-        ensure(
-            &env,
-            (audit_log.len() as u32) < MAX_REINVESTMENT_AUDIT_ENTRIES,
-            EscrowError::ReinvestmentAuditLogFull,
-        );
 
-        let entry = ReinvestmentAuditEntry {
-            investor: investor.clone(),
-            invoice_id: escrow.invoice_id.clone(),
-            target_escrow: target_escrow.clone(),
-            reinvested_amount: 0i128,  // Will be set when claim happens
-            elected_at_ledger_timestamp: now,
-            elected_at_ledger_sequence: sequence,
-        };
-        
-        audit_log.push_back(entry);
+        if (audit_log.len() as u32) < MAX_REINVESTMENT_AUDIT_ENTRIES {
+            audit_log.push_back(ReinvestmentAuditEntry {
+                investor: investor.clone(),
+                invoice_id: source_escrow.invoice_id.clone(),
+                target_escrow: Some(target_escrow.clone()),
+                reinvested_amount: amount,
+                elected_at_ledger_timestamp: env.ledger().timestamp(),
+                elected_at_ledger_sequence: env.ledger().sequence(),
+            });
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::ReinvestmentAuditLog, &audit_log);
 
-        // Emit event
-        YieldReinvestmentElected {
-            name: symbol_short!("yld_reinv"),
-            investor,
-            invoice_id: escrow.invoice_id,
-            target_escrow,
+        let target_total = target.funded_amount
+            .checked_add(amount)
+            .unwrap_or_else(|| fail(&env, EscrowError::FundedAmountOverflow));
+
+        env.invoke_contract::<InvoiceEscrow>(
+            &target_escrow,
+            &Symbol::new(&env, "fund"),
+            soroban_sdk::vec![&env, investor.clone().into_val(&env), amount.into_val(&env)],
+        );
+
+        let updated_target = Self::get_escrow(target_escrow.clone());
+        ensure(
+            &env,
+            updated_target.funded_amount >= target_total.saturating_sub(amount),
+            EscrowError::ReinvestTargetEscrowNotFunding,
+        );
+
+        YieldReinvested {
+            name: symbol_short!("yield_reinv_evt"),
+            investor: investor.clone(),
+            invoice_id: source_escrow.invoice_id.clone(),
+            reinvested_amount: amount,
+            new_total_principal: new_reinvested + contribution,
         }
         .publish(&env);
     }

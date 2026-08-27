@@ -191,6 +191,47 @@ fn test_repeated_funding_accumulates_contribution() {
 
 #[test]
 #[should_panic]
+fn test_reinvest_yield_rejects_target_not_in_funding_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (source_client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+    default_init(&source_client, &env, &admin, &sme);
+
+    let target = Address::generate(&env);
+    let target_client = deploy(&env);
+    let target_admin = Address::generate(&env);
+    let target_sme = Address::generate(&env);
+    target_client.init(
+        &target_admin,
+        &String::from_str(&env, "TARGET_ESCROW"),
+        &target_sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+    source_client.fund(&investor, &TARGET);
+    source_client.settle();
+
+    let settled = source_client.get_escrow();
+    assert_eq!(settled.status, 2u32);
+
+    source_client.reinvest_yield(&investor, &target, &1_000i128);
+}
+
+#[test]
+#[should_panic]
 fn test_funding_amount_accumulation_overflow_panics() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
