@@ -18,6 +18,88 @@ impl MockToken {
     }
 }
 
+#[contract]
+pub struct RegistryIntegrationMock;
+
+#[contractimpl]
+impl RegistryIntegrationMock {
+    pub fn register_escrow(env: Env, invoice_id: Symbol, escrow_address: Address) {
+        env.storage().persistent().set(&invoice_id, &escrow_address);
+    }
+
+    pub fn get_escrow(env: Env, invoice_id: Symbol) -> Option<Address> {
+        env.storage().persistent().get(&invoice_id)
+    }
+}
+
+#[contract]
+pub struct FailingRegistryMock;
+
+#[contractimpl]
+impl FailingRegistryMock {
+    pub fn register_escrow(_env: Env, _invoice_id: Symbol, _escrow_address: Address) {
+        panic!("registry unavailable")
+    }
+}
+
+fn init_for_registry_test(
+    env: &Env,
+    client: &LiquifactEscrowClient<'_>,
+    admin: &Address,
+    registry: Option<Address>,
+) {
+    let token = install_stellar_asset_token(env);
+    let treasury = Address::generate(env);
+    let sme = Address::generate(env);
+    client.init(
+        admin,
+        &soroban_sdk::String::from_str(env, "REGISTRY_TEST"),
+        &sme,
+        &1_000i128,
+        &800i64,
+        &0u64,
+        &token.id,
+        &registry,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+}
+
+#[test]
+fn test_register_with_registry_calls_registration_function() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let registry = env.register(RegistryIntegrationMock, ());
+    init_for_registry_test(&env, &client, &admin, Some(registry.clone()));
+
+    assert!(client.register_with_registry());
+    let invoice_id = client.get_escrow().invoice_id;
+    let registry_client = RegistryIntegrationMockClient::new(&env, &registry);
+    assert_eq!(registry_client.get_escrow(&invoice_id), Some(client.address.clone()));
+}
+
+#[test]
+fn test_register_with_registry_failure_is_non_blocking_and_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let registry = env.register(FailingRegistryMock, ());
+    init_for_registry_test(&env, &client, &admin, Some(registry));
+
+    assert!(!client.register_with_registry());
+    assert!(env.events().all().events().len() >= 2);
+}
+
 /// **MID-FLOW LEGAL HOLD INTEGRATION TEST (USER-EXPERIENCE NARRATIVE)**
 ///
 /// What a user sees:

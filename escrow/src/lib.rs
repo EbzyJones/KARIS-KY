@@ -1083,6 +1083,16 @@ pub struct EscrowInitialized {
 }
 
 #[contractevent]
+pub struct RegistryRegistrationAttempted {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub registry: Option<Address>,
+    pub successful: bool,
+}
+
+#[contractevent]
 pub struct MaxUniqueInvestorsCapLowered {
     #[topic]
     pub name: Symbol,
@@ -2509,28 +2519,31 @@ impl LiquifactEscrow {
         env.storage().instance().get(&DataKey::RegistryRef)
     }
 
-    /// Returns the optional yield-bearing token bound at [`LiquifactEscrow::init`]
-    /// ([`DataKey::YieldToken`]), or [`None`] when unset.
-    pub fn get_yield_token(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::YieldToken)
-    }
+    /// Best-effort registration with the immutable registry configured at init.
+    ///
+    /// Only the escrow admin may invoke this entrypoint. Registry failures are recorded in an
+    /// event and return `false`; they never revert the escrow transaction.
+    pub fn register_with_registry(env: Env) -> bool {
+        let escrow = Self::load_escrow_require_admin(&env);
+        let registry = Self::get_registry_ref(env.clone());
+        let successful = registry.as_ref().is_some_and(|registry| {
+            crate::external_calls::register_escrow_with_registry(
+                &env,
+                registry,
+                escrow.invoice_id.clone(),
+                env.current_contract_address(),
+            )
+        });
 
-    /// Returns the optional oracle contract bound at [`LiquifactEscrow::init`]
-    /// ([`DataKey::OracleContract`]), or [`None`] when unset.
-    pub fn get_oracle_contract(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::OracleContract)
-    }
+        RegistryRegistrationAttempted {
+            name: symbol_short!("reg_attempt"),
+            invoice_id: escrow.invoice_id,
+            registry,
+            successful,
+        }
+        .publish(&env);
 
-    /// Returns the optional NFT contract bound at [`LiquifactEscrow::init`]
-    /// ([`DataKey::NftContract`]), or [`None`] when unset.
-    pub fn get_nft_contract(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::NftContract)
-    }
-
-    /// Returns the ledger timestamp recorded at [`LiquifactEscrow::init`] ([`DataKey::CreatedAt`]).
-    /// Returns `0` for escrows that predate this storage key.
-    pub fn get_created_at(env: Env) -> u64 {
-        env.storage().instance().get(&DataKey::CreatedAt).unwrap_or(0)
+        successful
     }
 
     /// Returns the cached token metadata (decimals, cache timestamp, cache sequence).
