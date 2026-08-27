@@ -1313,4 +1313,192 @@ fn test_fee_on_transfer_token_rejected() {
 
     client.fund(&investor, &target);
     panic!("Funding should have been rejected for fee-on-transfer token");
+
+}
+
+// ============================================================================
+// TIER BOUNDARY TESTS — fund_with_commitment tier selection (Issue #412)
+// ============================================================================
+
+/// Tests tier selection boundaries for fund_with_commitment
+///
+/// Verifies correct tier is selected at:
+/// - Just below each boundary → should NOT get the higher tier
+/// - Exactly at each boundary → should get the higher tier
+/// - Just above each boundary → should get the higher tier
+#[test]
+fn test_fund_with_commitment_tier_boundaries() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, sme) = setup(&env);
+    let (funding_token, treasury) = free_addresses(&env);
+
+    const BASE_UNIT: i128 = 10_000_000; // USDC-like 7 decimals
+    const TARGET: i128 = 30_000 * BASE_UNIT;
+    const BASE_YIELD_BPS: i64 = 800; // 8% base yield
+
+    // Define yield tiers (same as in the gold-standard test)
+    // Tier 1: 90 days → 10%
+    // Tier 2: 180 days → 12%
+    // Tier 3: 365 days → 15%
+    let day = 24 * 60 * 60; // seconds in a day
+    let yield_tiers = SorobanVec::from_array(
+        &env,
+        [
+            YieldTier {
+                min_lock_secs: 90 * day,
+                yield_bps: 1000,
+            },
+            YieldTier {
+                min_lock_secs: 180 * day,
+                yield_bps: 1200,
+            },
+            YieldTier {
+                min_lock_secs: 365 * day,
+                yield_bps: 1500,
+            },
+        ],
+    );
+
+    // Initialize escrow with tiered yield
+    client.init(
+        &admin,
+        &String::from_str(&env, "TIER_BOUNDARY_001"),
+        &sme,
+        &TARGET,
+        &BASE_YIELD_BPS,
+        &0, // No maturity lock for testing
+        &funding_token,
+        &None,
+        &treasury,
+        &Some(yield_tiers),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // ---- Helper: fund with commitment and verify yield ----
+    fn test_lock_period(
+        env: &Env,
+        client: &LiquifactEscrowClient,
+        lock_secs: u64,
+        expected_yield: i64,
+        description: &str,
+    ) {
+        let investor = Address::generate(env);
+        let amount = 1_000 * 10_000_000; // 1,000 USDC
+        client.fund_with_commitment(&investor, &amount, &lock_secs);
+        let actual_yield = client.get_investor_yield_bps(&investor);
+        assert_eq!(
+            actual_yield, expected_yield,
+            "{}: expected {} bps, got {} bps for lock {}s",
+            description, expected_yield, actual_yield, lock_secs
+        );
+    }
+
+    // ---- Test Tier 1 Boundary (90 days) ----
+    let day_secs = 24 * 60 * 60;
+    let tier1_boundary = 90 * day_secs;
+
+    test_lock_period(
+        &env,
+        &client,
+        tier1_boundary - 1, // 89 days, 23h 59m 59s
+        BASE_YIELD_BPS,
+        "Just below Tier 1",
+    );
+
+    test_lock_period(
+        &env,
+        &client,
+        tier1_boundary, // 90 days exactly
+        1000,
+        "Exactly Tier 1",
+    );
+
+    test_lock_period(
+        &env,
+        &client,
+        tier1_boundary + 1, // 90 days + 1 second
+        1000,
+        "Just above Tier 1",
+    );
+
+    // ---- Test Tier 2 Boundary (180 days) ----
+    let tier2_boundary = 180 * day_secs;
+
+    test_lock_period(
+        &env,
+        &client,
+        tier2_boundary - 1, // 179 days, 23h 59m 59s
+        1000, // Should still be Tier 1 (10%)
+        "Just below Tier 2",
+    );
+
+    test_lock_period(
+        &env,
+        &client,
+        tier2_boundary, // 180 days exactly
+        1200,
+        "Exactly Tier 2",
+    );
+
+    test_lock_period(
+        &env,
+        &client,
+        tier2_boundary + 1, // 180 days + 1 second
+        1200,
+        "Just above Tier 2",
+    );
+
+    // ---- Test Tier 3 Boundary (365 days) ----
+    let tier3_boundary = 365 * day_secs;
+
+    test_lock_period(
+        &env,
+        &client,
+        tier3_boundary - 1, // 364 days, 23h 59m 59s
+        1200, // Should still be Tier 2 (12%)
+        "Just below Tier 3",
+    );
+
+    test_lock_period(
+        &env,
+        &client,
+        tier3_boundary, // 365 days exactly
+        1500,
+        "Exactly Tier 3",
+    );
+
+    test_lock_period(
+        &env,
+        &client,
+        tier3_boundary + 1, // 365 days + 1 second
+        1500,
+        "Just above Tier 3",
+    );
+
+    // ---- Edge Cases ----
+    // Test with 0 lock (should use base yield)
+    test_lock_period(
+        &env,
+        &client,
+        0,
+        BASE_YIELD_BPS,
+        "Zero lock period (base yield)",
+    );
+
+    // Test with very large lock (should still be Tier 3 max)
+    test_lock_period(
+        &env,
+        &client,
+        1000 * day_secs, // 1000 days
+        1500,
+        "Very large lock period (capped at Tier 3)",
+    );
 }
