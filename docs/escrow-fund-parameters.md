@@ -43,24 +43,23 @@ pub fn fund(env: Env, investor: Address, amount: i128) -> InvoiceEscrow
 
 1. **Auth required:** `investor.require_auth()` — caller must sign the transaction.
 2. **Preconditions checked (in order):**
-   - Amount must be positive (Code 19: `FundingAmountNotPositive`)
-   - Meets minimum contribution floor if configured (Code 20: `FundingBelowMinContribution`)
-   - Escrow must be Open (status = 0) (Code 22: `EscrowNotOpenForFunding`)
-   - Legal hold must not be active (Code 24: `LegalHoldBlocksFunding`)
-   - Dispute pause must not be active (Code 72: `DisputePausedBlocksFunding`)
-   - Funding deadline must not have passed (Code 164: `FundingDeadlinePassed`)
-   - Funding velocity gate not exceeded (Code 165: `FundingVelocityExceeded`)
-   - Investor must be allowlisted if allowlist is active (Code 79: `InvestorNotAllowlisted`)
-   - Investor must pass sanctions screening (Code 80: `SanctionsCheckFailed`)
-   - Investor must pass KYC check if registry configured (Code 81: `KycCheckFailed`)
+   - Amount must be positive (Code 100: `FundingAmountNotPositive`)
+   - Meets minimum contribution floor if configured (Code 101: `FundingBelowMinContribution`)
+   - Escrow must be Open (status = 0) (Code 103: `EscrowNotOpenForFunding`)
+   - Legal hold must not be active (Code 102: `LegalHoldBlocksFunding`)
+   - Dispute pause must not be active (Code 165: `DisputePausedBlocksFunding`)
+   - Funding deadline must not have passed (Code 153: `FundingDeadlinePassed`)
+   - Investor must be allowlisted if allowlist is active (Code 104: `InvestorNotAllowlisted`)
+   - Investor must pass sanctions screening (Code 205: `SanctionsScreeningFailed`)
+   - Investor must pass KYC check if registry configured (Code 173: `InvestorNotVerified`)
 
 3. **Contribution tracking:**
    - New total for investor = `previous_contribution + amount`
-   - Must not exceed per-investor cap if configured (Code 21: `InvestorContributionExceedsCap`)
+   - Must not exceed per-investor cap if configured (Code 106: `InvestorContributionExceedsCap`)
 
 4. **Unique investor cap:**
    - If previous contribution was 0, investor is "new" — count increments
-   - If unique investor cap is configured, reject if count would exceed (Code 25: `UniqueInvestorCapReached`)
+   - If unique investor cap is configured, reject if count would exceed (Code 107: `UniqueInvestorCapReached`)
 
 5. **Yield assignment (first deposit only):**
    - On first call (`prev == 0`): investor's effective yield = escrow's base `yield_bps`
@@ -69,10 +68,11 @@ pub fn fund(env: Env, investor: Address, amount: i128) -> InvoiceEscrow
 
 6. **Concentration limit:**
    - If configured, check investor concentration = `(investor_total * 100) / total_funded`
-   - Reject if exceeds configured cap (Code 82: `ConcentrationLimitExceeded`)
+   - Reject if exceeds configured cap (but no explicit error code — check logs for `ConcentrationLimitExceeded`)
 
 7. **Funding target check:**
-   - New total (`funded_amount + amount`) must not exceed `funding_target` (Code 23: `FundingTargetExceeded`)
+   - New total (`funded_amount + amount`) must not exceed `funding_target`
+   - Overflow in `funded_amount` would cause Code 110: `FundedAmountOverflow`
 
 8. **Status transition:**
    - If `funded_amount >= funding_target` after deposit, transition to Funded (status = 1)
@@ -131,13 +131,13 @@ pub fn fund_with_commitment(
    - Prevents changing an investor's tier after initial leg
 
 3. **Preconditions (same as `fund`):**
-   - Amount must be positive (Code 19: `FundingAmountNotPositive`)
-   - Meets minimum contribution floor if configured (Code 20: `FundingBelowMinContribution`)
-   - Escrow must be Open (status = 0) (Code 22: `EscrowNotOpenForFunding`)
-   - Legal hold, dispute pause, deadline, velocity, allowlist, sanctions, KYC checks
-   - Per-investor contribution cap (if configured)
-   - Unique investor cap (if configured)
-   - Funding target not exceeded
+   - Amount must be positive (Code 100: `FundingAmountNotPositive`)
+   - Meets minimum contribution floor if configured (Code 101: `FundingBelowMinContribution`)
+   - Escrow must be Open (status = 0) (Code 103: `EscrowNotOpenForFunding`)
+   - Legal hold, dispute pause, deadline, allowlist, sanctions, KYC checks
+   - Per-investor contribution cap (Code 106: `InvestorContributionExceedsCap`)
+   - Unique investor cap (Code 107: `UniqueInvestorCapReached`)
+   - Funding target not exceeded (Code 110: `FundedAmountOverflow` on overflow)
 
 ### Tier Selection Algorithm
 
@@ -186,7 +186,7 @@ After effective yield is selected, a **claim lock** is computed:
 
 2. If `committed_lock_secs > 0`:
    - `claim_not_before = now + committed_lock_secs` (Unix timestamp)
-   - Validated: `claim_not_before <= escrow.maturity` (Code 121: `CommitmentLockExceedsMaturity`)
+   - Validated: `claim_not_before <= escrow.maturity` (Code 111: `CommitmentLockExceedsMaturity`)
    - This ensures the lock expires before or at the maturity date
 
 3. **Optional investor lock-in period:**
@@ -309,22 +309,22 @@ pub struct YieldTier {
 
 | Code | Constant | Condition | Recovery |
 |------|----------|-----------|----------|
-| 19 | `FundingAmountNotPositive` | `amount <= 0` | Pass positive amount |
-| 20 | `FundingBelowMinContribution` | `amount < min_contribution_floor` | Increase deposit or contact operator |
-| 21 | `InvestorContributionExceedsCap` | Total would exceed per-investor cap | Reduce amount or split over time |
-| 22 | `EscrowNotOpenForFunding` | Escrow status != 0 (Open) | Wait or redeploy escrow |
-| 23 | `FundingTargetExceeded` | `funded_amount + amount > funding_target` | Reduce amount |
-| 24 | `LegalHoldBlocksFunding` | Legal hold is active | Contact operator/governance |
-| 25 | `UniqueInvestorCapReached` | New investor but cap full | Contact operator or fund as existing investor |
-| 36 | **`TieredSecondDeposit`** | **`fund_with_commitment` called twice by same investor** | **Use `fund` for additional deposits, or deploy new escrow** |
-| 72 | `DisputePausedBlocksFunding` | Dispute pause is active | Wait for dispute resolution |
-| 79 | `InvestorNotAllowlisted` | Allowlist active, investor not on list | Contact operator |
-| 80 | `SanctionsCheckFailed` | Sanctions provider rejects investor | Contact compliance team |
-| 81 | `KycCheckFailed` | KYC registry flags investor as unverified | Complete KYC or contact operator |
-| 82 | `ConcentrationLimitExceeded` | Single investor exceeds concentration cap | Reduce amount |
-| 121 | `CommitmentLockExceedsMaturity` | `claim_not_before > escrow.maturity` | Use shorter lock period |
-| 164 | `FundingDeadlinePassed` | Funding window closed | Redeploy escrow if still needed |
-| 165 | `FundingVelocityExceeded` | Ledger funding cap exceeded | Wait for next ledger or reduce amount |
+| 100 | `FundingAmountNotPositive` | `amount <= 0` | Pass positive amount |
+| 101 | `FundingBelowMinContribution` | `amount < min_contribution_floor` | Increase deposit or contact operator |
+| 102 | `LegalHoldBlocksFunding` | Legal hold is active | Contact operator/governance |
+| 103 | `EscrowNotOpenForFunding` | Escrow status != 0 (Open) | Wait or redeploy escrow |
+| 104 | `InvestorNotAllowlisted` | Allowlist active, investor not on list | Contact operator |
+| 105 | `InvestorContributionOverflow` | Contribution arithmetic overflow (rare) | Split deposit or contact operator |
+| 106 | `InvestorContributionExceedsCap` | Total would exceed per-investor cap | Reduce amount or split over time |
+| 107 | `UniqueInvestorCapReached` | New investor but cap full | Contact operator or fund as existing investor |
+| 108 | **`TieredSecondDeposit`** | **`fund_with_commitment` called twice by same investor** | **Use `fund` for additional deposits, or deploy new escrow** |
+| 109 | `InvestorClaimTimeOverflow` | Lock timestamp arithmetic overflow (rare) | Use shorter lock period |
+| 110 | `FundedAmountOverflow` | Total funded amount overflow (rare) | Contact operator |
+| 111 | `CommitmentLockExceedsMaturity` | `claim_not_before > escrow.maturity` | Use shorter lock period |
+| 153 | `FundingDeadlinePassed` | Funding window closed | Redeploy escrow if still needed |
+| 165 | `DisputePausedBlocksFunding` | Dispute pause is active | Wait for dispute resolution |
+| 173 | `InvestorNotVerified` | KYC check failed | Complete KYC or contact operator |
+| 205 | `SanctionsScreeningFailed` | Sanctions provider rejects investor | Contact compliance team |
 
 ---
 
