@@ -58,10 +58,12 @@ mod init;
 mod integration;
 mod legal_hold;
 mod properties;
+mod properties_funding;
 mod secure_rng;
 mod settlement;
 mod tokenomics;
 mod upgrade_compat;
+mod yield_distribution;
 
 /// Registers a new escrow contract instance and returns its contract id.
 pub fn deploy_id(env: &Env) -> Address {
@@ -141,8 +143,11 @@ pub fn default_init(client: &LiquifactEscrowClient<'_>, env: &Env, admin: &Addre
         &None,
         &None,
         &None,
+        &None, // No max funding rate
         &None, // No yield slippage threshold
         &None, // No settlement notifier
+        &None, // No KYC provider
+        &None, // No admin roles
     );
 }
 

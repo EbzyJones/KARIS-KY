@@ -108,7 +108,7 @@ fn typed_error_codes_cover_allowlist_attestation_and_dust_guards() {
         EscrowError::InvestorNotAllowlisted,
     );
 
-    let digest = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    let digest = soroban_sdk::Bytes::from_array(&env, &[1u8; 32]);
     client.bind_primary_attestation_hash(&digest);
     assert_contract_error(
         client.try_bind_primary_attestation_hash(&digest),
@@ -404,9 +404,9 @@ fn typed_error_codes_cover_range_boundaries() {
         &None,
     );
     let digest = BytesN::from_array(&env, &[1u8; 32]);
-    attest_client.bind_primary_attestation_hash(&digest);
+    attest_client.bind_primary_attestation_hash(&soroban_sdk::Bytes::from_array(&env, &[1u8; 32]));
     assert_contract_error(
-        attest_client.try_bind_primary_attestation_hash(&digest),
+        attest_client.try_bind_primary_attestation_hash(&soroban_sdk::Bytes::from_array(&env, &[1u8; 32])),
         EscrowError::PrimaryAttestationAlreadyBound,
     );
     for i in 0u8..MAX_ATTESTATION_APPEND_ENTRIES as u8 {
@@ -1143,11 +1143,14 @@ fn test_attestations_happy_path() {
         &None,
     );
 
-    let hash1 = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    let hash1 = soroban_sdk::Bytes::from_array(&env, &[1u8; 32]);
     let hash2 = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
 
     client.bind_primary_attestation_hash(&hash1);
-    assert_eq!(client.get_primary_attestation_hash(), Some(hash1.clone()));
+    assert_eq!(
+        client.get_primary_attestation_hash(),
+        Some(soroban_sdk::BytesN::from_array(&env, &[1u8; 32]))
+    );
 
     client.append_attestation_digest(&symbol_short!(""), &hash2);
     let log = client.get_attestation_append_log();
@@ -1182,7 +1185,7 @@ fn test_bind_primary_attestation_twice() {
         &None,
     );
 
-    let hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    let hash = soroban_sdk::Bytes::from_array(&env, &[1u8; 32]);
     client.bind_primary_attestation_hash(&hash);
     client.bind_primary_attestation_hash(&hash);
 }
@@ -1291,6 +1294,85 @@ fn test_sweep_terminal_dust_happy_path() {
 }
 
 #[test]
+fn test_sweep_terminal_dust_handles_one_unit_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let token = crate::tests::install_stellar_asset_token(&env);
+    let treasury = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "T1"),
+        &sme,
+        &100,
+        &10,
+        &10,
+        &token.id,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.fund(&Address::generate(&env), &100);
+    env.ledger().with_mut(|li| li.timestamp = 200);
+    client.settle();
+
+    token.stellar.mint(&client.address, &1);
+
+    let swept = client.sweep_terminal_dust(&1);
+    assert_eq!(swept, 1);
+    assert_eq!(token.token.balance(&treasury), 1);
+}
+
+#[test]
+fn test_sweep_terminal_dust_handles_sub_cap_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let token = crate::tests::install_stellar_asset_token(&env);
+    let treasury = Address::generate(&env);
+    let dust_amount = MAX_DUST_SWEEP_AMOUNT - 1;
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "T2"),
+        &sme,
+        &100,
+        &10,
+        &10,
+        &token.id,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.fund(&Address::generate(&env), &100);
+    env.ledger().with_mut(|li| li.timestamp = 200);
+    client.settle();
+
+    token.stellar.mint(&client.address, &dust_amount);
+
+    let swept = client.sweep_terminal_dust(&dust_amount);
+    assert_eq!(swept, dust_amount);
+    assert_eq!(token.token.balance(&treasury), dust_amount);
+}
+
+#[test]
 fn test_bump_ttl_covers_persistent_investor_keys() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1325,6 +1407,77 @@ fn test_bump_ttl_covers_persistent_investor_keys() {
     let mut investors = SorobanVec::new(&env);
     investors.push_back(investor);
     client.bump_ttl(&investors);
+}
+
+#[test]
+fn test_bump_ttl_accepts_empty_batch_instance_only() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let (funding_token, treasury) = free_addresses(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "TTL002"),
+        &sme,
+        &100,
+        &10,
+        &0,
+        &funding_token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // An empty `allowlisted` vector is valid: it still extends the instance TTL,
+    // it just skips the per-investor persistent-key loop.
+    let empty: SorobanVec<Address> = SorobanVec::new(&env);
+    client.bump_ttl(&empty);
+}
+
+#[test]
+fn test_bump_ttl_rejects_batch_over_max() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let (funding_token, treasury) = free_addresses(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "TTL003"),
+        &sme,
+        &100,
+        &10,
+        &0,
+        &funding_token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let mut too_many: SorobanVec<Address> = SorobanVec::new(&env);
+    for _ in 0..=crate::MAX_TTL_BUMP_BATCH {
+        too_many.push_back(Address::generate(&env));
+    }
+
+    assert_contract_error(
+        client.try_bump_ttl(&too_many),
+        EscrowError::TtlBumpBatchTooLarge,
+    );
 }
 
 #[test]
@@ -1670,7 +1823,10 @@ fn test_sme_collateral_replacement_preserves_prior_amount() {
 
     let second = client.record_sme_collateral_commitment(&asset, &7000);
     assert_eq!(second.amount, 7000);
-    assert_eq!(second.recorded_at, 20000);
+    // recorded_at is preserved from the original write (setup sets timestamp=12345).
+    assert_eq!(second.recorded_at, 12345);
+    // updated_at reflects the most recent write timestamp.
+    assert_eq!(second.updated_at, 20000);
 
     let stored = client.get_sme_collateral_commitment().unwrap();
     assert_eq!(stored.amount, 7000);
