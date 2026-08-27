@@ -119,8 +119,7 @@ use alloc::format;
 use core::{clone::Clone, default::Default};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
-    symbol_short, token::TokenClient, Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol,
-    Vec,
+    symbol_short, token::TokenClient, Address, Bytes, BytesN, Env, Executable, String, Symbol, Vec,
 };
 
 pub mod external_calls;
@@ -152,14 +151,11 @@ include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
 pub const SCHEMA_VERSION: u32 = 7;
 
-/// Contract entrypoint interface version, distinct from [`SCHEMA_VERSION`]:
-///
-/// - [`SCHEMA_VERSION`] tracks the on-chain storage layout (XDR structs, `DataKey` variants).
-/// - `CONTRACT_INTERFACE_VERSION` tracks the **public entrypoint surface** (function names,
-///   parameter lists, return types, event shapes).
-///
-/// See `docs/escrow-interface-versioning.md` for the full policy and examples.
-pub const CONTRACT_INTERFACE_VERSION: u32 = 2;
+/// Contract interface version: incremented when the public entrypoint ABI
+/// (parameter names, types, or return types) changes in a backward-incompatible way.
+/// Surfaced by [`LiquifactEscrow::get_interface_version`] and embedded into the WASM
+/// artifact by `build.rs` via `BUILD_INTERFACE_VERSION`.
+pub const CONTRACT_INTERFACE_VERSION: u32 = 1;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
@@ -492,10 +488,10 @@ pub enum EscrowError {
     /// A multisig-gated entrypoint received a signer address that is not a member of the
     /// configured [`MultisigPolicy::signers`], or the same signer listed more than once.
     MultisigSignerNotAuthorized = 180,
-      /// Funding would exceed the configured `funding_target`.
-    FundingTargetExceeded = 181,
-      /// Invariant violation: `funded_amount > funding_target` detected.
-    InvariantViolation = 182,
+    /// [`LiquifactEscrow::init`] received a contract address as `admin` and the caller
+    /// set `reject_contract_admin = true`. Use a regular account address (keypair / multisig)
+    /// or omit the flag to allow contract admins with a warning event instead.
+    ContractAdminRejected = 181,
 }
 
 #[inline(always)]
@@ -653,93 +649,6 @@ pub enum DataKey {
     /// Flag indicating whether automatic yield distribution snapshots are enabled for this escrow.
     /// Absent ⇒ false (default off, backwards-compatible). Set during [`LiquifactEscrow::init`].
     YieldAutoDistributionEnabled,
-    /// Ledger timestamp recorded at [`LiquifactEscrow::init`]. Immutable thereafter.
-    CreatedAt,
-    /// Running total funded within the current ledger, used for rate-limiting. Absent ⇒ `0`.
-    CurrentLedgerFunded,
-    /// Ledger sequence number of the last successful `fund` / `fund_with_commitment` call.
-    /// Used together with [`DataKey::CurrentLedgerFunded`] to reset the per-ledger funding rate window.
-    LastFundLedger,
-    /// Optional cap on principal funded within a single ledger (rate limiting). Absent ⇒ unlimited.
-    MaxFundingRate,
-    /// When true, `fund` and `fund_with_commitment` are blocked (operational pause, distinct from legal hold).
-    /// Absent ⇒ `false`.
-    EscrowPaused,
-    /// When true, only `fund` / `fund_with_commitment` are blocked; other operations proceed.
-    /// Absent ⇒ `false`. Cleared via [`LiquifactEscrow::clear_funding_pause`].
-    FundingPaused,
-    /// Optional protocol fee percentage (bps) deducted from yield at settlement. Absent ⇒ no fee.
-    FeePercentage,
-    /// Optional yield-claim slippage/deviation threshold; guards against unexpected yield changes.
-    /// Absent ⇒ disabled (no slippage check).
-    YieldSlippageThreshold,
-    /// Optional yield-bearing token address, distinct from the funding token. Absent ⇒ unset.
-    YieldToken,
-    /// Optional NFT contract minted/burned alongside settlement lifecycle events. Absent ⇒ unset.
-    NftContract,
-    /// Optional oracle contract consulted for external pricing/verification. Absent ⇒ unset.
-    OracleContract,
-    /// Optional external contract notified on settlement finalization. Absent ⇒ no notification sent.
-    SettlementNotifierContract,
-    /// Optional NFT token id minted for the settled escrow. Absent ⇒ no settlement NFT.
-    SettlementNft,
-    /// Optional KYC provider contract consulted before permitting an investor to fund.
-    /// Absent ⇒ no KYC gating.
-    KycProviderContract,
-    /// Optional sanctions-screening provider contract consulted before permitting an investor to fund.
-    /// Absent ⇒ no sanctions screening.
-    SanctionsProvider,
-    /// Cached SEP-41 token metadata (decimals, symbol) captured at [`LiquifactEscrow::init`] to avoid
-    /// repeated cross-contract calls.
-    TokenMetadataCache,
-    /// Tiered [`AdminRole`] assignments keyed by address hash bucket. Absent ⇒ only the single
-    /// [`InvoiceEscrow::admin`] has (implicit `Full`) privileges. See [`LiquifactEscrow::set_admin_roles`].
-    AdminRoles,
-    /// Configured [`MultisigPolicy`] gating critical operations. Absent ⇒ no policy configured.
-    MultisigPolicy,
-    /// Optional per-investor lock-in duration (seconds) applied on first deposit. Absent ⇒ no lock-in.
-    InvestorLockInSecs,
-    /// Per-investor ledger timestamp before which [`LiquifactEscrow::claim_investor_payout`] style
-    /// lock-in withdrawal restrictions apply. **Persistent** storage. Absent ⇒ `0`.
-    InvestorLockInUntil(Address),
-    /// Count of distinct investor addresses recorded via [`DataKey::InvestorIndex`]. Absent ⇒ `0`.
-    InvestorCount,
-    /// Enumerable investor address recorded at a given index (0-based, insertion order).
-    /// **Persistent** storage. Populated alongside [`DataKey::InvestorCount`].
-    InvestorIndex(u32),
-    /// Sharded aggregate of investor contributions for a given bucket
-    /// (see [`INVESTOR_BUCKET_COUNT`]). Absent ⇒ `0`.
-    InvestorContributionBucket(u32),
-    /// Optional cap on the concentration (bps of funding target) a single investor may hold.
-    /// Absent ⇒ unlimited.
-    MaxInvestorConcentration,
-    /// Append-only history of an investor's funding checkpoints, bounded by
-    /// [`MAX_INVESTOR_HISTORY_ENTRIES`]. **Persistent** storage. Absent ⇒ empty history.
-    InvestorFundingHistory(Address),
-    /// Optional delegate address authorized to claim yield on an investor's behalf.
-    /// **Persistent** storage. Absent ⇒ no delegate.
-    YieldClaimDelegate(Address),
-    /// Set to `true` once a [`DataKey::YieldClaimDelegate`] has been revoked for this investor.
-    /// **Persistent** storage. Absent ⇒ `false`.
-    YieldClaimDelegateRevoked(Address),
-    /// Optional free-text reason recorded alongside [`DataKey::LegalHold`]. Absent ⇒ no reason given.
-    LegalHoldReason,
-    /// Merkle root committed at funding close for off-chain investor-set verification.
-    /// Absent ⇒ not computed for this escrow.
-    FundingCloseMerkleRoot,
-    /// Audit trail of `(version, ledger_timestamp)` pairs recorded on [`LiquifactEscrow::init`] and
-    /// each successful [`LiquifactEscrow::migrate`]. Absent ⇒ empty history.
-    VersionHistory,
-    /// Individual entry in the bounded attestation append log (see [`MAX_ATTESTATION_APPEND_ENTRIES`]).
-    /// Indexed `0..count`; superseding the legacy [`DataKey::AttestationAppendLog`] vector encoding.
-    AttestationLogEntry(u32),
-    /// Number of entries written to [`DataKey::AttestationLogEntry`]. Absent ⇒ `0`.
-    AttestationAppendLogCount,
-    /// Ledger timestamp recorded for a given [`DataKey::AttestationLogEntry`] index.
-    AttestationTimestamp(u32),
-    /// Optional caller-supplied tag recorded for a given [`DataKey::AttestationLogEntry`] index.
-    /// Absent ⇒ no tag was supplied.
-    AttestationTag(u32),
 }
 
 // --- Data types ---
@@ -1291,6 +1200,25 @@ pub struct AdminProposedEvent {
     pub invoice_id: Symbol,
     pub current_admin: Address,
     pub pending_admin: Address,
+}
+
+/// Emitted by [`LiquifactEscrow::init`] when the supplied `admin` address resolves to a
+/// deployed contract rather than a regular account (keypair).
+///
+/// A contract admin is not inherently unsafe — it is the standard pattern for multisig and
+/// DAO governance — but it widens the attack surface compared to a simple account. Indexers
+/// and monitoring tools should surface this event to operators for manual review.
+///
+/// If the caller passed `reject_contract_admin = Some(true)`, [`LiquifactEscrow::init`] fails
+/// with [`EscrowError::ContractAdminRejected`] (code 181) **instead** of emitting this event.
+#[contractevent]
+pub struct AdminIsContractWarning {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// The contract address that was supplied as `admin`.
+    pub admin: Address,
 }
 
 #[contractevent]
@@ -2321,8 +2249,41 @@ impl LiquifactEscrow {
         settlement_notifier_contract: Option<Address>,
         kyc_provider_contract: Option<Address>,
         admin_roles: Option<Vec<(Address, AdminRole)>>,
+        reject_contract_admin: Option<bool>,
     ) -> InvoiceEscrow {
         admin.require_auth();
+
+        // ── Contract-admin detection ──────────────────────────────────────────
+        // A contract address as admin is legitimate (multisig, DAO timelock) but
+        // widens the attack surface relative to a plain account. Detect it via
+        // Address::executable(): Account ⇒ None or Executable::Account,
+        // deployed contract ⇒ Executable::Wasm(_) or Executable::StellarAsset.
+        //
+        // If reject_contract_admin = Some(true) the call fails immediately.
+        // Otherwise we emit AdminIsContractWarning so indexers can surface it.
+        //
+        // NOTE: executable() returns None when the address does not yet exist on
+        // the ledger (e.g. a pre-funded account that has not been activated, or a
+        // contract not yet deployed). We conservatively treat None as non-contract
+        // so legitimate accounts that are merely unfunded are not falsely warned.
+        let admin_is_contract = matches!(
+            admin.executable(),
+            Some(Executable::Wasm(_)) | Some(Executable::StellarAsset)
+        );
+        if admin_is_contract {
+            if reject_contract_admin.unwrap_or(false) {
+                fail(&env, EscrowError::ContractAdminRejected);
+            }
+            // Emit warning — callers can watch for symbol "adm_warn" in event logs.
+            // The invoice_id is not yet validated at this point so we emit a
+            // placeholder; the full id will appear in EscrowInitialized immediately after.
+            AdminIsContractWarning {
+                name: symbol_short!("adm_warn"),
+                invoice_id: symbol_short!("pending"),
+                admin: admin.clone(),
+            }
+            .publish(&env);
+        }
 
         ensure(&env, amount > 0, EscrowError::AmountMustBePositive);
         ensure(
