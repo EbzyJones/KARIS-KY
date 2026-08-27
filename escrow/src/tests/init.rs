@@ -26,6 +26,8 @@ fn test_init_stores_escrow() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     assert_eq!(escrow.invoice_id, symbol_short!("INV001"));
     assert_eq!(escrow.admin, admin);
@@ -58,6 +60,8 @@ fn test_init_stores_keyed_invoice_and_lists_it() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     let got = client.get_escrow();
     assert_eq!(got, escrow);
@@ -77,6 +81,8 @@ fn test_init_requires_admin_auth() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -136,6 +142,8 @@ fn test_init_unauthorized_panics() {
             &None,
             &None,
             &None,
+        &None,
+        &None,
         );
     }));
     assert!(result.is_err(), "Expected panic without auth");
@@ -178,6 +186,8 @@ fn test_cost_baseline_init() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -201,6 +211,8 @@ fn test_cost_baseline_init_zero_maturity() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -218,6 +230,8 @@ fn test_cost_baseline_init_max_amount() {
         &Address::generate(&env),
         &None,
         &Address::generate(&env),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -252,6 +266,8 @@ fn test_init_invoice_id_empty_string_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -274,6 +290,8 @@ fn test_init_invoice_id_whitespace_panics() {
         &t,
         &None,
         &tr,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -309,6 +327,8 @@ fn test_init_invoice_id_too_long_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -331,6 +351,8 @@ fn test_init_invoice_id_bad_charset_hyphen_panics() {
         &t,
         &None,
         &tr,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -365,6 +387,8 @@ fn test_init_invoice_id_non_ascii_multibyte_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -385,6 +409,8 @@ fn test_init_invoice_id_embedded_null_panics() {
     client.init(
         &admin, &s, &sme, &1000i128, &500i64, &0u64, &t, &None, &tr, &None, &None, &None, &None,
         &None, &None,
+        &None,
+        &None,
     );
 }
 
@@ -408,6 +434,8 @@ fn test_init_stores_registry_some_and_getters() {
         &token,
         &Some(reg.clone()),
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -447,6 +475,8 @@ fn test_init_min_contribution_floor_stored() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     assert_eq!(client.get_min_contribution_floor(), 1_000i128);
 }
@@ -470,6 +500,8 @@ fn test_init_min_contribution_floor_defaults_to_zero() {
         &tok,
         &None,
         &tre,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -506,6 +538,8 @@ fn test_init_min_contribution_zero_panics() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 }
 
@@ -531,6 +565,8 @@ fn test_init_min_contribution_exceeds_amount_panics() {
         &tre,
         &None,
         &Some(1_001i128),
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -563,6 +599,8 @@ fn test_init_min_contribution_equal_to_amount_accepted() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     assert_eq!(client.get_min_contribution_floor(), 5_000i128);
 }
@@ -581,10 +619,7 @@ fn test_get_funding_token_before_init_fails_with_typed_error() {
 fn test_get_treasury_before_init_fails_with_typed_error() {
     let env = Env::default();
     let client = deploy(&env);
-    assert_contract_error(
-        client.try_get_treasury(),
-        EscrowError::TreasuryNotSet,
-    );
+    assert_contract_error(client.try_get_treasury(), EscrowError::TreasuryNotSet);
 }
 
 #[test]
@@ -602,6 +637,8 @@ fn test_get_funding_token_after_init_succeeds() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -627,6 +664,8 @@ fn test_get_treasury_after_init_succeeds() {
         &token,
         &None,
         &treasury,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -669,6 +708,8 @@ fn test_init_registry_none_roundtrip() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
     assert_eq!(client.get_registry_ref(), None);
 }
@@ -703,6 +744,8 @@ fn test_init_escrow_initialized_event_includes_bound_refs() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     assert_eq!(
@@ -714,6 +757,9 @@ fn test_init_escrow_initialized_event_includes_bound_refs() {
             treasury,
             registry: Some(registry),
             has_maturity_lock: true,
+            yield_token: None,
+            oracle_contract: None,
+            nft_contract: None,
         }
         .to_xdr(&env, &contract_id)]
     );
@@ -748,6 +794,8 @@ fn test_init_escrow_initialized_event_registry_none() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     assert_eq!(
@@ -759,6 +807,9 @@ fn test_init_escrow_initialized_event_registry_none() {
             treasury,
             registry: None,
             has_maturity_lock: false,
+            yield_token: None,
+            oracle_contract: None,
+            nft_contract: None,
         }
         .to_xdr(&env, &contract_id)]
     );
@@ -792,6 +843,8 @@ fn try_init_with_id(env: &Env, id: &str) -> Result<(), ()> {
             &None,
             &None,
             &None,
+        &None,
+        &None,
         );
     }));
     result.map(|_| ()).map_err(|_| ())
@@ -834,6 +887,8 @@ fn test_invoice_id_length_33_panics() {
         &t,
         &None,
         &tr,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -1048,6 +1103,8 @@ fn datakey_distributed_principal_starts_at_zero_and_increments_on_refund() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
     );
 
     assert_eq!(client.get_distributed_principal(), 0i128);
@@ -1060,4 +1117,378 @@ fn datakey_distributed_principal_starts_at_zero_and_increments_on_refund() {
 
     client.refund(&investor);
     assert_eq!(client.get_distributed_principal(), 500i128);
+}
+
+// ── TEST-006: Admin address edge-case validation ──────────────────────────────
+//
+// Covers: contract-address as admin (warning event), admin == SME role collision,
+// admin == treasury role collision.
+//
+// Soroban does not have a "zero address" sentinel; all 32-byte `Address` values
+// are valid. The current contract policy is documented inline for each case.
+
+/// Helper: call init with caller-controlled admin/sme/treasury, returning the
+/// client and the addresses actually used.
+fn init_with_roles<'a>(
+    env: &'a Env,
+    admin: &Address,
+    sme: &Address,
+    treasury: &Address,
+) -> LiquifactEscrowClient<'a> {
+    let client = deploy(env);
+    let token = Address::generate(env);
+    client.init(
+        admin,
+        &soroban_sdk::String::from_str(env, "ROLETEST1"),
+        sme,
+        &100_000i128,
+        &500i64,
+        &0u64,
+        &token,
+        &None,
+        treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+    client
+}
+
+// ── Contract-address as admin ─────────────────────────────────────────────────
+
+/// Using the escrow contract's own address as the `admin` is permitted by the
+/// current contract implementation (no explicit guard exists). This test
+/// documents the current behaviour: init succeeds, and the stored admin equals
+/// the contract id.
+///
+/// Rationale: a contract-as-admin pattern is used in cross-contract governance
+/// flows. If the contract later adds a warning event for this case, assert it here.
+#[test]
+fn test_init_admin_is_contract_address_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Deploy a separate "governor" contract whose address we will use as admin.
+    let governor_id = env.register(LiquifactEscrow, ());
+    let sme = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Deploy the escrow contract being initialised.
+    let escrow_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &escrow_id);
+
+    // Use the governor contract address as the admin of this escrow.
+    client.init(
+        &governor_id,
+        &soroban_sdk::String::from_str(&env, "CTRADMIN1"),
+        &sme,
+        &50_000i128,
+        &300i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let escrow = client.get_escrow();
+    assert_eq!(
+        escrow.admin, governor_id,
+        "admin should be stored as the contract address"
+    );
+    // The escrow is open and fully operational.
+    assert_eq!(escrow.status, 0);
+}
+
+/// When the escrow's own contract address is used as admin, the stored admin
+/// field must equal `env.current_contract_address()` for that instance.
+/// This confirms the storage round-trip, not just acceptance at init.
+#[test]
+fn test_init_self_as_admin_stored_correctly() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let escrow_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &escrow_id);
+    let sme = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    // Use the escrow's own id as admin.
+    client.init(
+        &escrow_id,
+        &soroban_sdk::String::from_str(&env, "SELFADMIN1"),
+        &sme,
+        &10_000i128,
+        &100i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let stored = client.get_escrow();
+    assert_eq!(
+        stored.admin, escrow_id,
+        "stored admin must equal the contract's own address"
+    );
+}
+
+// ── Admin == SME role collision ───────────────────────────────────────────────
+
+/// The contract does **not** currently enforce admin ≠ SME.  Using the same
+/// address for both roles is allowed: a single keypair can act as both the
+/// governance administrator and the invoice borrower.  This test documents
+/// that policy so it will break loudly if a rejection guard is ever added.
+#[test]
+fn test_init_admin_equals_sme_is_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dual_role = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token = Address::generate(&env);
+    let client = deploy(&env);
+
+    client.init(
+        &dual_role,
+        &soroban_sdk::String::from_str(&env, "ADMSME001"),
+        &dual_role, // same address for admin and SME
+        &20_000i128,
+        &400i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let escrow = client.get_escrow();
+    assert_eq!(
+        escrow.admin, dual_role,
+        "admin should be stored correctly when admin == sme"
+    );
+    assert_eq!(
+        escrow.sme_address, dual_role,
+        "sme_address should be stored correctly when admin == sme"
+    );
+    // Escrow is functional: a fund call should work with mocked auths.
+    let investor = Address::generate(&env);
+    client.fund(&investor, &20_000i128);
+    let after = client.get_escrow();
+    assert_eq!(after.funded_amount, 20_000i128);
+    assert_eq!(after.status, 1); // funded
+}
+
+/// Verify that when admin == SME, the admin can also call `settle` (which
+/// normally requires SME auth) because the same address satisfies both roles.
+#[test]
+fn test_init_admin_equals_sme_can_settle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dual_role = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token = Address::generate(&env);
+    let client = deploy(&env);
+
+    client.init(
+        &dual_role,
+        &soroban_sdk::String::from_str(&env, "ADMSME002"),
+        &dual_role,
+        &5_000i128,
+        &200i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor = Address::generate(&env);
+    client.fund(&investor, &5_000i128);
+    // settle() is guarded by sme_address.require_auth() — dual_role satisfies this.
+    client.settle();
+    assert_eq!(client.get_escrow().status, 2);
+}
+
+// ── Admin == Treasury role collision ─────────────────────────────────────────
+
+/// The contract does **not** currently enforce admin ≠ treasury.  Using the
+/// same address for both is allowed: an operator may run a single entity that
+/// governs the escrow and also collects dust sweeps. This test documents
+/// that policy.
+#[test]
+fn test_init_admin_equals_treasury_is_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dual_role = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let token = Address::generate(&env);
+    let client = deploy(&env);
+
+    client.init(
+        &dual_role, // admin
+        &soroban_sdk::String::from_str(&env, "ADMTREAS1"),
+        &sme,
+        &15_000i128,
+        &600i64,
+        &0u64,
+        &token,
+        &None,
+        &dual_role, // treasury == admin
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let escrow = client.get_escrow();
+    assert_eq!(
+        escrow.admin, dual_role,
+        "admin stored correctly when admin == treasury"
+    );
+    assert_eq!(
+        client.get_treasury(),
+        dual_role,
+        "treasury stored correctly when admin == treasury"
+    );
+}
+
+/// When admin == treasury, both admin-gated and treasury-gated operations
+/// should succeed because the same address satisfies both auth requirements.
+#[test]
+fn test_init_admin_equals_treasury_both_ops_succeed() {
+    use crate::tests::install_stellar_asset_token;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dual_role = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let investor = Address::generate(&env);
+    let token_setup = install_stellar_asset_token(&env);
+    let client = deploy(&env);
+    let escrow_id = client.address.clone();
+
+    client.init(
+        &dual_role,
+        &soroban_sdk::String::from_str(&env, "ADMTREAS2"),
+        &sme,
+        &10_000i128,
+        &500i64,
+        &0u64,
+        &token_setup.id,
+        &None,
+        &dual_role, // treasury == admin
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Admin-gated op: set_legal_hold
+    client.set_legal_hold(&true, &soroban_sdk::String::from_str(&env, "test"));
+    assert!(client.get_legal_hold());
+    client.set_legal_hold(&false, &soroban_sdk::String::from_str(&env, ""));
+    assert!(!client.get_legal_hold());
+
+    // Fund and withdraw so the escrow reaches a terminal state for dust sweep.
+    token_setup.stellar.mint(&investor, &10_000i128);
+    client.fund(&investor, &10_000i128);
+    client.settle();
+    // Mint token balance into escrow so withdraw can transfer.
+    token_setup.stellar.mint(&escrow_id, &10_000i128);
+    client.withdraw();
+    // Escrow is now status 3 (withdrawn = terminal for dust sweep purposes).
+    // Mint a small extra dust amount.
+    token_setup.stellar.mint(&escrow_id, &100i128);
+    // Treasury (= dual_role) can sweep.
+    let swept = client.sweep_terminal_dust(&100i128);
+    assert_eq!(swept, 100i128);
+}
+
+// ── All three roles distinct (positive baseline) ─────────────────────────────
+
+/// Sanity check: admin, SME, and treasury as distinct addresses all work as
+/// expected. This is the canonical happy-path configuration.
+#[test]
+fn test_init_distinct_admin_sme_treasury_baseline() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token = Address::generate(&env);
+    let client = deploy(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "DISTINCT1"),
+        &sme,
+        &30_000i128,
+        &700i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let escrow = client.get_escrow();
+    assert_ne!(escrow.admin, escrow.sme_address, "admin != sme");
+    assert_ne!(escrow.admin, client.get_treasury(), "admin != treasury");
+    assert_ne!(escrow.sme_address, client.get_treasury(), "sme != treasury");
 }
