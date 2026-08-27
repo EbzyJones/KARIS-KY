@@ -1100,3 +1100,217 @@ fn withdraw_event_includes_recipient() {
         "SmeWithdrew event with correct recipient and amount must be emitted"
     );
 }
+
+// ============================================================================
+// MULTI-TOKEN SCENARIOS — USDC, EURC, and fee-on-transfer (Issue #407)
+// ============================================================================
+
+/// Helper: Create a token with specified decimals
+fn setup_token_with_decimals(env: &Env, decimals: u32) -> (Address, StellarAssetClient, TokenClient) {
+    use soroban_sdk::token::{StellarAssetClient, TokenClient};
+
+    let sac = env.register_stellar_asset_contract_v2(Address::generate(env));
+    let token_id = sac.address();
+    let sac_admin = StellarAssetClient::new(env, &token_id);
+    let token = TokenClient::new(env, &token_id);
+
+    sac_admin.set_decimals(&decimals);
+
+    (token_id, sac_admin, token)
+}
+
+/// USDC-like token full lifecycle test (6 decimals)
+#[test]
+fn test_usdc_like_token_full_lifecycle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let contract_id = client.address.clone();
+
+    const DECIMALS: u32 = 6;
+    const BASE_UNIT: i128 = 10_i128.pow(DECIMALS);
+    let target = 50_000 * BASE_UNIT;
+
+    let (token_id, sac_admin, token) = setup_token_with_decimals(&env, DECIMALS);
+
+    client.init(
+        &admin,
+        &String::from_str(&env, "USDC001"),
+        &sme,
+        &target,
+        &800,
+        &0,
+        &token_id,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let escrow = client.get_escrow();
+    assert_eq!(escrow.status, 0);
+    assert_eq!(escrow.funded_amount, 0);
+
+    let fund_amount = target;
+    let funded = client.fund(&investor, &fund_amount);
+    assert_eq!(funded.status, 1);
+    assert_eq!(funded.funded_amount, fund_amount);
+    assert_eq!(client.get_contribution(&investor), fund_amount);
+
+    sac_admin.mint(&contract_id, &fund_amount);
+    assert_eq!(token.balance(&contract_id), fund_amount);
+
+    let settled = client.settle();
+    assert_eq!(settled.status, 2);
+
+    client.claim_investor_payout(&investor);
+    assert!(client.is_investor_claimed(&investor));
+
+    let yield_bps = client.get_investor_yield_bps(&investor);
+    assert_eq!(yield_bps, 800);
+
+    let final_escrow = client.get_escrow();
+    assert_eq!(final_escrow.status, 2);
+}
+
+/// EURC-like token full lifecycle test (6 decimals)
+#[test]
+fn test_eurc_like_token_full_lifecycle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let contract_id = client.address.clone();
+
+    const DECIMALS: u32 = 6;
+    const BASE_UNIT: i128 = 10_i128.pow(DECIMALS);
+    let target = 25_000 * BASE_UNIT;
+
+    let (token_id, sac_admin, token) = setup_token_with_decimals(&env, DECIMALS);
+
+    client.init(
+        &admin,
+        &String::from_str(&env, "EURC001"),
+        &sme,
+        &target,
+        &900,
+        &0,
+        &token_id,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let escrow = client.get_escrow();
+    assert_eq!(escrow.status, 0);
+    assert_eq!(escrow.funded_amount, 0);
+
+    let fund_amount = target;
+    let funded = client.fund(&investor, &fund_amount);
+    assert_eq!(funded.status, 1);
+    assert_eq!(funded.funded_amount, fund_amount);
+    assert_eq!(client.get_contribution(&investor), fund_amount);
+
+    sac_admin.mint(&contract_id, &fund_amount);
+    assert_eq!(token.balance(&contract_id), fund_amount);
+
+    let settled = client.settle();
+    assert_eq!(settled.status, 2);
+
+    client.claim_investor_payout(&investor);
+    assert!(client.is_investor_claimed(&investor));
+
+    let yield_bps = client.get_investor_yield_bps(&investor);
+    assert_eq!(yield_bps, 900);
+
+    let final_escrow = client.get_escrow();
+    assert_eq!(final_escrow.status, 2);
+}
+
+/// Mock fee-on-transfer token
+#[contract]
+pub struct MockFeeToken;
+
+#[contractimpl]
+impl MockFeeToken {
+    pub fn init(env: Env, admin: Address, decimals: u32) {
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage().persistent().set(&DataKey::Decimals, &decimals);
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        let fee = amount / 20;
+        let _amount_after_fee = amount - fee;
+        // The escrow should detect the fee and reject with error codes 36-41
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        0
+    }
+
+    pub fn decimals(env: Env) -> u32 {
+        env.storage().persistent().get(&DataKey::Decimals).unwrap_or(6)
+    }
+}
+
+/// Fee-on-transfer mock token test
+#[test]
+#[should_panic(expected = "FeeOnTransfer")]
+fn test_fee_on_transfer_token_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let token_id = env.register(MockFeeToken, ());
+    let token_client = MockFeeTokenClient::new(&env, &token_id);
+
+    const DECIMALS: u32 = 6;
+    const BASE_UNIT: i128 = 10_i128.pow(DECIMALS);
+    let target = 10_000 * BASE_UNIT;
+
+    token_client.init(&admin, &DECIMALS);
+
+    client.init(
+        &admin,
+        &String::from_str(&env, "FEE001"),
+        &sme,
+        &target,
+        &800,
+        &0,
+        &token_id,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.fund(&investor, &target);
+    panic!("Funding should have been rejected for fee-on-transfer token");
+}
