@@ -492,56 +492,10 @@ pub enum EscrowError {
     /// A multisig-gated entrypoint received a signer address that is not a member of the
     /// configured [`MultisigPolicy::signers`], or the same signer listed more than once.
     MultisigSignerNotAuthorized = 180,
-
-    /// [`LiquifactEscrow::archive_escrow`] called on an escrow that is not yet in a terminal
-    /// status (settled, withdrawn, cancelled, or already archived).
-    ArchiveNotTerminal = 184,
-    /// [`LiquifactEscrow::archive_escrow`] called on an escrow already at status `5` (archived).
-    EscrowAlreadyArchived = 185,
-    /// Entrypoint blocked while [`DataKey::EscrowPaused`] is active (operational pause).
-    EscrowIsPaused = 186,
-    /// [`LiquifactEscrow::fund`] / [`LiquifactEscrow::fund_with_commitment`] blocked while
-    /// [`DataKey::FundingPaused`] is active.
-    FundingIsPaused = 187,
-    /// Funding within the current ledger would exceed the configured [`DataKey::MaxFundingRate`].
-    FundingVelocityExceeded = 188,
-    /// A funding contribution would push a single investor's share above the configured
-    /// [`DataKey::MaxInvestorConcentration`].
-    ConcentrationLimitExceeded = 189,
-    /// [`LiquifactEscrow::claim_investor_payout`] called before the investor's configured
-    /// [`DataKey::InvestorLockInUntil`] timestamp has elapsed.
-    InvestorStillInLockIn = 190,
-    /// [`LiquifactEscrow::set_legal_hold`] received a reason string exceeding the maximum length.
-    LegalHoldReasonTooLong = 191,
-    /// A yield-claim delegation entrypoint found no [`DataKey::YieldClaimDelegate`] configured
-    /// for the caller/investor.
-    NoDelegationSet = 192,
-    /// A yield-claim delegation entrypoint found the configured delegation already revoked.
-    DelegationRevoked = 193,
-    /// [`LiquifactEscrow::set_yield_claim_delegate`] received a `delegate` identical to `investor`.
-    DelegateAddressSameAsInvestor = 194,
-    /// [`LiquifactEscrow::revoke_yield_claim_delegate`] called when the investor has no active
-    /// delegation to revoke.
-    NoActiveDelegation = 195,
-    /// A reinvestment election entrypoint called when the investor already has an active election.
-    ReinvestElectionAlreadyActive = 196,
-    /// A reinvestment entrypoint exceeded [`MAX_REINVESTMENT_AUDIT_ENTRIES`] capacity.
-    ReinvestmentAuditLogFull = 197,
-    /// [`LiquifactEscrow::settle`] (partial) received a non-positive settlement amount.
-    SettlementNotPositive = 198,
-    /// [`LiquifactEscrow::settle`] (partial) settlement amount exceeds outstanding `funded_amount`.
-    SettlementExceedsFunded = 199,
-    /// A settlement-notification entrypoint found no [`DataKey::SettlementNotifierContract`] configured.
-    SettlementNotifierNotSet = 200,
-    /// [`LiquifactEscrow::clone_settled_escrow`] called on a template escrow that is not settled.
-    CloneNotSettled = 201,
-    /// [`LiquifactEscrow::clone_settled_escrow`] received a non-positive `new_amount`.
-    CloneAmountNotPositive = 202,
-    /// [`LiquifactEscrow::batch_claim_investor_payout`] received an empty investors list.
-    BatchClaimEmpty = 203,
-    /// [`LiquifactEscrow::batch_claim_investor_payout`] investors list exceeds the configured
-    /// per-call bound.
-    BatchClaimTooLarge = 204,
+      /// Funding would exceed the configured `funding_target`.
+    FundingTargetExceeded = 181,
+      /// Invariant violation: `funded_amount > funding_target` detected.
+    InvariantViolation = 182,
 }
 
 #[inline(always)]
@@ -2409,6 +2363,12 @@ impl LiquifactEscrow {
             maturity,
             status: 0,
         };
+
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
         env.storage()
@@ -4760,6 +4720,8 @@ impl LiquifactEscrow {
         Self::set_legal_hold(env, false, reason);
     }
 
+
+
     pub fn update_funding_target(env: Env, new_target: i128) -> InvoiceEscrow {
         ensure(
             &env,
@@ -4779,6 +4741,12 @@ impl LiquifactEscrow {
 
         let old_target = escrow.funding_target;
         escrow.funding_target = new_target;
+
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
@@ -5470,10 +5438,17 @@ impl LiquifactEscrow {
             }
         }
 
-        escrow.funded_amount = escrow
+        let new_funded = escrow
             .funded_amount
             .checked_add(amount)
             .unwrap_or_else(|| fail(&env, EscrowError::FundedAmountOverflow));
+
+        ensure!(
+            new_funded <= escrow.funding_target,
+            EscrowError::FundingTargetExceeded
+        );
+
+        escrow.funded_amount = new_funded;
 
         // --- Concentration cap check ---
         if let Some(concentration_cap) = env
@@ -5682,6 +5657,14 @@ impl LiquifactEscrow {
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
+
+        env.storage().instance().set(&DataKey::Escrow, &escrow);
+
         EscrowPartialSettle {
             name: symbol_short!("part_set"),
             invoice_id: escrow.invoice_id.clone(),
@@ -5690,6 +5673,7 @@ impl LiquifactEscrow {
         .publish(&env);
 
         escrow
+
     }
 
     /// Retry / standalone settlement notification. Invokes the configured
@@ -5741,6 +5725,8 @@ impl LiquifactEscrow {
         }
         .publish(&env);
     }
+
+
 
     pub fn settle(env: Env, partial_amount: Option<i128>) -> InvoiceEscrow {
         ensure(
@@ -5875,6 +5861,12 @@ impl LiquifactEscrow {
                 }
             }
         }
+
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
@@ -6104,6 +6096,8 @@ impl LiquifactEscrow {
     /// - [`EscrowError::LegalHoldBlocksWithdrawal`] — hold is active.
     /// - [`EscrowError::WithdrawalNotFunded`] — escrow not in funded state.
     /// - [`EscrowError::InsufficientContractBalance`] — contract holds less than `funded_amount`.
+
+
     pub fn withdraw(env: Env) -> InvoiceEscrow {
         ensure(
             &env,
@@ -6140,6 +6134,13 @@ impl LiquifactEscrow {
 
         // State transition and accounting (checks-effects-interactions).
         escrow.status = 3;
+
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
+
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
         let prev_distributed: i128 = env
