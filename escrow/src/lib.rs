@@ -809,6 +809,16 @@ pub struct EscrowInitialized {
 }
 
 #[contractevent]
+pub struct RegistryRegistrationAttempted {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub registry: Option<Address>,
+    pub successful: bool,
+}
+
+#[contractevent]
 pub struct MaxUniqueInvestorsCapLowered {
     #[topic]
     pub name: Symbol,
@@ -1916,6 +1926,33 @@ impl LiquifactEscrow {
     /// proof of registry membership — query the registry contract directly to verify on-chain state.
     pub fn get_registry_ref(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::RegistryRef)
+    }
+
+    /// Best-effort registration with the immutable registry configured at init.
+    ///
+    /// Only the escrow admin may invoke this entrypoint. Registry failures are recorded in an
+    /// event and return `false`; they never revert the escrow transaction.
+    pub fn register_with_registry(env: Env) -> bool {
+        let escrow = Self::load_escrow_require_admin(&env);
+        let registry = Self::get_registry_ref(env.clone());
+        let successful = registry.as_ref().is_some_and(|registry| {
+            crate::external_calls::register_escrow_with_registry(
+                &env,
+                registry,
+                escrow.invoice_id.clone(),
+                env.current_contract_address(),
+            )
+        });
+
+        RegistryRegistrationAttempted {
+            name: symbol_short!("reg_attempt"),
+            invoice_id: escrow.invoice_id,
+            registry,
+            successful,
+        }
+        .publish(&env);
+
+        successful
     }
 
     /// Returns the cached token metadata (decimals, cache timestamp, cache sequence).
