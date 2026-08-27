@@ -206,6 +206,15 @@ pub const INVESTOR_BUCKET_COUNT: u32 = 256;
 /// Caps blast radius if instrumentation mis-estimates “dust”; tune per asset decimals off-chain.
 pub const MAX_DUST_SWEEP_AMOUNT: i128 = 100_000_000;
 
+/// Maximum allowed dispute pause duration in seconds (14 days).
+///
+/// Guards against indefinite admin locks and ensures disputes can be escalated to governance
+/// within a bounded operational window. This aligns with standard business dispute resolution
+/// SLAs in invoice finance (typically 3–15 days).
+///
+/// A pause duration exceeding this value will fail with [`EscrowError::DisputePauseDurationExceedsMax`].
+pub const MAX_DISPUTE_PAUSE_DURATION_SECS: u64 = 14 * 24 * 60 * 60; // 1,209,600 seconds
+
 /// Maximum UTF-8 byte length for the invoice `String` at init (matches Soroban [`Symbol`] max).
 pub const MAX_INVOICE_ID_STRING_LEN: u32 = 32;
 
@@ -453,6 +462,9 @@ pub enum EscrowError {
     DisputePausedBlocksInvestorClaims = 168,
     /// [`LiquifactEscrow::pause_dispute`] received a non-positive pause duration in seconds.
     DisputePauseDurationNotPositive = 169,
+    /// [`LiquifactEscrow::pause_dispute`] received a pause duration exceeding the maximum allowed window.
+    /// See [`MAX_DISPUTE_PAUSE_DURATION_SECS`] for the upper bound.
+    DisputePauseDurationExceedsMax = 181,
     /// [`LiquifactEscrow::pause_dispute`] received an empty dispute ticket reference.
     DisputeTicketIdEmpty = 170,
     /// [`LiquifactEscrow::resume_dispute`] called when no dispute pause is active.
@@ -7444,6 +7456,11 @@ impl LiquifactEscrow {
             &env,
             duration_secs > 0,
             EscrowError::DisputePauseDurationNotPositive,
+        );
+        ensure(
+            &env,
+            duration_secs <= MAX_DISPUTE_PAUSE_DURATION_SECS,
+            EscrowError::DisputePauseDurationExceedsMax,
         );
 
         let escrow = Self::load_escrow_require_admin(&env);
