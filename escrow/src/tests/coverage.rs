@@ -1410,6 +1410,77 @@ fn test_bump_ttl_covers_persistent_investor_keys() {
 }
 
 #[test]
+fn test_bump_ttl_accepts_empty_batch_instance_only() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let (funding_token, treasury) = free_addresses(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "TTL002"),
+        &sme,
+        &100,
+        &10,
+        &0,
+        &funding_token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // An empty `allowlisted` vector is valid: it still extends the instance TTL,
+    // it just skips the per-investor persistent-key loop.
+    let empty: SorobanVec<Address> = SorobanVec::new(&env);
+    client.bump_ttl(&empty);
+}
+
+#[test]
+fn test_bump_ttl_rejects_batch_over_max() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let (funding_token, treasury) = free_addresses(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "TTL003"),
+        &sme,
+        &100,
+        &10,
+        &0,
+        &funding_token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let mut too_many: SorobanVec<Address> = SorobanVec::new(&env);
+    for _ in 0..=crate::MAX_TTL_BUMP_BATCH {
+        too_many.push_back(Address::generate(&env));
+    }
+
+    assert_contract_error(
+        client.try_bump_ttl(&too_many),
+        EscrowError::TtlBumpBatchTooLarge,
+    );
+}
+
+#[test]
 fn test_sweep_not_terminal() {
     let env = Env::default();
     env.mock_all_auths();

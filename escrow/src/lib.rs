@@ -210,6 +210,14 @@ pub const INSTANCE_TTL_MIN_EXTENSION_LEDGERS: u32 = 60 * 60; // Approx. 1h at 1 
 /// Extending persistent allowlist TTL reduces the risk of silent allowlist disablement.
 pub const PERSISTENT_TTL_MIN_EXTENSION_LEDGERS: u32 = 60 * 60; // Approx. 1h at 1 ledger/sec.
 
+/// Upper bound on [`LiquifactEscrow::bump_ttl`]'s `allowlisted` entries per call.
+///
+/// Each entry costs 5 `extend_ttl` host calls (`InvestorAllowlisted`, `InvestorContribution`,
+/// `InvestorEffectiveYield`, `InvestorClaimNotBefore`, `InvestorClaimed`); an unbounded vector
+/// risks exceeding the transaction's CPU/resource budget with no partial progress. Mirrors
+/// [`MAX_INVESTOR_ALLOWLIST_BATCH`] to limit per-call work.
+pub const MAX_TTL_BUMP_BATCH: u32 = 32;
+
 /// Maximum UTF-8 byte length for a snapshot name (must fit in Soroban Symbol).
 pub const MAX_SNAPSHOT_NAME_LEN: u32 = 32;
 
@@ -464,6 +472,9 @@ pub enum EscrowError {
     /// A multisig-gated entrypoint received a signer address that is not a member of the
     /// configured [`MultisigPolicy::signers`], or the same signer listed more than once.
     MultisigSignerNotAuthorized = 180,
+
+    /// [`LiquifactEscrow::bump_ttl`] exceeded [`MAX_TTL_BUMP_BATCH`].
+    TtlBumpBatchTooLarge = 181,
 }
 
 #[inline(always)]
@@ -6670,6 +6681,14 @@ impl LiquifactEscrow {
         escrow
     }
 
+    /// Extend storage TTLs for the contract instance and, optionally, a batch of per-investor
+    /// persistent keys, in a single call.
+    ///
+    /// # Bounds
+    ///
+    /// `allowlisted` may be empty (the instance-storage TTL extension always runs regardless),
+    /// but is capped at [`MAX_TTL_BUMP_BATCH`] entries; larger investor sets must be split
+    /// across multiple calls.
     pub fn bump_ttl(env: Env, allowlisted: Vec<Address>) {
         // Permissionless TTL extension.
         //
@@ -6684,6 +6703,16 @@ impl LiquifactEscrow {
         // Documentation references:
         // - ADR-007: storage key evolution policy (additive changes / key semantics).
         // - docs/escrow-ledger-time.md: all gating uses `Env::ledger().timestamp()` with `>=`.
+        //
+        // `allowlisted` is bounded (see `MAX_TTL_BUMP_BATCH`) because each entry costs 5
+        // `extend_ttl` host calls; an unbounded vector risks exceeding the transaction's
+        // CPU/resource budget with no partial progress on failure. An empty vector is valid
+        // and simply skips the per-investor loop below.
+        ensure(
+            &env,
+            allowlisted.len() <= MAX_TTL_BUMP_BATCH,
+            EscrowError::TtlBumpBatchTooLarge,
+        );
 
         env.storage().instance().extend_ttl(
             INSTANCE_TTL_MIN_EXTENSION_LEDGERS,
