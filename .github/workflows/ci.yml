@@ -51,7 +51,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  backend-python-tests:
+  openapi-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint OpenAPI spec
+        # Validates docs/openapi.yaml against the OpenAPI specification so the
+        # spec stays in sync with the actual backend endpoints.
+        run: npx --yes @redocly/cli@latest lint docs/openapi.yaml
+
+  fmt-build-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
