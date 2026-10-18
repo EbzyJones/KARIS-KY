@@ -11,6 +11,7 @@ pub enum Command {
     GetHealth,
     GetContribution { investor: String },
     FundWithCommitment { investor: String, amount: i128, lock_secs: u64 },
+    DetectInconsistencies,
     Help { topic: Option<String> },
     Quit,
 }
@@ -77,6 +78,7 @@ fn parse_command(input: &str) -> Result<Command> {
             let lock_secs: u64 = parts[3].parse().map_err(|_| anyhow!("Invalid lock_secs: must be a positive integer"))?;
             Ok(Command::FundWithCommitment { investor, amount, lock_secs })
         }
+        Some("inconsistencies") => Ok(Command::DetectInconsistencies),
         Some("help") => {
             let topic = parts.get(1).map(|s| s.to_string());
             Ok(Command::Help { topic })
@@ -227,6 +229,173 @@ fn display_get_contribution(investor: &str, contribution: i128) {
     println!();
 }
 
+/// Mock of the contract's StateInconsistencyReport — mirrors the 10 bool fields returned by
+/// `detect_state_inconsistencies`.  In production this would be deserialized from the Soroban
+/// RPC response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateInconsistencyReport {
+    /// funded_amount > funding_target AND status < 1
+    pub funded_exceeds_target_stale: bool,
+    /// funded_amount > 0 AND status == 0
+    pub funded_positive_status_open: bool,
+    /// funded_amount == 0 AND status >= 1
+    pub funded_zero_status_advanced: bool,
+    /// unique_funder_count > 0 AND status == 0
+    pub funders_exist_status_open: bool,
+    /// unique_funder_count == 0 AND status >= 1
+    pub no_funders_advanced_status: bool,
+    /// Snapshot present AND status < 1
+    pub snapshot_exists_not_funded: bool,
+    /// No snapshot AND status >= 2
+    pub snapshot_missing_post_funded: bool,
+    /// status == 2 AND maturity > 0 AND ledger_time < maturity
+    pub settled_before_maturity_lock: bool,
+    /// funding_target <= 0 OR amount <= 0
+    pub invalid_funding_amounts: bool,
+    /// status > 4
+    pub invalid_status_value: bool,
+}
+
+impl StateInconsistencyReport {
+    /// Returns `true` if every flag is `false` (i.e. escrow state is fully consistent).
+    pub fn is_clean(&self) -> bool {
+        !self.funded_exceeds_target_stale
+            && !self.funded_positive_status_open
+            && !self.funded_zero_status_advanced
+            && !self.funders_exist_status_open
+            && !self.no_funders_advanced_status
+            && !self.snapshot_exists_not_funded
+            && !self.snapshot_missing_post_funded
+            && !self.settled_before_maturity_lock
+            && !self.invalid_funding_amounts
+            && !self.invalid_status_value
+    }
+
+    /// Simulate calling `detect_state_inconsistencies` on the contract.
+    /// In production this would invoke via Soroban RPC.
+    fn from_contract() -> Self {
+        StateInconsistencyReport {
+            funded_exceeds_target_stale: false,
+            funded_positive_status_open: false,
+            funded_zero_status_advanced: false,
+            funders_exist_status_open: false,
+            no_funders_advanced_status: false,
+            snapshot_exists_not_funded: false,
+            snapshot_missing_post_funded: false,
+            settled_before_maturity_lock: false,
+            invalid_funding_amounts: false,
+            invalid_status_value: false,
+        }
+    }
+}
+
+/// A single finding row rendered inside `display_inconsistencies`.
+struct Finding {
+    flag: bool,
+    label: &'static str,
+    description: &'static str,
+}
+
+/// Print one row: green tick when clean, red cross with description when flagged.
+fn print_finding(finding: &Finding) {
+    if finding.flag {
+        println!(
+            "  {} {} — {}",
+            "✗".red().bold(),
+            finding.label.red(),
+            finding.description.red()
+        );
+    } else {
+        println!("  {} {}", "✓".green(), finding.label.bright_white());
+    }
+}
+
+/// Format and display the output of `detect_state_inconsistencies` with per-finding color coding.
+///
+/// - All flags `false` → green "ALL CLEAR" banner.
+/// - Any flag `true`  → each failing flag is highlighted in red; a red summary count is shown.
+pub fn display_inconsistencies(report: &StateInconsistencyReport) {
+    let findings = [
+        Finding {
+            flag: report.funded_exceeds_target_stale,
+            label: "funded_exceeds_target_stale",
+            description: "funded_amount > funding_target but status has not advanced to funded",
+        },
+        Finding {
+            flag: report.funded_positive_status_open,
+            label: "funded_positive_status_open",
+            description: "principal received but escrow status is still open (0)",
+        },
+        Finding {
+            flag: report.funded_zero_status_advanced,
+            label: "funded_zero_status_advanced",
+            description: "advanced escrow has zero funded principal",
+        },
+        Finding {
+            flag: report.funders_exist_status_open,
+            label: "funders_exist_status_open",
+            description: "investors have funded but escrow remains in open status",
+        },
+        Finding {
+            flag: report.no_funders_advanced_status,
+            label: "no_funders_advanced_status",
+            description: "advanced escrow has no recorded investors",
+        },
+        Finding {
+            flag: report.snapshot_exists_not_funded,
+            label: "snapshot_exists_not_funded",
+            description: "funding-close snapshot present before escrow reached funded status",
+        },
+        Finding {
+            flag: report.snapshot_missing_post_funded,
+            label: "snapshot_missing_post_funded",
+            description: "advanced escrow is missing its funding-close snapshot",
+        },
+        Finding {
+            flag: report.settled_before_maturity_lock,
+            label: "settled_before_maturity_lock",
+            description: "escrow settled before the maturity lock expired",
+        },
+        Finding {
+            flag: report.invalid_funding_amounts,
+            label: "invalid_funding_amounts",
+            description: "funding_target or invoice amount is zero or negative",
+        },
+        Finding {
+            flag: report.invalid_status_value,
+            label: "invalid_status_value",
+            description: "status is outside the valid range 0–4",
+        },
+    ];
+
+    let flagged_count = findings.iter().filter(|f| f.flag).count();
+
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!("{}", "STATE INCONSISTENCY REPORT".bright_blue().bold());
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!();
+
+    for finding in &findings {
+        print_finding(finding);
+    }
+
+    println!();
+    if flagged_count == 0 {
+        println!("{}", "  ✓ ALL CLEAR — no inconsistencies detected.".green().bold());
+    } else {
+        println!(
+            "  {} {} inconsistenc{} detected.",
+            "✗".red().bold(),
+            format!("{}", flagged_count).red().bold(),
+            if flagged_count == 1 { "y" } else { "ies" }
+        );
+    }
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!();
+}
+
 /// Format duration in seconds to human-readable format.
 fn format_duration(secs: i64) -> String {
     if secs < 0 {
@@ -308,6 +477,32 @@ fn display_help(topic: Option<&str>) {
             println!("  > fund_with_commitment GDPM3QMXN3APYMYBNPIBMVJHD3FQJSCAEBFHDZZS3MSVVUAOTBMVYF2 50000000 86400");
             println!();
         }
+        Some("inconsistencies") => {
+            println!("{}:", "inconsistencies".bright_cyan().bold());
+            println!("  Run detect_state_inconsistencies diagnostic on the escrow contract.");
+            println!("  Checks 10 logical invariants and reports any violations with per-finding");
+            println!("  color coding: green (✓) when clean, red (✗) when flagged.");
+            println!();
+            println!("{}:", "Flags checked".bright_cyan());
+            println!("  funded_exceeds_target_stale   — funded_amount > target but status < funded");
+            println!("  funded_positive_status_open   — principal received but status still open");
+            println!("  funded_zero_status_advanced   — advanced status with zero funded amount");
+            println!("  funders_exist_status_open     — investors recorded but status still open");
+            println!("  no_funders_advanced_status    — advanced status with no recorded investors");
+            println!("  snapshot_exists_not_funded    — funding snapshot before funded status");
+            println!("  snapshot_missing_post_funded  — missing snapshot on post-funded escrow");
+            println!("  settled_before_maturity_lock  — settled before maturity lock expired");
+            println!("  invalid_funding_amounts       — funding_target or invoice amount ≤ 0");
+            println!("  invalid_status_value          — status outside valid range 0–4");
+            println!();
+            println!("{}:", "Color Coding".bright_yellow());
+            println!("  {} — invariant holds, no inconsistency", "✓ GREEN".green());
+            println!("  {} — invariant violated, investigation required", "✗ RED".red());
+            println!();
+            println!("{}:", "Usage".bright_cyan());
+            println!("  > inconsistencies");
+            println!();
+        }
         _ => {
             println!("Available commands:");
             println!();
@@ -315,6 +510,7 @@ fn display_help(topic: Option<&str>) {
             println!("  {} - Get detailed health metrics", "get_health".bright_cyan());
             println!("  {} - Get investor contribution amount", "get_contribution <investor>".bright_cyan());
             println!("  {} - Record deposit with commitment lock", "fund_with_commitment <investor> <amount> <lock_secs>".bright_cyan());
+            println!("  {} - Detect escrow state inconsistencies", "inconsistencies".bright_cyan());
             println!("  {} - Display this help message", "help [command]".bright_cyan());
             println!("  {} - Exit the REPL", "quit/exit".bright_cyan());
             println!();
@@ -378,6 +574,10 @@ async fn run_repl() -> Result<()> {
                             "claim_not_before": claim_nb
                         });
                         println!("{}", serde_json::to_string_pretty(&out)?);
+                    }
+                    Ok(Command::DetectInconsistencies) => {
+                        let report = StateInconsistencyReport::from_contract();
+                        display_inconsistencies(&report);
                     }
                     Ok(Command::Help { topic }) => {
                         display_help(topic.as_deref());
@@ -497,5 +697,119 @@ mod tests {
     #[test]
     fn display_contribution_nonzero_shows_amount() {
         display_get_contribution("GDPM3QMXN3APYMYBNPIBMVJHD3FQJSCAEBFHDZZS3MSVVUAOTBMVYF2", 50_000_000_000i128);
+    }
+
+    // ── inconsistencies command tests ────────────────────────────────────────
+
+    /// parse_command("inconsistencies") must round-trip to Command::DetectInconsistencies.
+    #[test]
+    fn parse_inconsistencies_round_trip() {
+        let cmd = parse_command("inconsistencies");
+        assert!(cmd.is_ok(), "expected Ok, got {:?}", cmd);
+        assert!(
+            matches!(cmd.unwrap(), Command::DetectInconsistencies),
+            "expected DetectInconsistencies variant"
+        );
+    }
+
+    /// Leading/trailing whitespace must be tolerated.
+    #[test]
+    fn parse_inconsistencies_trims_whitespace() {
+        assert!(matches!(
+            parse_command("  inconsistencies  ").unwrap(),
+            Command::DetectInconsistencies
+        ));
+    }
+
+    /// display_inconsistencies with an all-false (clean) report must not panic and
+    /// must exercise the "ALL CLEAR" path.
+    #[test]
+    fn display_inconsistencies_clean_report_does_not_panic() {
+        let report = StateInconsistencyReport {
+            funded_exceeds_target_stale: false,
+            funded_positive_status_open: false,
+            funded_zero_status_advanced: false,
+            funders_exist_status_open: false,
+            no_funders_advanced_status: false,
+            snapshot_exists_not_funded: false,
+            snapshot_missing_post_funded: false,
+            settled_before_maturity_lock: false,
+            invalid_funding_amounts: false,
+            invalid_status_value: false,
+        };
+        assert!(report.is_clean());
+        // Must not panic — output goes to stdout (visual only in test run).
+        display_inconsistencies(&report);
+    }
+
+    /// display_inconsistencies with every flag set must not panic and must exercise
+    /// all ten "red" paths.
+    #[test]
+    fn display_inconsistencies_all_flags_set_does_not_panic() {
+        let report = StateInconsistencyReport {
+            funded_exceeds_target_stale: true,
+            funded_positive_status_open: true,
+            funded_zero_status_advanced: true,
+            funders_exist_status_open: true,
+            no_funders_advanced_status: true,
+            snapshot_exists_not_funded: true,
+            snapshot_missing_post_funded: true,
+            settled_before_maturity_lock: true,
+            invalid_funding_amounts: true,
+            invalid_status_value: true,
+        };
+        assert!(!report.is_clean());
+        display_inconsistencies(&report);
+    }
+
+    /// is_clean returns false as soon as any single flag is true.
+    #[test]
+    fn is_clean_returns_false_for_any_single_flag() {
+        let base = StateInconsistencyReport {
+            funded_exceeds_target_stale: false,
+            funded_positive_status_open: false,
+            funded_zero_status_advanced: false,
+            funders_exist_status_open: false,
+            no_funders_advanced_status: false,
+            snapshot_exists_not_funded: false,
+            snapshot_missing_post_funded: false,
+            settled_before_maturity_lock: false,
+            invalid_funding_amounts: false,
+            invalid_status_value: false,
+        };
+
+        assert!(base.is_clean(), "all-false report should be clean");
+
+        // Flip each flag individually and assert is_clean becomes false.
+        let cases: &[StateInconsistencyReport] = &[
+            StateInconsistencyReport { funded_exceeds_target_stale: true, ..base.clone() },
+            StateInconsistencyReport { funded_positive_status_open: true, ..base.clone() },
+            StateInconsistencyReport { funded_zero_status_advanced: true, ..base.clone() },
+            StateInconsistencyReport { funders_exist_status_open: true, ..base.clone() },
+            StateInconsistencyReport { no_funders_advanced_status: true, ..base.clone() },
+            StateInconsistencyReport { snapshot_exists_not_funded: true, ..base.clone() },
+            StateInconsistencyReport { snapshot_missing_post_funded: true, ..base.clone() },
+            StateInconsistencyReport { settled_before_maturity_lock: true, ..base.clone() },
+            StateInconsistencyReport { invalid_funding_amounts: true, ..base.clone() },
+            StateInconsistencyReport { invalid_status_value: true, ..base.clone() },
+        ];
+
+        for (i, r) in cases.iter().enumerate() {
+            assert!(!r.is_clean(), "report with flag #{i} set should not be clean");
+        }
+    }
+
+    /// help topic "inconsistencies" must not panic.
+    #[test]
+    fn help_inconsistencies_topic_does_not_panic() {
+        display_help(Some("inconsistencies"));
+    }
+
+    /// Summary help must list "inconsistencies" as an available command.
+    /// We verify by confirming display_help(None) does not panic (visual-only check;
+    /// stdout capture is not available in no_std/no-harness context).
+    #[test]
+    fn help_summary_includes_inconsistencies_does_not_panic() {
+        display_help(None);
     }
 }

@@ -488,12 +488,13 @@ fn test_propose_admin_emits_event() {
 }
 
 #[test]
-#[should_panic]
-fn test_migrate_at_current_version_panics() {
+fn test_migrate_at_current_version_records_upgrade_audit() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
-    client.migrate(&SCHEMA_VERSION);
+
+    assert_eq!(client.migrate(&SCHEMA_VERSION), SCHEMA_VERSION);
+    assert_eq!(client.get_version_history().len(), 2);
 }
 
 #[test]
@@ -1896,7 +1897,10 @@ fn test_rotate_beneficiary_then_withdraw_goes_to_new_sme() {
     // Mint funded_amount into the escrow contract so withdraw() can transfer it.
     token.stellar.mint(&escrow_id, &TARGET);
     client.rotate_beneficiary(&new_sme);
-    client.withdraw();
+    let old_sme_result = client.try_withdraw(&sme);
+    assert_contract_error(old_sme_result, EscrowError::UnauthorizedWithdrawer);
+    client.withdraw(&new_sme);
+    assert_eq!(token.stellar.balance(&sme), 0);
     assert_eq!(token.stellar.balance(&new_sme), TARGET);
 }
 
