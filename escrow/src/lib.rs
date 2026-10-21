@@ -414,13 +414,13 @@ pub enum EscrowError {
     /// Yield slippage threshold is out of valid range (0..=10_000 bps).
     YieldSlippageThresholdOutOfRange = 163,
     /// The proposed new SME address is identical to the current beneficiary.
-    NewSmeSameAsCurrent = 162,
+    NewSmeSameAsCurrent = 181,
 
     /// Attempted to accept admin role when no pending admin exists.
-    NoPendingAdmin = 163,
+    NoPendingAdmin = 182,
     /// The contract's funding-token balance is less than `funded_amount` at withdraw time.
     /// Funds must be custodied in this contract before the SME can pull them.
-    InsufficientContractBalance = 164,
+    InsufficientContractBalance = 183,
 
     /// [`LiquifactEscrow::fund`] / [`LiquifactEscrow::fund_with_commitment`] blocked while a dispute pause is active.
     DisputePausedBlocksFunding = 165,
