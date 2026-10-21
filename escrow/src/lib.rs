@@ -2289,6 +2289,8 @@ pub struct ContractUpgraded {
     #[topic]
     pub invoice_id: Symbol,
     pub new_wasm_hash: BytesN<32>,
+    pub schema_version: u32,
+    pub admin: Address,
 }
 
 #[contractevent]
@@ -5218,12 +5220,21 @@ impl LiquifactEscrow {
         // Auth first — matches migrate() ordering
         let escrow = Self::load_escrow_require_admin(&env);
 
+        // Get the current schema version
+        let schema_version = env
+            .storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(SCHEMA_VERSION);
+
         // Emit event before the deployer call so the event is recorded even if
         // the deployer call somehow reverts (defensive ordering)
         ContractUpgraded {
             name: symbol_short!("upgrade"),
             invoice_id: escrow.invoice_id,
             new_wasm_hash: new_wasm_hash.clone(),
+            schema_version,
+            admin: escrow.admin,
         }
         .publish(&env);
 

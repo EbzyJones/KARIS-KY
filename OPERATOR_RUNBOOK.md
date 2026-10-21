@@ -52,3 +52,37 @@ Resumes funding after it has been paused.
 2. When a pause occurs, review recent funding volume to confirm it is legitimate.
 3. If the activity is expected, call `resume_funding()` to restore service.
 4. If the activity is unexpected, investigate before resuming and consider adjusting `set_max_funding_rate` to a value appropriate for normal operating conditions.
+
+## Contract Upgrade Alerting
+
+The `upgrade` entrypoint is a security-critical admin operation that replaces the contract WASM. Unauthorized or unexpected upgrades represent a high-impact vulnerability vector.
+
+### `ContractUpgraded` Event
+
+The `upgrade` entrypoint emits a `ContractUpgraded` event containing:
+
+- **`new_wasm_hash`**: The hash of the new WASM code. This is the primary identifier for the upgrade.
+- **`schema_version`**: The schema version at the time of upgrade (for audit and migration tracking).
+- **`admin`**: The admin address who performed the upgrade (authorization audit).
+- **`invoice_id`**: The escrow's invoice identifier for context.
+
+### Alerting Best Practices
+
+1. **Unexpected upgrade detection:**
+   - Set up continuous monitoring on `ContractUpgraded` events.
+   - Alert if an upgrade occurs outside the expected maintenance window.
+   - Alert if the `admin` performing the upgrade is not a known governance address.
+
+2. **WASM hash validation:**
+   - Maintain a registry of known good `new_wasm_hash` values for each production release.
+   - Alert if an upgrade deploys a WASM hash not on the approved list.
+   - Cross-check the hash against the official release artifacts to confirm it matches the intended code.
+
+3. **Schema version audit:**
+   - Log the `schema_version` at upgrade time for reconciliation against on-chain storage.
+   - Verify that the new WASM is compatible with the stored schema version.
+
+4. **Response procedures:**
+   - If an unauthorized upgrade is detected, immediately pause further operations pending investigation.
+   - Escalate to incident response if the `admin` address or `new_wasm_hash` is unexpected.
+   - Coordinate with the platform team to assess whether the deployed WASM is safe or requires emergency rollback.
