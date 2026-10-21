@@ -18,8 +18,8 @@
 
 #[cfg(test)]
 use super::{
-    default_init, deploy, deploy_with_id, free_addresses, install_stellar_asset_token, setup,
-    MAX_DUST_SWEEP_AMOUNT, TARGET,
+    assert_contract_error, default_init, deploy, deploy_with_id, free_addresses,
+    install_stellar_asset_token, setup, MAX_DUST_SWEEP_AMOUNT, TARGET,
 };
 use crate::LiquifactEscrow;
 use soroban_sdk::{
@@ -1296,6 +1296,101 @@ fn claim_investor_payout_succeeds_after_settle() {
     assert!(err.is_err(), "sweep without treasury auth must fail");
 }
 
+/// Deterministic scenario: sweeping terminal dust must not consume funds that
+/// are still owed to investors who have not yet claimed.
+///
+/// Three investors each contribute a third of `TARGET`; the escrow settles and
+/// `TARGET` tokens are minted into the contract.  The first investor claims,
+/// then the maximum permitted dust sweep runs.  The remaining two investors
+/// must still be able to claim their full payouts, and the contract balance
+/// after the sweep must cover both outstanding liabilities.
+#[test]
+fn test_sweep_terminal_dust_preserves_unclaimed_investor_liabilities() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = install_stellar_asset_token(&env);
+    let (contract_id, client) = deploy_with_id(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let (_tok, treasury) = free_addresses(&env);
+
+    client.init(
+        &admin,
+        &String::from_str(&env, "SW_DUST_LIAB"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &token.id,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Three equal investors, each contributing a third of TARGET.
+    let inv_a = Address::generate(&env);
+    let inv_b = Address::generate(&env);
+    let inv_c = Address::generate(&env);
+    let third = TARGET / 3;
+    let remainder = TARGET - (third * 2);
+    client.fund(&inv_a, &third);
+    client.fund(&inv_b, &third);
+    client.fund(&inv_c, &remainder);
+
+    client.settle();
+
+    // Mint the full TARGET into the contract so payouts can be honoured.
+    token.stellar.mint(&contract_id, &TARGET);
+
+    // First investor claims.
+    client.claim_investor_payout(&inv_a);
+    assert!(client.is_investor_claimed(&inv_a));
+
+    // Compute the outstanding liabilities for the two unclaimed investors.
+    let payout_b = client.compute_investor_payout(&inv_b);
+    let payout_c = client.compute_investor_payout(&inv_c);
+    let outstanding = payout_b + payout_c;
+
+    // Sweep the maximum allowed amount, capped by the dust cap and the balance.
+    let balance_before = token.token.balance(&contract_id);
+    let sweep_amount = if balance_before < MAX_DUST_SWEEP_AMOUNT {
+        balance_before
+    } else {
+        MAX_DUST_SWEEP_AMOUNT
+    };
+    let treasury_before = token.token.balance(&treasury);
+    let swept = client.sweep_terminal_dust(&sweep_amount);
+
+    assert_eq!(swept, sweep_amount, "sweep must transfer the requested amount");
+    assert_eq!(
+        token.token.balance(&treasury),
+        treasury_before + swept,
+        "treasury must receive the swept amount"
+    );
+
+    // The remaining balance must still cover both unclaimed payouts.
+    let balance_after = token.token.balance(&contract_id);
+    assert!(
+        balance_after >= outstanding,
+        "contract balance after sweep must cover unclaimed investor liabilities"
+    );
+
+    // Both remaining investors can still claim successfully.
+    client.claim_investor_payout(&inv_b);
+    client.claim_investor_payout(&inv_c);
+
+    assert!(client.is_investor_claimed(&inv_a));
+    assert!(client.is_investor_claimed(&inv_b));
+    assert!(client.is_investor_claimed(&inv_c));
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // BUG-005: Token transfer safety checks in sweep_terminal_dust
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1765,6 +1860,93 @@ fn no_state_mutation_possible_after_withdraw() {
         assert!(r.is_err(), "fund after withdraw must panic");
     }
 }
+// ──────────────────────────────────────────────────────────────────────────────
+// `archive_escrow` — unclaimed-payout guard and terminal-state behavior
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// `archive_escrow` must panic with `ArchiveBlockedByUnclaimedPayouts` when a
+/// settled escrow still has at least one investor who has not claimed.
+#[test]
+#[should_panic(expected = "ArchiveBlockedByUnclaimedPayouts")]
+fn archive_escrow_blocked_by_unclaimed_payouts() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+    // Settle with a single investor who never claims.
+    let _investor = settle_escrow(&client, &env);
+
+    client.archive_escrow();
+}
+
+/// `archive_escrow` must succeed once every investor has claimed their payout.
+#[test]
+fn archive_escrow_succeeds_after_all_claims() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+    let investor = settle_escrow(&client, &env);
+
+    client.claim_investor_payout(&investor);
+    assert!(client.is_investor_claimed(&investor));
+
+    client.archive_escrow();
+    assert_eq!(
+        client.get_escrow().status,
+        5u32,
+        "status must be 5 (archived) after archive_escrow"
+    );
+}
+
+/// `archive_escrow` must succeed for a withdrawn (status 3) escrow regardless
+/// of claim state — the settlement path never ran, so there are no payouts.
+#[test]
+fn archive_escrow_succeeds_for_withdrawn_escrow() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+    fund_to_target(&client, &env);
+    client.withdraw(&sme); // status → 3
+
+    client.archive_escrow();
+    assert_eq!(client.get_escrow().status, 5u32);
+}
+
+/// `archive_escrow` must succeed for a cancelled (status 4) escrow regardless
+/// of claim state.
+#[test]
+fn archive_escrow_succeeds_for_cancelled_escrow() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+    fund_to_target(&client, &env);
+    client.cancel(&sme); // status → 4
+
+    client.archive_escrow();
+    assert_eq!(client.get_escrow().status, 5u32);
+}
+
+/// `archive_escrow` must be idempotent: calling it again on an already-archived
+/// (status 5) escrow must not panic and must leave the status at 5.
+#[test]
+fn archive_escrow_is_idempotent_when_already_archived() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+    fund_to_target(&client, &env);
+    client.withdraw(&sme); // status → 3
+
+    client.archive_escrow();
+    assert_eq!(client.get_escrow().status, 5u32);
+
+    // Second call must be a no-op, not a panic.
+    client.archive_escrow();
+    assert_eq!(
+        client.get_escrow().status,
+        5u32,
+        "archive_escrow must be idempotent when already archived"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // `partial_settle` tests
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2269,14 +2451,11 @@ fn reinvest_yield_requires_settled_source_escrow() {
     );
 
     let result = source_client.try_reinvest_yield(&investor, &target_client.address, &1_000i128);
-    assert!(
-        result.is_err(),
-        "source escrow must be settled before reinvesting"
-    );
+    assert_contract_error(result, crate::EscrowError::ReinvestSourceEscrowNotSettled);
 }
 
 #[test]
-fn reinvest_yield_allows_rollover_into_funding_target() {
+fn reinvest_yield_rejects_insufficient_accrued_yield() {
     let env = Env::default();
     env.mock_all_auths();
     let (source_client, admin, sme) = setup(&env);
@@ -2291,7 +2470,7 @@ fn reinvest_yield_allows_rollover_into_funding_target() {
     let target_sme = Address::generate(&env);
     target_client.init(
         &target_admin,
-        &String::from_str(&env, "TARGET_REINVEST"),
+        &String::from_str(&env, "TARGET_INSUFFICIENT_YIELD"),
         &target_sme,
         &TARGET,
         &800i64,
@@ -2309,12 +2488,83 @@ fn reinvest_yield_allows_rollover_into_funding_target() {
         &None,
     );
 
-    source_client.reinvest_yield(&investor, &target_client.address, &1_000i128);
+    let result = source_client.try_reinvest_yield(
+        &investor,
+        &target_client.address,
+        &8_000_000_001i128,
+    );
+    assert_contract_error(result, crate::EscrowError::ReinvestYieldInsufficient);
+}
+
+#[test]
+fn reinvest_yield_allows_rollover_into_funding_target() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = install_stellar_asset_token(&env);
+    let (source_id, source_client) = deploy_with_id(&env);
+    let source_admin = Address::generate(&env);
+    let source_sme = Address::generate(&env);
+    let source_treasury = Address::generate(&env);
+    source_client.init(
+        &source_admin,
+        &String::from_str(&env, "SOURCE_REINVEST"),
+        &source_sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &token.id,
+        &None,
+        &source_treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor = Address::generate(&env);
+    source_client.fund(&investor, &TARGET);
+    source_client.settle();
+    let reinvest_amount = 1_000i128;
+    token.stellar.mint(&source_id, &(TARGET + reinvest_amount));
+
+    let (target_id, target_client) = deploy_with_id(&env);
+    let target_admin = Address::generate(&env);
+    let target_sme = Address::generate(&env);
+    let target_treasury = Address::generate(&env);
+    target_client.init(
+        &target_admin,
+        &String::from_str(&env, "TARGET_REINVEST"),
+        &target_sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &token.id,
+        &None,
+        &target_treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    source_client.reinvest_yield(&investor, &target_id, &reinvest_amount);
     let target = target_client.get_escrow();
     assert_eq!(
         target.status, 0u32,
         "target escrow must remain in funding state"
     );
+    assert_eq!(target.funded_amount, reinvest_amount);
+    assert_eq!(target_client.get_contribution(&investor), reinvest_amount);
+    assert_eq!(token.token.balance(&target_id), reinvest_amount);
+    assert_eq!(token.token.balance(&source_id), TARGET);
 }
 
 #[test]

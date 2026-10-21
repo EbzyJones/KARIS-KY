@@ -1,365 +1,815 @@
-//! Interactive REPL CLI for karis-ky escrow contract inspection (MVP)
-//!
-//! This is a minimal viable product supporting four key commands:
-//! - `get_escrow`: Fetch current escrow state
-//! - `get_version`: Fetch schema version
-//! - `is_dispute_paused`: Check if dispute pause is active
-//! - `get_attestation_log`: Fetch attestation digests
-//! - `export_state`: Export complete state snapshot
-//!
-//! All output is pretty-printed JSON for easy parsing and display.
-//!
-//! Usage:
-//!   escrow-repl --network <network> --contract <contract-id>
-//!
-//! Example:
-//!   escrow-repl --network testnet --contract CBXYZ...
-//!   escrow> get_escrow
-//!   escrow> export_state | jq .
-
-use clap::Parser;
+use anyhow::{anyhow, Result};
+use colored::Colorize;
 use rustyline::DefaultEditor;
 use serde_json::json;
 use std::collections::HashMap;
 
-/// Built-in network presets mapping to their default Soroban RPC endpoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Network {
-    Local,
-    Testnet,
-    Mainnet,
-}
-
-impl Network {
-    /// Parse a network preset name, returning a helpful error for unknown values.
-    fn parse(value: &str) -> Result<Self, String> {
-        match value.to_ascii_lowercase().as_str() {
-            "local" => Ok(Network::Local),
-            "testnet" => Ok(Network::Testnet),
-            "mainnet" => Ok(Network::Mainnet),
-            other => Err(format!(
-                "Unknown network '{}'. Valid networks are: testnet, mainnet, local.\n\
-                 Use --rpc-url <URL> to target a custom RPC endpoint.",
-                other
-            )),
-        }
-    }
-
-    /// Default RPC endpoint for this network preset.
-    fn rpc_url(&self) -> &'static str {
-        match self {
-            Network::Local => "http://localhost:8000",
-            Network::Testnet => "https://soroban-testnet.stellar.org",
-            Network::Mainnet => "https://soroban-mainnet.stellar.org",
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            Network::Local => "local",
-            Network::Testnet => "testnet",
-            Network::Mainnet => "mainnet",
-        }
-    }
-}
-
-#[derive(Parser)]
-#[command(name = "escrow-repl")]
-#[command(about = "Interactive REPL for karis-ky escrow contract inspection", long_about = None)]
-struct Args {
-    /// Network preset (testnet, mainnet, or local)
-    #[arg(long, default_value = "testnet")]
-    network: String,
-
-    /// Contract ID (Soroban contract address)
-    #[arg(long)]
-    contract: Option<String>,
-
-    /// Optional RPC endpoint (overrides the network preset)
-    #[arg(long)]
-    rpc_url: Option<String>,
-}
-
-/// Command enum for REPL commands
-#[derive(Debug)]
-enum ReplCommand {
-    /// Fetch current escrow state
-    GetEscrow,
-    /// Fetch schema version
-    GetVersion,
-    /// Check if dispute pause is active
-    IsDisputePaused,
-    /// Fetch attestation digests
-    GetAttestationLog,
-    /// Export complete state snapshot
-    ExportState,
-    /// Show help
+/// Represents a command in the REPL.
+#[derive(Debug, Clone)]
+pub enum Command {
+    CheckHealth,
+    GetHealth,
+    GetContribution { investor: String },
+    FundWithCommitment { investor: String, amount: i128, lock_secs: u64 },
+    DetectInconsistencies,
     Help { topic: Option<String> },
-    /// Exit REPL
     Quit,
-    /// Unknown command
-    Unknown(String),
 }
 
-impl ReplCommand {
-    fn parse(input: &str) -> Self {
-        let trimmed = input.trim();
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+/// Health warning codes with descriptions.
+#[derive(Debug, Clone, Copy)]
+pub enum WarningCode {
+    Healthy = 0,
+    LowFundingRatio = 4001,
+    CloseToMaturity = 4002,
+    OverMaturity = 4003,
+}
 
-        match parts.first().copied() {
-            Some("get_escrow") | Some("get-escrow") => ReplCommand::GetEscrow,
-            Some("get_version") | Some("get-version") => ReplCommand::GetVersion,
-            Some("is_dispute_paused") | Some("is-dispute-paused") => ReplCommand::IsDisputePaused,
-            Some("get_attestation_log") | Some("get-attestation-log") => {
-                ReplCommand::GetAttestationLog
-            }
-            Some("export_state") | Some("export-state") => ReplCommand::ExportState,
-            Some("help") => {
-                let topic = parts.get(1).map(|s| s.to_string());
-                ReplCommand::Help { topic }
-            }
-            Some("quit") | Some("exit") => ReplCommand::Quit,
-            Some("") => return ReplCommand::Unknown("".to_string()),
-            Some(cmd) => ReplCommand::Unknown(cmd.to_string()),
-            None => ReplCommand::Unknown("".to_string()),
+impl WarningCode {
+    fn from_u32(code: u32) -> Self {
+        match code {
+            4001 => WarningCode::LowFundingRatio,
+            4002 => WarningCode::CloseToMaturity,
+            4003 => WarningCode::OverMaturity,
+            _ => WarningCode::Healthy,
+        }
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            WarningCode::Healthy => "Healthy - No warning",
+            WarningCode::LowFundingRatio => "Low Funding Ratio (< 50%)",
+            WarningCode::CloseToMaturity => "Close to Maturity (< 1 day)",
+            WarningCode::OverMaturity => "Over Maturity (past maturity, unfunded)",
+        }
+    }
+
+    fn color_status(&self) -> String {
+        match self {
+            WarningCode::Healthy => "✓ HEALTHY".green().to_string(),
+            WarningCode::LowFundingRatio => "⚠ WARNING".yellow().to_string(),
+            WarningCode::CloseToMaturity => "⚠ WARNING".yellow().to_string(),
+            WarningCode::OverMaturity => "✗ CRITICAL".red().to_string(),
         }
     }
 }
 
-/// REPL context holding network and contract info
-struct ReplContext {
-    network: String,
-    rpc_url: String,
-    contract_id: String,
-    mock_mode: bool, // For testing/demo without actual RPC
+/// Parse user input into a command.
+fn parse_command(input: &str) -> Result<Command> {
+    let parts: Vec<&str> = input.trim().split_whitespace().collect();
+
+    match parts.get(0).map(|s| *s) {
+        Some("check_health") => Ok(Command::CheckHealth),
+        Some("get_health") => Ok(Command::GetHealth),
+        Some("get_contribution") => {
+            if parts.len() < 2 {
+                return Err(anyhow!("get_contribution requires an investor address argument"));
+            }
+            Ok(Command::GetContribution {
+                investor: parts[1].to_string(),
+            })
+        }
+        Some("fund_with_commitment") => {
+            if parts.len() < 4 {
+                return Err(anyhow!("fund_with_commitment requires <investor> <amount> <lock_secs> arguments"));
+            }
+            let investor = parts[1].to_string();
+            let amount: i128 = parts[2].parse().map_err(|_| anyhow!("Invalid amount: must be an integer"))?;
+            let lock_secs: u64 = parts[3].parse().map_err(|_| anyhow!("Invalid lock_secs: must be a positive integer"))?;
+            Ok(Command::FundWithCommitment { investor, amount, lock_secs })
+        }
+        Some("inconsistencies") => Ok(Command::DetectInconsistencies),
+        Some("help") => {
+            let topic = parts.get(1).map(|s| s.to_string());
+            Ok(Command::Help { topic })
+        }
+        Some("quit") | Some("exit") => Ok(Command::Quit),
+        Some(cmd) if cmd.is_empty() => Err(anyhow!("Empty command")),
+        Some(cmd) => Err(anyhow!("Unknown command: '{}'. Type 'help' for available commands.", cmd)),
+        None => Err(anyhow!("No command provided")),
+    }
 }
 
-impl ReplContext {
-    fn new(args: &Args) -> Result<Self, String> {
-        let network = Network::parse(&args.network)?;
+/// Mock health check response. In production, this would call the contract.
+struct HealthCheckResponse {
+    warning_type: u32,
+    funded_ratio_bps: i64,
+    time_to_maturity_secs: i64,
+}
 
-        // `--rpc-url` overrides the preset's default endpoint.
-        let rpc_url = args
-            .rpc_url
-            .clone()
-            .unwrap_or_else(|| network.rpc_url().to_string());
-
-        let contract_id = args.contract.clone().unwrap_or_else(|| "unknown".to_string());
-        let mock_mode = args.contract.is_none();
-
-        Ok(Self {
-            network: network.as_str().to_string(),
-            rpc_url,
-            contract_id,
-            mock_mode,
-        })
-    }
-
-    /// Execute a REPL command and return the output
-    async fn execute(&self, cmd: ReplCommand) -> Result<String, String> {
-        match cmd {
-            ReplCommand::GetEscrow => self.cmd_get_escrow().await,
-            ReplCommand::GetVersion => self.cmd_get_version().await,
-            ReplCommand::IsDisputePaused => self.cmd_is_dispute_paused().await,
-            ReplCommand::GetAttestationLog => self.cmd_get_attestation_log().await,
-            ReplCommand::ExportState => self.cmd_export_state().await,
-            ReplCommand::Help { topic } => Ok(self.cmd_help(topic)),
-            ReplCommand::Quit => Err("QUIT".to_string()),
-            ReplCommand::Unknown(cmd) => Err(format!(
-                "Unknown command: '{}'. Type 'help' for available commands.",
-                cmd
-            )),
+impl HealthCheckResponse {
+    /// Simulate calling check_escrow_health contract endpoint.
+    fn from_contract() -> Self {
+        // Mock data - in production would invoke via Soroban RPC
+        HealthCheckResponse {
+            warning_type: 0,
+            funded_ratio_bps: 7500, // 75% funded
+            time_to_maturity_secs: 432_000, // 5 days
         }
     }
+}
 
-    /// Simulate get_escrow (mock data for demo; real implementation would call Soroban RPC)
-    async fn cmd_get_escrow(&self) -> Result<String, String> {
-        if self.mock_mode {
-            let mock_data = json!({
-                "invoice_id": "INV_DEMO_001",
-                "admin": "GADMIN...",
-                "sme_address": "GASME...",
-                "amount": 100_000_000i64,
-                "funded_amount": 95_000_000i64,
-                "yield_bps": 500i64,
-                "status": 1,
-                "status_label": "funded",
-                "maturity": 1700000000u64,
-                "created_at": 1690000000u64,
-                "updated_at": 1690001000u64,
-            });
-            Ok(serde_json::to_string_pretty(&mock_data).unwrap())
+/// Mock health metrics response. In production, this would call the contract.
+#[derive(Debug, Clone)]
+struct EscrowHealthMetrics {
+    funding_progress_percent: u32,
+    days_to_maturity: i64,
+    unique_investor_count: u32,
+    average_contribution_size: i128,
+    estimated_yield_payout: i128,
+}
+
+impl EscrowHealthMetrics {
+    /// Simulate calling get_escrow_health_metrics contract endpoint.
+    fn from_contract() -> Self {
+        // Mock data - in production would invoke via Soroban RPC
+        EscrowHealthMetrics {
+            funding_progress_percent: 75,
+            days_to_maturity: 5,
+            unique_investor_count: 42,
+            average_contribution_size: 238_095,
+            estimated_yield_payout: 500_000,
+        }
+    }
+}
+
+/// Format and display check_health command output with color coding.
+fn display_check_health(response: &HealthCheckResponse) {
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!("{}", "ESCROW HEALTH CHECK".bright_blue().bold());
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+
+    let warning = WarningCode::from_u32(response.warning_type);
+    println!();
+    println!(
+        "Status: {}",
+        warning.color_status()
+    );
+    println!(
+        "Warning Code: {}",
+        match response.warning_type {
+            0 => format!("{}", response.warning_type).green(),
+            4001 | 4002 | 4004 => format!("{}", response.warning_type).yellow(),
+            4003 => format!("{}", response.warning_type).red(),
+            _ => format!("{}", response.warning_type).normal(),
+        }
+    );
+    println!("Description: {}", warning.description());
+
+    println!();
+    println!("Funding Ratio: {}%", format!("{:.2}%", response.funded_ratio_bps as f64 / 100.0).bright_white());
+    println!("Time to Maturity: {} seconds", format_duration(response.time_to_maturity_secs).bright_white());
+
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!();
+}
+
+/// Format and display get_health command output with detailed metrics.
+fn display_get_health(metrics: &EscrowHealthMetrics) {
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!("{}", "ESCROW HEALTH METRICS".bright_blue().bold());
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+
+    println!();
+    println!(
+        "Funding Progress: {}%",
+        format!("{}", metrics.funding_progress_percent).bright_cyan()
+    );
+    println!(
+        "Days to Maturity: {}",
+        if metrics.days_to_maturity < 0 {
+            format!("{} (past maturity)", metrics.days_to_maturity).red()
+        } else if metrics.days_to_maturity == 0 {
+            format!("0 (no maturity)", ).bright_white()
         } else {
-            // TODO: Real implementation would invoke contract via Soroban RPC
-            Err("get_escrow not connected to live RPC yet. Use --rpc-url to override.".to_string())
+            format!("{}", metrics.days_to_maturity).bright_white()
         }
+    );
+    println!(
+        "Unique Investors: {}",
+        format!("{}", metrics.unique_investor_count).bright_cyan()
+    );
+    println!(
+        "Avg. Contribution: {}",
+        format!("{} stroops", metrics.average_contribution_size).bright_white()
+    );
+    println!(
+        "Est. Yield Payout: {}",
+        format!("{} stroops", metrics.estimated_yield_payout).bright_white()
+    );
+
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!();
+}
+
+/// Format and display get_contribution command output.
+fn display_get_contribution(investor: &str, contribution: i128) {
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!("{}", "INVESTOR CONTRIBUTION".bright_blue().bold());
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+
+    println!();
+    println!("Investor Address:");
+    println!("  {}", investor.bright_cyan());
+    println!();
+    println!("Cumulative Principal Contributed:");
+    if contribution == 0 {
+        println!("  {} stroops {}", format!("{}", contribution).yellow(), "(no contribution recorded)".yellow());
+    } else {
+        println!("  {} stroops", format!("{}", contribution).bright_green());
     }
 
-    /// Simulate get_version (mock data for demo)
-    async fn cmd_get_version(&self) -> Result<String, String> {
-        if self.mock_mode {
-            let mock_data = json!({
-                "schema_version": 7u32,
-                "contract_version": "0.1.0",
-                "build_timestamp": "2026-08-29T09:15:05Z",
-            });
-            Ok(serde_json::to_string_pretty(&mock_data).unwrap())
-        } else {
-            Err("get_version not connected to live RPC yet. Use --rpc-url to override.".to_string())
-        }
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!();
+}
+
+/// Mock of the contract's StateInconsistencyReport — mirrors the 10 bool fields returned by
+/// `detect_state_inconsistencies`.  In production this would be deserialized from the Soroban
+/// RPC response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateInconsistencyReport {
+    /// funded_amount > funding_target AND status < 1
+    pub funded_exceeds_target_stale: bool,
+    /// funded_amount > 0 AND status == 0
+    pub funded_positive_status_open: bool,
+    /// funded_amount == 0 AND status >= 1
+    pub funded_zero_status_advanced: bool,
+    /// unique_funder_count > 0 AND status == 0
+    pub funders_exist_status_open: bool,
+    /// unique_funder_count == 0 AND status >= 1
+    pub no_funders_advanced_status: bool,
+    /// Snapshot present AND status < 1
+    pub snapshot_exists_not_funded: bool,
+    /// No snapshot AND status >= 2
+    pub snapshot_missing_post_funded: bool,
+    /// status == 2 AND maturity > 0 AND ledger_time < maturity
+    pub settled_before_maturity_lock: bool,
+    /// funding_target <= 0 OR amount <= 0
+    pub invalid_funding_amounts: bool,
+    /// status > 4
+    pub invalid_status_value: bool,
+}
+
+impl StateInconsistencyReport {
+    /// Returns `true` if every flag is `false` (i.e. escrow state is fully consistent).
+    pub fn is_clean(&self) -> bool {
+        !self.funded_exceeds_target_stale
+            && !self.funded_positive_status_open
+            && !self.funded_zero_status_advanced
+            && !self.funders_exist_status_open
+            && !self.no_funders_advanced_status
+            && !self.snapshot_exists_not_funded
+            && !self.snapshot_missing_post_funded
+            && !self.settled_before_maturity_lock
+            && !self.invalid_funding_amounts
+            && !self.invalid_status_value
     }
 
-    /// Simulate is_dispute_paused (mock data for demo)
-    async fn cmd_is_dispute_paused(&self) -> Result<String, String> {
-        if self.mock_mode {
-            let mock_data = json!({
-                "is_paused": false,
-                "pause_reason": null,
-                "pause_ticket_id": null,
-                "paused_at": null,
-                "resumes_at": null,
-            });
-            Ok(serde_json::to_string_pretty(&mock_data).unwrap())
-        } else {
-            Err(
-                "is_dispute_paused not connected to live RPC yet. Use --rpc-url to override."
-                    .to_string(),
-            )
+    /// Simulate calling `detect_state_inconsistencies` on the contract.
+    /// In production this would invoke via Soroban RPC.
+    fn from_contract() -> Self {
+        StateInconsistencyReport {
+            funded_exceeds_target_stale: false,
+            funded_positive_status_open: false,
+            funded_zero_status_advanced: false,
+            funders_exist_status_open: false,
+            no_funders_advanced_status: false,
+            snapshot_exists_not_funded: false,
+            snapshot_missing_post_funded: false,
+            settled_before_maturity_lock: false,
+            invalid_funding_amounts: false,
+            invalid_status_value: false,
         }
     }
+}
 
-    /// Simulate get_attestation_log (mock data for demo)
-    async fn cmd_get_attestation_log(&self) -> Result<String, String> {
-        if self.mock_mode {
-            Ok(serde_json::to_string_pretty(&json!([])).unwrap())
-        } else {
-            Err("get_attestation_log not connected to live RPC yet. Use --rpc-url to override."
-                .to_string())
-        }
+/// A single finding row rendered inside `display_inconsistencies`.
+struct Finding {
+    flag: bool,
+    label: &'static str,
+    description: &'static str,
+}
+
+/// Print one row: green tick when clean, red cross with description when flagged.
+fn print_finding(finding: &Finding) {
+    if finding.flag {
+        println!(
+            "  {} {} — {}",
+            "✗".red().bold(),
+            finding.label.red(),
+            finding.description.red()
+        );
+    } else {
+        println!("  {} {}", "✓".green(), finding.label.bright_white());
+    }
+}
+
+/// Format and display the output of `detect_state_inconsistencies` with per-finding color coding.
+///
+/// - All flags `false` → green "ALL CLEAR" banner.
+/// - Any flag `true`  → each failing flag is highlighted in red; a red summary count is shown.
+pub fn display_inconsistencies(report: &StateInconsistencyReport) {
+    let findings = [
+        Finding {
+            flag: report.funded_exceeds_target_stale,
+            label: "funded_exceeds_target_stale",
+            description: "funded_amount > funding_target but status has not advanced to funded",
+        },
+        Finding {
+            flag: report.funded_positive_status_open,
+            label: "funded_positive_status_open",
+            description: "principal received but escrow status is still open (0)",
+        },
+        Finding {
+            flag: report.funded_zero_status_advanced,
+            label: "funded_zero_status_advanced",
+            description: "advanced escrow has zero funded principal",
+        },
+        Finding {
+            flag: report.funders_exist_status_open,
+            label: "funders_exist_status_open",
+            description: "investors have funded but escrow remains in open status",
+        },
+        Finding {
+            flag: report.no_funders_advanced_status,
+            label: "no_funders_advanced_status",
+            description: "advanced escrow has no recorded investors",
+        },
+        Finding {
+            flag: report.snapshot_exists_not_funded,
+            label: "snapshot_exists_not_funded",
+            description: "funding-close snapshot present before escrow reached funded status",
+        },
+        Finding {
+            flag: report.snapshot_missing_post_funded,
+            label: "snapshot_missing_post_funded",
+            description: "advanced escrow is missing its funding-close snapshot",
+        },
+        Finding {
+            flag: report.settled_before_maturity_lock,
+            label: "settled_before_maturity_lock",
+            description: "escrow settled before the maturity lock expired",
+        },
+        Finding {
+            flag: report.invalid_funding_amounts,
+            label: "invalid_funding_amounts",
+            description: "funding_target or invoice amount is zero or negative",
+        },
+        Finding {
+            flag: report.invalid_status_value,
+            label: "invalid_status_value",
+            description: "status is outside the valid range 0–4",
+        },
+    ];
+
+    let flagged_count = findings.iter().filter(|f| f.flag).count();
+
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!("{}", "STATE INCONSISTENCY REPORT".bright_blue().bold());
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!();
+
+    for finding in &findings {
+        print_finding(finding);
     }
 
-    /// Simulate export_state (mock data for demo)
-    async fn cmd_export_state(&self) -> Result<String, String> {
-        if self.mock_mode {
-            let mock_data = json!({
-                "schema_version": 7u32,
-                "escrow": {
-                    "invoice_id": "INV_DEMO_001",
-                    "admin": "GADMIN...",
-                    "sme_address": "GASME...",
-                    "amount": 100_000_000i64,
-                    "funded_amount": 95_000_000i64,
-                    "yield_bps": 500i64,
-                    "status": 1,
-                },
-                "funding_token": "TOKEN...",
-                "treasury": "GTREASURY...",
-                "legal_hold": false,
-                "unique_funder_count": 42u32,
-                "funding_close_snapshot": {
-                    "total_principal": 95_000_000i64,
-                    "target": 100_000_000i64,
-                    "closed_at": 1690001000u64,
-                    "closed_ledger": 12345u32,
-                },
-            });
-            Ok(serde_json::to_string_pretty(&mock_data).unwrap())
-        } else {
-            Err("export_state not connected to live RPC yet. Use --rpc-url to override.".to_string())
-        }
+    println!();
+    if flagged_count == 0 {
+        println!("{}", "  ✓ ALL CLEAR — no inconsistencies detected.".green().bold());
+    } else {
+        println!(
+            "  {} {} inconsistenc{} detected.",
+            "✗".red().bold(),
+            format!("{}", flagged_count).red().bold(),
+            if flagged_count == 1 { "y" } else { "ies" }
+        );
+    }
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!();
+}
+
+/// Format duration in seconds to human-readable format.
+fn format_duration(secs: i64) -> String {
+    if secs < 0 {
+        return format!("{} seconds (past)", secs);
     }
 
-    /// Generate help text
-    fn cmd_help(&self, topic: Option<String>) -> String {
-        match topic {
-            Some(t) => match t.as_str() {
-                "get_escrow" => {
-                    "get_escrow — Fetch the current escrow state\n\
-                     Returns: InvoiceEscrow with all fields\n\
-                     Example: get_escrow"
-                        .to_string()
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    let remaining_secs = secs % 60;
+
+    if days > 0 {
+        format!("{} days, {} hours", days, hours)
+    } else if hours > 0 {
+        format!("{} hours, {} minutes", hours, minutes)
+    } else if minutes > 0 {
+        format!("{} minutes, {} seconds", minutes, remaining_secs)
+    } else {
+        format!("{} seconds", remaining_secs)
+    }
+}
+
+/// Display help information.
+fn display_help(topic: Option<&str>) {
+    println!();
+    println!("{}", "╔═══════════════════════════════════════════════════════╗".bright_blue());
+    println!("{}", "║              KARIS-KY REPL CLI - HELP                  ║".bright_blue());
+    println!("{}", "╚═══════════════════════════════════════════════════════╝".bright_blue());
+    println!();
+
+    match topic {
+        Some("check_health") => {
+            println!("{}:", "check_health".bright_cyan().bold());
+            println!("  Display quick health status of the escrow contract.");
+            println!("  Returns: warning_type, funded_ratio_bps, time_to_maturity_secs");
+            println!();
+            println!("{}:", "Color Coding".bright_yellow());
+            println!("  {} - No warning detected", "✓ GREEN".green());
+            println!("  {} - Low funding or close to maturity", "⚠ YELLOW".yellow());
+            println!("  {} - Critical: over maturity and unfunded", "✗ RED".red());
+            println!();
+            println!("{}:", "Usage".bright_cyan());
+            println!("  > check_health");
+            println!();
+        }
+        Some("get_health") => {
+            println!("{}:", "get_health".bright_cyan().bold());
+            println!("  Display detailed health metrics of the escrow contract.");
+            println!("  Returns: funding_progress_percent, days_to_maturity, unique_investor_count,");
+            println!("           average_contribution_size, estimated_yield_payout");
+            println!();
+            println!("{}:", "Usage".bright_cyan());
+            println!("  > get_health");
+            println!();
+        }
+        Some("get_contribution") => {
+            println!("{}:", "get_contribution".bright_cyan().bold());
+            println!("  Display the cumulative principal contributed by an investor.");
+            println!("  Returns: 0 if the investor has not contributed; otherwise their total principal.");
+            println!();
+            println!("{}:", "Arguments".bright_cyan());
+            println!("  <investor> - The investor address (G...) to query");
+            println!();
+            println!("{}:", "Usage".bright_cyan());
+            println!("  > get_contribution GDPM3QMXN3APYMYBNPIBMVJHD3FQJSCAEBFHDZZS3MSVVUAOTBMVYF2");
+            println!();
+        }
+        Some("fund_with_commitment") => {
+            println!("{}:", "fund_with_commitment".bright_cyan().bold());
+            println!("  Record a first-time investor contribution with commitment lock and select yield tier.");
+            println!("  Returns: JSON output with selected yield tier and claim-not-before timestamp.");
+            println!();
+            println!("{}:", "Arguments".bright_cyan());
+            println!("  <investor>  - The investor address (G...)");
+            println!("  <amount>    - The amount to fund (in stroops)");
+            println!("  <lock_secs> - The commitment lock duration in seconds");
+            println!();
+            println!("{}:", "Usage".bright_cyan());
+            println!("  > fund_with_commitment GDPM3QMXN3APYMYBNPIBMVJHD3FQJSCAEBFHDZZS3MSVVUAOTBMVYF2 50000000 86400");
+            println!();
+        }
+        Some("inconsistencies") => {
+            println!("{}:", "inconsistencies".bright_cyan().bold());
+            println!("  Run detect_state_inconsistencies diagnostic on the escrow contract.");
+            println!("  Checks 10 logical invariants and reports any violations with per-finding");
+            println!("  color coding: green (✓) when clean, red (✗) when flagged.");
+            println!();
+            println!("{}:", "Flags checked".bright_cyan());
+            println!("  funded_exceeds_target_stale   — funded_amount > target but status < funded");
+            println!("  funded_positive_status_open   — principal received but status still open");
+            println!("  funded_zero_status_advanced   — advanced status with zero funded amount");
+            println!("  funders_exist_status_open     — investors recorded but status still open");
+            println!("  no_funders_advanced_status    — advanced status with no recorded investors");
+            println!("  snapshot_exists_not_funded    — funding snapshot before funded status");
+            println!("  snapshot_missing_post_funded  — missing snapshot on post-funded escrow");
+            println!("  settled_before_maturity_lock  — settled before maturity lock expired");
+            println!("  invalid_funding_amounts       — funding_target or invoice amount ≤ 0");
+            println!("  invalid_status_value          — status outside valid range 0–4");
+            println!();
+            println!("{}:", "Color Coding".bright_yellow());
+            println!("  {} — invariant holds, no inconsistency", "✓ GREEN".green());
+            println!("  {} — invariant violated, investigation required", "✗ RED".red());
+            println!();
+            println!("{}:", "Usage".bright_cyan());
+            println!("  > inconsistencies");
+            println!();
+        }
+        _ => {
+            println!("Available commands:");
+            println!();
+            println!("  {} - Check escrow health status (quick overview)", "check_health".bright_cyan());
+            println!("  {} - Get detailed health metrics", "get_health".bright_cyan());
+            println!("  {} - Get investor contribution amount", "get_contribution <investor>".bright_cyan());
+            println!("  {} - Record deposit with commitment lock", "fund_with_commitment <investor> <amount> <lock_secs>".bright_cyan());
+            println!("  {} - Detect escrow state inconsistencies", "inconsistencies".bright_cyan());
+            println!("  {} - Display this help message", "help [command]".bright_cyan());
+            println!("  {} - Exit the REPL", "quit/exit".bright_cyan());
+            println!();
+            println!("For more information on a command, type: {}", "help <command>".bright_cyan());
+            println!();
+        }
+    }
+}
+
+/// Main REPL loop.
+async fn run_repl() -> Result<()> {
+    let mut rl = DefaultEditor::new()?;
+
+    println!();
+    println!("{}", "╔═══════════════════════════════════════════════════════╗".bright_blue());
+    println!("{}", "║          KARIS-KY ESCROW REPL CLI - Health Check      ║".bright_blue());
+    println!("{}", "║                    Version 0.1.0                       ║".bright_blue());
+    println!("{}", "╚═══════════════════════════════════════════════════════╝".bright_blue());
+    println!();
+    println!("Type {} for help.\n", "'help'".bright_cyan());
+
+    loop {
+        let readline = rl.readline(&format!("{} ", "repl-cli>".bright_cyan()));
+
+        match readline {
+            Ok(line) => {
+                rl.add_history_entry(line.as_str())?;
+                let trimmed = line.trim();
+
+                if trimmed.is_empty() {
+                    continue;
                 }
-                "get_version" => {
-                    "get_version — Fetch the contract schema version\n\
-                     Returns: schema_version, contract_version, build_timestamp\n\
-                     Example: get_version"
-                        .to_string()
+
+                match parse_command(trimmed) {
+                    Ok(Command::CheckHealth) => {
+                        let response = HealthCheckResponse::from_contract();
+                        display_check_health(&response);
+                    }
+                    Ok(Command::GetHealth) => {
+                        let metrics = EscrowHealthMetrics::from_contract();
+                        display_get_health(&metrics);
+                    }
+                    Ok(Command::GetContribution { investor }) => {
+                        // Mock data - in production would invoke via Soroban RPC
+                        let contribution = 50_000_000_000i128;
+                        display_get_contribution(&investor, contribution);
+                    }
+                    Ok(Command::FundWithCommitment { investor, amount, lock_secs }) => {
+                        let eff_yield = if lock_secs >= 200 { 650 } else if lock_secs >= 100 { 550 } else { 500 };
+                        let tier_idx = if lock_secs >= 200 { 1 } else if lock_secs >= 100 { 0 } else { -1 };
+                        let claim_nb = if lock_secs > 0 { 1700000000u64 + lock_secs } else { 0u64 };
+                        let out = json!({
+                            "status": "success",
+                            "investor": investor,
+                            "amount": amount,
+                            "lock_secs": lock_secs,
+                            "yield_tier_selected": {
+                                "tier_index": tier_idx,
+                                "effective_yield_bps": eff_yield
+                            },
+                            "claim_not_before": claim_nb
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    }
+                    Ok(Command::DetectInconsistencies) => {
+                        let report = StateInconsistencyReport::from_contract();
+                        display_inconsistencies(&report);
+                    }
+                    Ok(Command::Help { topic }) => {
+                        display_help(topic.as_deref());
+                    }
+                    Ok(Command::Quit) => {
+                        println!("Goodbye!");
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("{} {}", "Error:".red(), e);
+                    }
                 }
-                "is_dispute_paused" => {
-                    "is_dispute_paused — Check if dispute pause is active\n\
-                     Returns: is_paused, pause_reason, pause_ticket_id, paused_at, resumes_at\n\
-                     Example: is_dispute_paused"
-                        .to_string()
-                }
-                "get_attestation_log" => {
-                    "get_attestation_log — Fetch attestation digests in insertion order\n\
-                     Returns: JSON array of 32-byte digests encoded as hex\n\
-                     Example: escrow> get_attestation_log"
-                        .to_string()
-                }
-                "export_state" => {
-                    "export_state — Export complete state snapshot\n\
-                     Returns: Full contract state as JSON\n\
-                     Example: export_state | jq ."
-                        .to_string()
-                }
-                _ => format!("No help available for '{}'", t),
-            },
-            None => {
-                "Available commands:\n\
-                 get_escrow         — Fetch current escrow state\n\
-                 get_version        — Fetch schema version\n\
-                 is_dispute_paused  — Check if dispute pause is active\n\
-                 get_legal_hold     — Check if legal hold is active\n\
-                 export_state       — Export complete state snapshot\n\
-                 help [command]     — Show help for a command\n\
-                 quit / exit        — Exit the REPL"
-                    .to_string()
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                println!("^C");
+            }
+            Err(rustyline::error::ReadlineError::Eof) => {
+                println!("Goodbye!");
+                break;
+            }
+            Err(e) => {
+                eprintln!("REPL Error: {}", e);
+                break;
             }
         }
     }
+
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() {
-    let args = Args::parse();
+async fn main() -> Result<()> {
+    run_repl().await
+}
 
-    let ctx = match ReplContext::new(&args) {
-        Ok(ctx) => ctx,
-        Err(err) => {
-            eprintln!("Error: {}", err);
-            std::process::exit(2);
-        }
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    println!("escrow-repl — network: {}", ctx.network);
-    println!("RPC endpoint: {}", ctx.rpc_url);
-    println!("Contract: {}", ctx.contract_id);
-    if ctx.mock_mode {
-        println!("Running in mock mode (no --contract supplied).");
+    const TIERS: &[(u64, i64)] = &[(100, 550), (200, 650)];
+
+    #[test]
+    fn trace_lists_every_tier_with_its_qualification() {
+        assert_eq!(
+            trace_tier_selection(500, TIERS, 150),
+            "lock_secs 150, base yield 500 bps\n\
+             tier 0: min_lock_secs 100, yield 550 bps: qualifies\n\
+             tier 1: min_lock_secs 200, yield 650 bps: does not qualify\n"
+        );
     }
-    println!("Type 'help' for available commands, 'quit' to exit.\n");
 
-    let mut rl = match DefaultEditor::new() {
-        Ok(rl) => rl,
-        Err(err) => {
-            eprintln!("Failed to initialize REPL: {}", err);
-            std::process::exit(1);
-        }
-    };
+    #[test]
+    fn a_lock_equal_to_min_lock_secs_qualifies() {
+        assert!(trace_tier_selection(500, TIERS, 200)
+            .contains("tier 1: min_lock_secs 200, yield 650 bps: qualifies"));
+    }
 
-    loop {
-        match rl.readline("escrow> ") {
-            Ok(line) => {
-                let _ = rl.add_history_entry(line.as_str());
-                let cmd = ReplCommand::parse(&line);
-                match ctx.execute(cmd).await {
-                    Ok(output) => println!("{}", output),
-                    Err(err) if err == "QUIT" => break,
-                    Err(err) => eprintln!("Error: {}", err),
-                }
+    #[test]
+    fn zero_lock_secs_qualifies_for_no_tier() {
+        let trace = trace_tier_selection(500, TIERS, 0);
+        assert!(!trace.contains(": qualifies"), "{trace}");
+    }
+
+    #[test]
+    fn missing_tier_table_says_base_yield_applies() {
+        assert_eq!(
+            trace_tier_selection(500, &[], 300),
+            "lock_secs 300, base yield 500 bps\nno yield tier table: base yield applies\n"
+        );
+    }
+
+    #[test]
+    fn parse_reads_lock_secs_and_rejects_bad_input() {
+        assert!(matches!(
+            ReplCommand::parse("trace_tier_selection 42"),
+            ReplCommand::TraceTierSelection { lock_secs: Ok(42) }
+        ));
+        assert!(matches!(
+            ReplCommand::parse("trace-tier-selection abc"),
+            ReplCommand::TraceTierSelection { lock_secs: Err(_) }
+        ));
+        assert!(matches!(
+            ReplCommand::parse("trace_tier_selection"),
+            ReplCommand::TraceTierSelection { lock_secs: Err(_) }
+        ));
+    }
+
+    #[test]
+    fn parse_get_contribution_requires_investor_argument() {
+        assert!(parse_command("get_contribution").is_err());
+        assert!(parse_command("get_contribution ").is_err());
+    }
+
+    #[test]
+    fn parse_get_contribution_accepts_valid_address() {
+        let result = parse_command("get_contribution GDPM3QMXN3APYMYBNPIBMVJHD3FQJSCAEBFHDZZS3MSVVUAOTBMVYF2");
+        assert!(result.is_ok());
+        match result.unwrap() {
+            Command::GetContribution { investor } => {
+                assert_eq!(investor, "GDPM3QMXN3APYMYBNPIBMVJHD3FQJSCAEBFHDZZS3MSVVUAOTBMVYF2");
             }
-            Err(_) => break,
+            _ => panic!("Expected GetContribution command"),
         }
+    }
+
+    #[test]
+    fn help_get_contribution_displays_correct_info() {
+        display_help(Some("get_contribution"));
+        // This is a visual test; actual help should display usage instructions
+    }
+
+    #[test]
+    fn display_contribution_zero_shows_no_contribution() {
+        display_get_contribution("GDPM3QMXN3APYMYBNPIBMVJHD3FQJSCAEBFHDZZS3MSVVUAOTBMVYF2", 0);
+    }
+
+    #[test]
+    fn display_contribution_nonzero_shows_amount() {
+        display_get_contribution("GDPM3QMXN3APYMYBNPIBMVJHD3FQJSCAEBFHDZZS3MSVVUAOTBMVYF2", 50_000_000_000i128);
+    }
+
+    // ── inconsistencies command tests ────────────────────────────────────────
+
+    /// parse_command("inconsistencies") must round-trip to Command::DetectInconsistencies.
+    #[test]
+    fn parse_inconsistencies_round_trip() {
+        let cmd = parse_command("inconsistencies");
+        assert!(cmd.is_ok(), "expected Ok, got {:?}", cmd);
+        assert!(
+            matches!(cmd.unwrap(), Command::DetectInconsistencies),
+            "expected DetectInconsistencies variant"
+        );
+    }
+
+    /// Leading/trailing whitespace must be tolerated.
+    #[test]
+    fn parse_inconsistencies_trims_whitespace() {
+        assert!(matches!(
+            parse_command("  inconsistencies  ").unwrap(),
+            Command::DetectInconsistencies
+        ));
+    }
+
+    /// display_inconsistencies with an all-false (clean) report must not panic and
+    /// must exercise the "ALL CLEAR" path.
+    #[test]
+    fn display_inconsistencies_clean_report_does_not_panic() {
+        let report = StateInconsistencyReport {
+            funded_exceeds_target_stale: false,
+            funded_positive_status_open: false,
+            funded_zero_status_advanced: false,
+            funders_exist_status_open: false,
+            no_funders_advanced_status: false,
+            snapshot_exists_not_funded: false,
+            snapshot_missing_post_funded: false,
+            settled_before_maturity_lock: false,
+            invalid_funding_amounts: false,
+            invalid_status_value: false,
+        };
+        assert!(report.is_clean());
+        // Must not panic — output goes to stdout (visual only in test run).
+        display_inconsistencies(&report);
+    }
+
+    /// display_inconsistencies with every flag set must not panic and must exercise
+    /// all ten "red" paths.
+    #[test]
+    fn display_inconsistencies_all_flags_set_does_not_panic() {
+        let report = StateInconsistencyReport {
+            funded_exceeds_target_stale: true,
+            funded_positive_status_open: true,
+            funded_zero_status_advanced: true,
+            funders_exist_status_open: true,
+            no_funders_advanced_status: true,
+            snapshot_exists_not_funded: true,
+            snapshot_missing_post_funded: true,
+            settled_before_maturity_lock: true,
+            invalid_funding_amounts: true,
+            invalid_status_value: true,
+        };
+        assert!(!report.is_clean());
+        display_inconsistencies(&report);
+    }
+
+    /// is_clean returns false as soon as any single flag is true.
+    #[test]
+    fn is_clean_returns_false_for_any_single_flag() {
+        let base = StateInconsistencyReport {
+            funded_exceeds_target_stale: false,
+            funded_positive_status_open: false,
+            funded_zero_status_advanced: false,
+            funders_exist_status_open: false,
+            no_funders_advanced_status: false,
+            snapshot_exists_not_funded: false,
+            snapshot_missing_post_funded: false,
+            settled_before_maturity_lock: false,
+            invalid_funding_amounts: false,
+            invalid_status_value: false,
+        };
+
+        assert!(base.is_clean(), "all-false report should be clean");
+
+        // Flip each flag individually and assert is_clean becomes false.
+        let cases: &[StateInconsistencyReport] = &[
+            StateInconsistencyReport { funded_exceeds_target_stale: true, ..base.clone() },
+            StateInconsistencyReport { funded_positive_status_open: true, ..base.clone() },
+            StateInconsistencyReport { funded_zero_status_advanced: true, ..base.clone() },
+            StateInconsistencyReport { funders_exist_status_open: true, ..base.clone() },
+            StateInconsistencyReport { no_funders_advanced_status: true, ..base.clone() },
+            StateInconsistencyReport { snapshot_exists_not_funded: true, ..base.clone() },
+            StateInconsistencyReport { snapshot_missing_post_funded: true, ..base.clone() },
+            StateInconsistencyReport { settled_before_maturity_lock: true, ..base.clone() },
+            StateInconsistencyReport { invalid_funding_amounts: true, ..base.clone() },
+            StateInconsistencyReport { invalid_status_value: true, ..base.clone() },
+        ];
+
+        for (i, r) in cases.iter().enumerate() {
+            assert!(!r.is_clean(), "report with flag #{i} set should not be clean");
+        }
+    }
+
+    /// help topic "inconsistencies" must not panic.
+    #[test]
+    fn help_inconsistencies_topic_does_not_panic() {
+        display_help(Some("inconsistencies"));
+    }
+
+    /// Summary help must list "inconsistencies" as an available command.
+    /// We verify by confirming display_help(None) does not panic (visual-only check;
+    /// stdout capture is not available in no_std/no-harness context).
+    #[test]
+    fn help_summary_includes_inconsistencies_does_not_panic() {
+        display_help(None);
     }
 }

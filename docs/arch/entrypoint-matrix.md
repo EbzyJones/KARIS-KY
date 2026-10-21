@@ -29,6 +29,7 @@ graph LR
     INVESTOR["INVESTOR"] --> refund["💬 refund()"]
     INVESTOR["INVESTOR"] --> is_investor_refunded["💬 is_investor_refunded()"]
     INVESTOR["INVESTOR"] --> get_distributed_principal["💬 get_distributed_principal()"]
+    INVESTOR["INVESTOR"] --> get_investor_position["💬 get_investor_position()"]
     PUBLIC["PUBLIC"] --> new["💬 new()"]
     PUBLIC["PUBLIC"] --> with_context["💬 with_context()"]
     PUBLIC["PUBLIC"] --> init["💬 init()"]
@@ -92,6 +93,7 @@ graph LR
 - `fund_with_commitment()` — Lock + tier selection
 - `claim_investor_payout()` — Claim after settlement
 - `refund()` — Reclaim in cancelled escrow
+- `get_investor_position()` — Read investor position
 
 ### Treasury
 - `sweep_terminal_dust()` — Terminal rounding cleanup

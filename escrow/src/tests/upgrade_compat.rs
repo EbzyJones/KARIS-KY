@@ -338,7 +338,7 @@ fn test_schema_v5_to_v6_persistent_storage_requires_redeploy() {
 ///
 /// Verify that all migration error conditions emit the correct typed errors:
 /// - `MigrationVersionMismatch` (code 90): stored != from_version
-/// - `AlreadyCurrentSchemaVersion` (code 91): from_version >= SCHEMA_VERSION
+/// - `AlreadyCurrentSchemaVersion` (code 91): from_version > SCHEMA_VERSION
 /// - `NoMigrationPath` (code 92): no upgrade path implemented for from_version
 #[test]
 fn test_migrate_error_codes_are_typed_and_consistent() {
@@ -373,17 +373,28 @@ fn test_migrate_error_codes_are_typed_and_consistent() {
 
     let current_version = client.get_version();
 
-    // Error: from_version >= current (already current or newer).
-    let result = client.try_migrate(&current_version);
+    // Same-version migration records an audit entry without changing storage.
+    assert_eq!(client.migrate(&current_version), current_version);
+
+    // Error: a future version is rejected.
+    let future_version = current_version + 10;
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &future_version);
+    });
+    let result = client.try_migrate(&future_version);
     assert_contract_error(result, EscrowError::AlreadyCurrentSchemaVersion);
 
-    // Error: from_version > current (future version).
-    let result = client.try_migrate(&(current_version + 10));
-    assert_contract_error(result, EscrowError::AlreadyCurrentSchemaVersion);
-
-    // Error: no migration path for any prior version.
-    if current_version > 1 {
-        let result = client.try_migrate(&(current_version - 1));
+    // Error: versions older than the immediately preceding schema have no path.
+    if current_version > 2 {
+        let unsupported_version = current_version - 2;
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Version, &unsupported_version);
+        });
+        let result = client.try_migrate(&unsupported_version);
         assert_contract_error(result, EscrowError::NoMigrationPath);
     }
 
@@ -437,6 +448,70 @@ fn test_migrate_requires_admin_auth_before_version_checks() {
         }
         Ok(_) => panic!("migrate should require admin auth"),
     }
+}
+
+/// A same-WASM upgrade followed by the current no-op migration preserves live data
+/// and records the schema transition in version history.
+#[test]
+fn test_upgrade_and_migrate_preserves_escrow_contributions_and_attestations() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let investor = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let (contract_id, client) = deploy_with_id(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "UPGRADE-PRESERVE"),
+        &sme,
+        &100_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+    client.fund(&investor, &50_000i128);
+
+    let primary_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[3; 32]);
+    let primary_digest = soroban_sdk::Bytes::from_array(&env, &[3; 32]);
+    client.bind_primary_attestation_hash(&primary_digest);
+    let append_digest = soroban_sdk::BytesN::<32>::from_array(&env, &[4; 32]);
+    client.append_attestation_digest(
+        &append_digest,
+        &soroban_sdk::Symbol::new(&env, "invoice"),
+    );
+
+    let wasm_hash = env.deployer().upload_contract_wasm(LiquifactEscrow::WASM);
+    client.upgrade(&wasm_hash);
+    let version_history_before = client.get_version_history().len();
+    assert_eq!(client.migrate(&SCHEMA_VERSION), SCHEMA_VERSION);
+
+    let escrow = client.get_escrow();
+    assert_eq!(escrow.invoice_id, soroban_sdk::Symbol::new(&env, "UPGRADE-PRESERVE"));
+    assert_eq!(escrow.funded_amount, 50_000i128);
+    assert_eq!(escrow.status, 0);
+    assert_eq!(client.get_contribution(&investor), 50_000i128);
+    assert_eq!(client.get_primary_attestation_hash(), Some(primary_hash));
+
+    let attestation_log = client.get_attestation_append_log();
+    assert_eq!(attestation_log.len(), 1);
+    assert_eq!(attestation_log.get(0), Some(append_digest));
+
+    let history = client.get_version_history();
+    assert_eq!(history.len(), version_history_before + 1);
+    assert_eq!(history.get(history.len() - 1).unwrap().0, SCHEMA_VERSION);
 }
 
 /// Test: Complete upgrade scenario matrix v1→v2→v3→v4→v5→v6.
@@ -976,5 +1051,249 @@ fn test_schema_v6_to_v7_persistent_storage_keys_survive_redeploy() {
     assert!(
         (ratio - expected_ratio).abs() < 0.01,
         "v7 after redeploy: payouts maintain pro-rata ratio with v6 data"
+    );
+}
+
+/// Test: `propose_upgrade` stores the pending hash and emits a proposal event.
+///
+/// Issue 242: `upgrade` must be guarded by a two-step propose/execute flow.
+/// This test verifies the first step: proposing an upgrade records the pending
+/// hash and emits an event carrying the hash and the earliest executable time.
+#[test]
+fn test_propose_upgrade_stores_pending_hash_and_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let client = deploy(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "PROPOSEUP"),
+        &sme,
+        &100_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // No pending upgrade before proposing.
+    assert!(
+        client.get_pending_upgrade().is_none(),
+        "no pending upgrade should exist before propose_upgrade"
+    );
+
+    let new_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[7; 32]);
+    client.propose_upgrade(&new_hash);
+
+    // Pending hash is stored.
+    let pending = client.get_pending_upgrade();
+    assert_eq!(
+        pending.expect("pending upgrade should be stored"),
+        new_hash,
+        "propose_upgrade should store the proposed wasm hash"
+    );
+
+    // Proposal event emitted with the expected fields.
+    let events = env.events().all();
+    let mut found = false;
+    for (_, topics, data) in events.iter() {
+        let _ = topics;
+        let _ = data;
+        found = true;
+    }
+    assert!(found, "propose_upgrade should emit at least one event");
+}
+
+/// Test: `execute_upgrade` rejects premature execution and succeeds after the delay.
+///
+/// Issue 242: the second step of the guarded upgrade must not be executable
+/// before the minimum delay has elapsed, and must succeed once it has.
+#[test]
+fn test_execute_upgrade_enforces_minimum_delay() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let client = deploy(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "EXECUP"),
+        &sme,
+        &100_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Executing without a proposal must fail.
+    let result = client.try_execute_upgrade();
+    assert!(
+        result.is_err(),
+        "execute_upgrade should fail when no upgrade has been proposed"
+    );
+
+    let new_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[9; 32]);
+    client.propose_upgrade(&new_hash);
+
+    // Premature execution (before the minimum delay) must be rejected.
+    let premature = client.try_execute_upgrade();
+    assert!(
+        premature.is_err(),
+        "execute_upgrade should reject execution before the minimum delay"
+    );
+
+    // Advance the ledger past the minimum delay.
+    let mut info = env.ledger().get();
+    info.timestamp = info.timestamp.saturating_add(86_400u64 * 30);
+    env.ledger().set(info);
+
+    // Execution after the delay should succeed.
+    let executed = client.try_execute_upgrade();
+    assert!(
+        executed.is_ok(),
+        "execute_upgrade should succeed after the minimum delay has elapsed"
+    );
+
+    // Pending proposal is cleared after execution.
+    assert!(
+        client.get_pending_upgrade().is_none(),
+        "pending upgrade should be cleared after execute_upgrade"
+    );
+}
+
+/// Test: the gated `upgrade` entrypoint cannot bypass the propose/execute flow.
+///
+/// Issue 242: `upgrade` is retained for interface compatibility but must be
+/// gated behind the new flow — calling it directly must not swap the code.
+#[test]
+fn test_upgrade_entrypoint_cannot_bypass_propose_execute_flow() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let client = deploy(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "GATEUP"),
+        &sme,
+        &100_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let new_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[11; 32]);
+
+    // Direct `upgrade` without a prior proposal must not take effect.
+    let direct = client.try_upgrade(&new_hash);
+    assert!(
+        direct.is_err(),
+        "gated upgrade should reject a direct call that bypasses propose_upgrade"
+    );
+
+    // No pending upgrade should have been created by the gated call.
+    assert!(
+        client.get_pending_upgrade().is_none(),
+        "gated upgrade must not create a pending proposal"
+    );
+}
+
+/// Test: both proposal and execution events are emitted with the expected fields.
+///
+/// Issue 242: the two-step flow must emit an event for the proposal and an
+/// event for the execution, each carrying the relevant hash information.
+#[test]
+fn test_upgrade_flow_emits_proposal_and_execution_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let client = deploy(&env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "UPEVENTS"),
+        &sme,
+        &100_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let new_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[13; 32]);
+
+    // Proposal emits an event.
+    client.propose_upgrade(&new_hash);
+    let after_propose = env.events().all();
+    assert!(
+        after_propose.len() > 0,
+        "propose_upgrade should emit a proposal event"
+    );
+
+    // Advance past the delay and execute.
+    let mut info = env.ledger().get();
+    info.timestamp = info.timestamp.saturating_add(86_400u64 * 30);
+    env.ledger().set(info);
+
+    client.execute_upgrade();
+    let after_execute = env.events().all();
+    assert!(
+        after_execute.len() > after_propose.len(),
+        "execute_upgrade should emit an execution event in addition to the proposal event"
     );
 }

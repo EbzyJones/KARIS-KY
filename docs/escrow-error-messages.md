@@ -106,6 +106,7 @@ See also [`docs/escrow-legal-hold.md`](escrow-legal-hold.md),
 | 90 | `MigrationVersionMismatch` | `migrate` | stored version `!= from_version` | Pass matching `from_version` | typed |
 | 91 | `AlreadyCurrentSchemaVersion` | `migrate` | `from_version >= SCHEMA_VERSION` | No migration needed | typed |
 | 92 | `NoMigrationPath` | `migrate` | `from_version < SCHEMA_VERSION` and no transform implemented | Redeploy or extend `migrate` | typed |
+| 93 | `MigrationAlreadyApplied` | `migrate` | Migration already applied to this instance; replay detected | Verify on-chain version; check migration nonce | typed |
 | 100 | `FundingAmountNotPositive` | `fund`, `fund_with_commitment` | `amount <= 0` | Pass positive funding amount | typed |
 | 101 | `FundingBelowMinContribution` | `fund`, `fund_with_commitment` | `amount < min_contribution` | Increase deposit to meet floor | typed |
 | 102 | `LegalHoldBlocksFunding` | `fund`, `fund_with_commitment` | legal hold active | Complete legal-hold clear workflow | typed |
@@ -144,6 +145,7 @@ See also [`docs/escrow-legal-hold.md`](escrow-legal-hold.md),
 | 211 | `LegalHoldGuardianNotConfigured` | `propose_legal_hold` | escrow has no guardian | Use legacy `set_legal_hold(true)` or initialize with guardian | typed |
 | 212 | `LegalHoldAlreadyActive` | `propose_legal_hold` | hold is already active | Clear the current hold before proposing another | typed |
 | 213 | `LegalHoldGuardianSameAsAdmin` | `init_with_guardian` | guardian address equals admin address | Configure an independent guardian address | typed |
+| 217 | `LegalHoldBlocksMutation` | Non-whitelisted state-mutating entrypoints | legal hold active | Clear the hold or use an explicit recovery/maintenance entrypoint | typed |
 | 160 | `LegalHoldBlocksBeneficiaryRotation` | `rotate_beneficiary` | legal hold active | Clear hold before rotation | typed |
 | 161 | `RotationNotOpen` | `rotate_beneficiary` | status not `0` (open) or `1` (funded) | Rotation only before settlement | typed |
 | 162 | `NewSmeSameAsCurrent` | `rotate_beneficiary` | `new_sme == current sme_address` | Pass a different beneficiary | typed |
@@ -211,6 +213,7 @@ See also [`docs/escrow-legal-hold.md`](escrow-legal-hold.md),
 | 90 | `from_version does not match stored version` |
 | 91 | `Already at current schema version` |
 | 92 | `No migration path from version 0 - extend migrate or redeploy` |
+| 93 | `Migration has already been applied to this instance` |
 | 100 | `Funding amount must be positive` |
 | 101 | `funding amount below min_contribution floor` |
 | 102 | `Legal hold blocks new funding while active` |

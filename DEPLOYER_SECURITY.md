@@ -23,10 +23,10 @@ The administrator manages ongoing operations, including parameter updates, attes
 Before deploying to production, ensure the following:
 
 1. **Key Management**: Use a hardware wallet or secure key management solution for the deployer account.
-2. **Parameter Review**: Verify all initialization parameters against the [escrow-init-parameters.md](escrow-init-parameters.md) documentation.
-3. **Fund Parameters**: Confirm fund parameters match the [escrow-fund-parameters.md](escrow-fund-parameters.md) specification.
-4. **Attestations**: Review the [escrow-attestations.md](escrow-attestations.md) documentation for attestation requirements.
-5. **Compliance**: Ensure compliance requirements are met per the [escrow-compliance-guide.md](escrow-compliance-guide.md).
+2. **Parameter Review**: Verify all initialization parameters against the [escrow-init-parameters.md](docs/escrow-init-parameters.md) documentation.
+3. **Fund Parameters**: Confirm fund parameters match the [escrow-fund-parameters.md](docs/escrow-fund-parameters.md) specification.
+4. **Attestations**: Review the [escrow-attestations.md](docs/escrow-attestations.md) documentation for attestation requirements.
+5. **Compliance**: Ensure compliance requirements are met per the [escrow-compliance-guide.md](docs/escrow-compliance-guide.md).
 
 ## Key Management
 
@@ -65,6 +65,37 @@ A malicious administrator could abuse privileged functions to:
 
 **Mitigation**: Implement multi-signature requirements, establish audit trails, and separate duties across multiple administrators.
 
+### Admin-Only Entrypoints
+
+The table below enumerates every admin-only entrypoint and the worst-case impact of a compromised admin key, along with the mitigations currently in place and those recommended. Follow-up issues are linked for any unmitigated high-impact power.
+
+| Admin power | Worst-case impact | Current mitigation | Recommended mitigation |
+| --- | --- | --- | --- |
+| `update_target` | Redirect escrow target, misdirecting investor expectations and downstream accounting | Admin authorization only | Multi-signature admin + monitoring/alerting on target changes |
+| `update_maturity` (extension) | Extend maturity indefinitely, delaying investor repayment | Admin authorization only | Timelock or guardian confirmation for extensions ([#764](https://github.com/example/issues/764)) |
+| `update_maturity` (shortening) | Accelerate repayment schedule | Admin authorization only | Multi-signature admin; unchanged by the extension guard |
+| `lower_cap` | Reduce the cap below committed amounts, blocking participation | Admin authorization only | Multi-signature admin + event monitoring |
+| `pause` | Halt all operations, denying access to funds | Admin authorization only | Multi-signature admin + documented emergency runbook |
+| `rate limit` | Throttle or block withdrawals/operations | Admin authorization only | Multi-signature admin + monitoring |
+| `upgrade` | Swap contract code in a single transaction, enabling arbitrary logic | Admin authorization only | Two-step `propose_upgrade`/`execute_upgrade` with delay ([#765](https://github.com/example/issues/765)) |
+| `archive` | Archive the contract, preventing further operations | Admin authorization only | Multi-signature admin + monitoring |
+| `rotate beneficiary` | Redirect beneficiary payouts to an attacker-controlled account | Admin authorization only | Multi-signature admin + confirmation delay |
+
+**High-impact powers without a timelock or guardian today:** `update_maturity` extensions ([#764](https://github.com/example/issues/764)) and `upgrade` ([#765](https://github.com/example/issues/765)). Both are tracked as follow-ups and are expected to gain a propose/confirm or delay mechanism.
+
+### Maturity Extensions
+
+Extending maturity with `update_maturity` delays investor repayment and is therefore treated as a sensitive action. Extensions must be gated behind a timelock or guardian confirmation: the extension is proposed, held for the configured delay (or confirmed by the guardian), and only then applied. Shortening maturity is out of scope for this guard and retains its existing rules. See [#764](https://github.com/example/issues/764) for the tracking issue.
+
+### Contract Upgrades
+
+`upgrade(new_wasm_hash)` must not take effect immediately on admin authorization. Upgrades follow a two-step flow:
+
+1. `propose_upgrade(hash)` — records the proposed wasm hash and emits a proposal event.
+2. `execute_upgrade()` — after the minimum delay has elapsed, applies the proposed hash and emits an execution event.
+
+Both steps emit events so operators can monitor for unexpected proposals. The legacy immediate `upgrade` entrypoint is gated behind this flow until the interface version is bumped. See [#765](https://github.com/example/issues/765) for the tracking issue.
+
 ### Front-Running
 
 Attackers may attempt to front-run deployment or configuration transactions.
@@ -95,15 +126,15 @@ Attackers may attempt to front-run deployment or configuration transactions.
 
 ## Compliance Considerations
 
-Deployers must ensure the system is configured to meet applicable regulatory requirements. See the [escrow-compliance-guide.md](escrow-compliance-guide.md) for detailed compliance procedures.
+Deployers must ensure the system is configured to meet applicable regulatory requirements. See the [escrow-compliance-guide.md](docs/escrow-compliance-guide.md) for detailed compliance procedures.
 
 ### Legal Holds
 
-Understand how legal holds interact with fund operations. See [escrow-legal-hold.md](escrow-legal-hold.md) for details.
+Understand how legal holds interact with fund operations. See [escrow-legal-hold.md](docs/escrow-legal-hold.md) for details.
 
 ## State Machine
 
-The escrow contracts follow a defined state machine. Review [state-machine.md](state-machine.md) to understand valid state transitions and their security implications.
+The escrow contracts follow a defined state machine. Review [state-machine.md](docs/state-machine.md) to understand valid state transitions and their security implications.
 
 ## Audit and Verification
 
@@ -114,6 +145,6 @@ The escrow contracts follow a defined state machine. Review [state-machine.md](s
 
 ## Additional Resources
 
-- [OPERATOR_RUNBOOK.md](OPERATOR_RUNBOOK.md) — Operational procedures
-- [investor-quick-start.md](investor-quick-start.md) — Investor onboarding
+- [OPERATOR_RUNBOOK.md](docs/OPERATOR_RUNBOOK.md) — Operational procedures
+- [investor-quick-start.md](docs/investor-quick-start.md) — Investor onboarding
 - [docs/glossary.md](docs/glossary.md) — Key terms and definitions

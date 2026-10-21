@@ -64,7 +64,7 @@ reducing transaction overhead for primary issuance workflows.
 **Semantics:**
 - Each entry `(investor_address, amount)` is processed sequentially
 - Per-investor `require_auth()` is called for each entry
-- All existing [`fund()`](funding.md) invariants (allowlist, caps, min contribution, overflow guards)
+- All existing [`fund()`](../escrow/src/lib.rs#L1444) invariants (allowlist, caps, min contribution, overflow guards)
   are enforced per entry
 - One `EscrowFunded` event is emitted per entry
 - If any entry fails its invariants, the call returns an error **without corrupting prior entries**
@@ -171,9 +171,13 @@ their principal:
 | `withdraw()` | SME |
 | `cancel_funding()` | Admin only |
 | `set_legal_hold()` | Admin only |
-| `update_maturity()` | Admin only |
+| `update_maturity()` | Admin only (extensions require timelock/guardian; see below) |
+| `propose_maturity_extension()` | Admin only |
+| `confirm_maturity_extension()` | Admin only (after delay or guardian confirmation) |
 | `propose_admin()` | Admin only |
 | `accept_admin()` | Pending admin only |
+| `propose_upgrade()` | Admin only |
+| `execute_upgrade()` | Admin only (after delay) |
 
 The SME role represents the off-chain settlement policy authority. The admin role
 handles on-chain configuration and compliance controls.
@@ -204,6 +208,92 @@ When `maturity > 0`:
 - When `maturity == 0`: `settle()` succeeds immediately (no time gate)
 
 `withdraw()` does **not** check maturity; it is a pull model for SME liquidity.
+
+---
+
+## Maturity extension guard (`update_maturity`)
+
+An admin can no longer extend maturity in a single transaction. Extending maturity
+delays investor repayment, so it is treated as a sensitive admin action and must
+pass through a propose/confirm flow with a timelock or guardian confirmation.
+
+### Shortening remains immediate
+
+- If the new maturity is **earlier** than the current maturity (shortening), or the
+  escrow is not yet funded, `update_maturity()` applies the change immediately.
+- Shortening is never delayed and never requires a guardian.
+
+### Extensions require delay or guardian
+
+- If the new maturity is **later** than the current maturity (an extension), the
+  admin must first call `propose_maturity_extension(new_maturity)`.
+- The proposal records the proposed maturity and the earliest execution timestamp
+  (`proposed_at + MATURITY_EXTENSION_DELAY`).
+- `confirm_maturity_extension()` applies the extension once either:
+  - the timelock has elapsed (`env.ledger().timestamp() >= earliest_execution`), or
+  - the configured guardian has confirmed the proposal.
+- Calling `confirm_maturity_extension()` before the delay elapses and without
+  guardian confirmation panics.
+- A new proposal overwrites any pending proposal and restarts the delay.
+
+### States permitting each operation
+
+| Operation | Permitted states | Notes |
+|-----------|------------------|-------|
+| `update_maturity()` (shorten) | `0` (open), `1` (funded) | Immediate; blocked in terminal states |
+| `update_maturity()` (extend) | `0` (open), `1` (funded) | Records a pending proposal only |
+| `propose_maturity_extension()` | `0` (open), `1` (funded) | Admin auth; blocked in terminal states |
+| `confirm_maturity_extension()` | `0` (open), `1` (funded) | Requires elapsed delay or guardian confirmation |
+
+Extensions are forbidden in terminal states (`2`, `3`, `4`, `5`); the status never
+regresses and maturity is irrelevant once the escrow is settled, withdrawn,
+cancelled, or archived.
+
+### Events emitted
+
+| Event | When |
+|-------|------|
+| `MaturityExtensionProposed` | `propose_maturity_extension()` succeeds |
+| `MaturityExtensionConfirmed` | `confirm_maturity_extension()` succeeds |
+| `MaturityUpdated` | `update_maturity()` applies an immediate (shortening) change |
+
+---
+
+## Two-step upgrade flow
+
+`upgrade(new_wasm_hash)` no longer takes effect immediately. A compromised admin key
+can no longer swap the contract code in a single transaction; the code swap must be
+proposed and then executed after a minimum delay.
+
+### Flow
+
+1. Admin calls `propose_upgrade(new_wasm_hash)`.
+   - Records the proposed wasm hash and the earliest execution timestamp
+     (`proposed_at + UPGRADE_DELAY`).
+   - Emits `UpgradeProposed`.
+2. After the delay elapses, admin calls `execute_upgrade()`.
+   - Applies the pending wasm hash via `env.deployer().update_current_contract_wasm()`.
+   - Emits `UpgradeExecuted`.
+   - Clears the pending proposal.
+3. Calling `execute_upgrade()` before the delay elapses, or with no pending proposal,
+   panics.
+
+### States permitting each operation
+
+| Operation | Permitted states | Notes |
+|-----------|------------------|-------|
+| `propose_upgrade()` | Any | Admin auth; records a pending proposal |
+| `execute_upgrade()` | Any | Admin auth; requires elapsed delay and a pending proposal |
+
+The legacy `upgrade(new_wasm_hash)` entry point is gated behind the new flow: it is
+retained for interface compatibility but must not bypass the propose/execute delay.
+
+### Events emitted
+
+| Event | When |
+|-------|------|
+| `UpgradeProposed` | `propose_upgrade()` succeeds |
+| `UpgradeExecuted` | `execute_upgrade()` succeeds |
 
 ---
 

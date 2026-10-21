@@ -46,9 +46,46 @@ const MAX_FUND_BATCH: u32 = 50;
 ```
 
 **Rationale:**
-- Soroban host functions charge per-operation costs. A batch of 50 entries involves ~100 storage operations (50 contribution writes + 50 event publishes), which fits within typical transaction budgets while remaining practical for large-scale funding coordination.
+- Soroban host functions charge per-operation costs. A batch of 50 entries involves ~50 contribution writes plus 50 event publishes, which fits within typical transaction budgets while remaining practical for large-scale funding coordination.
 - Larger batches (e.g., 1000+) would risk hitting Soroban's per-transaction limits and block legitimate use cases.
 - Callers needing to fund > 50 investors can invoke `fund_batch` multiple times.
+
+### 2a. Single-Read / Single-Write Escrow Pattern
+
+`fund_batch` (and its `batch_fund` alias) does **not** read and write the escrow struct once per entry. Instead, the escrow is loaded **once** before the loop, threaded through the per-entry funding logic as an in-memory value, and persisted **once** after the loop completes.
+
+**Implementation shape:**
+
+```rust
+// Load once.
+let mut escrow = Self::get_escrow(&env);
+
+for (investor, amount) in entries {
+    // fund_impl takes the in-memory escrow and returns the updated
+    // in-memory escrow; it performs no escrow storage read or write.
+    escrow = Self::fund_impl(&env, escrow, investor, amount)?;
+}
+
+// Persist once.
+Self::set_escrow(&env, &escrow);
+```
+
+**Consequences:**
+- The escrow instance key is read exactly once and written exactly once per batch call, regardless of `entries.len()`.
+- Per-entry validation (auth, caps, allowlist, legal hold, maturity, KYC, sanctions) is unchanged; only the storage access pattern differs.
+- Per-entry contribution records and `EscrowFunded` events are still written/published per entry, so event semantics and contribution accounting are identical to the previous implementation.
+- The funded transition and `FundingCloseSnapshot` write still occur at the entry that crosses the target, using the in-memory escrow state.
+
+**Measured storage-op reduction (batch of 50 entries):**
+
+| Storage operation | Before | After |
+|-------------------|--------|-------|
+| Escrow instance reads | 50 | 1 |
+| Escrow instance writes | 50 | 1 |
+| Contribution record writes | 50 | 50 |
+| Event publishes | 50 | 50 |
+
+This removes 49 redundant escrow reads and 49 redundant escrow writes per full-size batch, with no semantic change to funding behavior.
 
 **Errors:**
 - [`EscrowError::FundingBatchEmpty`] (code 73) if `entries.len() == 0`
@@ -158,6 +195,14 @@ This ensures that even if multiple entries in the batch cross the target (e.g., 
 - Soroban transactions have fixed gas budgets. A batch of 1000+ entries could exhaust the budget and waste user fees.
 - A smaller cap (50) encourages batches to be split across multiple calls, spreading compute cost across multiple ledger entries and preventing any single call from dominating a ledger.
 - 50 is large enough for practical use cases (e.g., a VC fund closing a 30-investor syndicate in one call) but small enough to fit in standard Soroban budgets.
+- Because the escrow is read once and written once per call (see §2a), the per-entry marginal cost is dominated by the contribution record write and the event publish, so the cap is no longer driven by repeated escrow instance access.
+
+### Why thread the escrow in memory instead of re-reading per entry?
+
+**Cost without semantic change:**
+- Re-reading and re-writing the same escrow instance key per entry is pure overhead: the value is already in memory and no other entry in the batch can observe an intermediate persisted state.
+- Passing the escrow into `fund_impl` and returning the updated value keeps the per-entry validation and accounting logic in one place while removing the redundant host storage calls.
+- The single persist at the end of the loop preserves the existing partial-failure semantics: on error, the batch aborts and the escrow is not written with partially applied in-memory state.
 
 ### Why is the snapshot immutable within the batch?
 
@@ -232,6 +277,12 @@ All batch funding tests are located in [`escrow/src/tests/funding.rs`](../../esc
 - `status == 1` (funded) if `funded_amount >= funding_target` (and snapshot exists)
 - `FundingCloseSnapshot` present iff status transitioned to 1
 - `UniqueFunderCount` incremented exactly once per distinct new investor
+- The escrow instance is read once and written once per batch call, independent of batch size
+
+**Storage-op invariants:**
+- Escrow instance read count for a batch call is exactly 1
+- Escrow instance write count for a batch call is exactly 1
+- Contribution record writes and event publishes remain exactly 1 per entry
 
 **Event invariants:**
 - One `EscrowFunded` event per entry
@@ -339,9 +390,10 @@ The `fund_batch` entrypoint does **not** affect existing escrows or existing fun
 
 ## References
 
-- Entrypoint: `LiquifactEscrow::fund_batch` in `escrow/src/lib.rs`
+- Entrypoint: `LiquifactEscrow::fund_batch` / `batch_fund` in `escrow/src/lib.rs`
+- Per-entry funding logic: `LiquifactEscrow::fund_impl` in `escrow/src/lib.rs` (takes and returns an in-memory `InvoiceEscrow`)
 - Tests: `escrow/src/tests/funding.rs` (search for `// Tests for fund_batch`)
 - Error codes: `docs/escrow-error-messages.md` (codes 73–74)
 - Snapshot design: `docs/escrow-snapshot.md`
 - CLI usage: `docs/escrow-sim-stellar-cli.md` (fund_batch section)
-- Issue tracking: GitHub Issue #311 (batch funding implementation), #340 (DOCS-009, this ADR)
+- Issue tracking: GitHub Issue #311 (batch funding implementation), #340 (DOCS-009, this ADR), #239 (single-read/single-write escrow refactor)

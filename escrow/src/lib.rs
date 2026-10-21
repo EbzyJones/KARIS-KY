@@ -28,9 +28,9 @@
 //!
 //! ## Compliance hold (legal hold)
 //!
-//! An admin may set [`DataKey::LegalHold`] to block risk-bearing transitions until cleared:
-//! [`LiquifactEscrow::settle`], SME [`LiquifactEscrow::withdraw`], and
-//! [`LiquifactEscrow::claim_investor_payout`]. **Clearing** requires the **current**
+//! An admin may set [`DataKey::LegalHold`] to block state-mutating entrypoints until cleared.
+//! Hold management, admin handover, initialization, and [`LiquifactEscrow::bump_ttl`] remain
+//! available as explicit recovery/maintenance exceptions. **Clearing** requires the **current**
 //! [`InvoiceEscrow::admin`] to call [`LiquifactEscrow::set_legal_hold`] with `active = false`
 //! (or [`LiquifactEscrow::clear_legal_hold`]). This contract does not embed a timelock or
 //! council multisig: production deployments **must** use a governed `admin` (multisig or

@@ -1,5 +1,5 @@
 [workspace]
-members = ["escrow"]
+members = ["escrow", "repl-cli"]
 resolver = "2"
 
 [workspace.metadata.cargo-llvm-cov]
@@ -9,3 +9,8 @@ exclude = [
     "**/*_test.rs",
     "tests/*"
 ]
+
+[workspace.lints.rustdoc]
+# Fail the build on broken intra-doc links so CI catches stale references
+# (e.g. `LiquifactEscrow::set_admin_roles`) instead of silently ignoring them.
+broken_intra_doc_links = "deny"

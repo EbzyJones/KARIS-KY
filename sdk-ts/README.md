@@ -95,6 +95,7 @@ try {
 | [Type Definitions](src/types.ts) | All contract types, enums, and constants |
 | [Client Implementation](src/client.ts) | EscrowClient class with all entrypoints |
 | [Example Usage](examples/basic-usage.ts) | Complete workflow demonstration |
+| [Full Lifecycle Example](examples/full-lifecycle.ts) | End-to-end script covering init, funding, settlement, and investor claims |
 | [Contract Spec](spec.json) | Machine-readable ABI (auto-generated from Rust) |
 
 ## Contract Entrypoints
@@ -206,6 +207,40 @@ const client = new EscrowClient(
   rpc,
 );
 ```
+
+## Full Lifecycle Example
+
+The `examples/full-lifecycle.ts` script walks through the entire escrow lifecycle end to end: initialization, investor funding, settlement, and investor payout claims. It is intended as a runnable reference for integrating the SDK against a live Soroban network.
+
+### Required Environment Variables
+
+| Variable | Description |
+| --- | --- |
+| `SOROBAN_RPC_URL` | Soroban RPC endpoint (e.g. `https://soroban-testnet.stellar.org`) |
+| `NETWORK_PASSPHRASE` | Stellar network passphrase (e.g. `Test SDF Network ; September 2015`) |
+| `ESCROW_CONTRACT_ID` | Deployed LiquifactEscrow contract ID |
+| `ADMIN_SECRET` | Secret key for the escrow admin account |
+| `SME_SECRET` | Secret key for the SME account |
+| `INVESTOR_SECRET` | Secret key for the investor account |
+
+### Optional Environment Variables
+
+| Variable | Description |
+| --- | --- |
+| `FUNDING_TOKEN` | Funding token contract ID (defaults to the native asset) |
+| `TREASURY` | Treasury address for dust sweeps |
+| `INVOICE_ID` | Invoice identifier used at initialization |
+| `AMOUNT` | Investor contribution amount in base units |
+| `YIELD_BPS` | Investor yield in basis points |
+| `MATURITY` | Maturity unix timestamp |
+
+### Running
+
+```bash
+npm run full-lifecycle
+```
+
+> **Warning:** Secret keys (`ADMIN_SECRET`, `SME_SECRET`, `INVESTOR_SECRET`) must **never** be committed to version control or written to logs. Load them from a secure secret manager or an untracked `.env` file, and use dedicated testnet-only keys when running the example.
 
 ## Schema Versioning
 

@@ -43,7 +43,28 @@ export interface InvoiceEscrow {
   maturity: string; // u64 → bigint string
   status: EscrowStatus;
   guardian: string | null;
+  unique_funder_count?: number;
 }
+
+/** Summary statistics of funding progress and investor participation. */
+export interface FundingStats {
+  funded_amount: string;
+  funding_target: string;
+  unique_funder_count: number;
+  status: EscrowStatus;
+}
+
+/** Settlement event payload emitted at settlement. */
+export interface SettledEvent {
+  invoice_id: string;
+  funded_amount: string;
+  yield_bps: number;
+  maturity: number;
+  settled_at_ledger_timestamp: number;
+}
+
+/** Alias for SettledEvent */
+export type SettledEvt = SettledEvent;
 
 /** One step in the optional tiered yield ladder. Immutable after init. */
 export interface YieldTier {
@@ -74,18 +95,54 @@ export interface EscrowSummary {
   funding_close_snapshot: FundingCloseSnapshot | null;
   unique_funder_count: number;
   is_allowlist_active: boolean;
+  allowlist_active: boolean;
+  dispute_pause_active: boolean;
+  dispute_pause_expiry: string | null;
   schema_version: number;
   sme_collateral_commitment: SmeCollateralCommitment | null;
   has_primary_attestation: boolean;
   attestation_log_length: number;
 }
 
-/** Result of checking whether another distinct investor can contribute. */
+/** Quick health check result returned by check_escrow_health. */
+export interface CheckEscrowHealth {
+  warning_type: string; // Human-readable warning label or "healthy"
+  funded_ratio_bps: string; // i64 → bigint string, basis points (0-10000)
+  time_to_maturity_secs: string; // i64 → bigint string, seconds until maturity
+}
+
+/** Full escrow health diagnostic returned by get_escrow_health. */
+export interface EscrowHealth {
+  warning_type: string; // Human-readable warning label or "healthy"
+  funded_ratio_bps: string; // i64 → bigint string, basis points (0-10000)
+  time_to_maturity_secs: string; // i64 → bigint string, seconds until maturity
+  status_label: string; // Human-readable status (e.g., "Open", "Funded", "Settled")
+  is_maturity_locked: boolean;
+  is_legal_held: boolean;
+  unique_funder_count: number;
+}
+
+/** Investor capacity status returned by get_investor_cap_status. */
 export interface InvestorCapStatus {
+  /** Maximum number of distinct investors allowed (2^32-1 if unlimited). */
   max: number;
+  /** Current number of distinct investors that have contributed. */
   current: number;
+  /** Remaining slots for new investors; 0 means cap reached. */
   remaining: number;
+  /** Whether the investor cap is at maximum. */
   is_full: boolean;
+}
+
+/** Per-investor position snapshot returned by `get_investor_position`. */
+export interface InvestorPosition {
+  contribution: string;
+  yield_bps: string;
+  claim_not_before: string;
+  claimed: boolean;
+  refunded: boolean;
+  lock_in_until: string;
+  yield_claim_delegate: string | null;
 }
 
 /** Snapshot payload returned by `export_state` and accepted by `import_state`. */
@@ -536,3 +593,29 @@ export function parseResult<T>(
     };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Health check types and utilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Health check warning type constants for easy comparison.
+ */
+export const HEALTH_CHECK_WARNINGS = {
+  HEALTHY: "healthy",
+  UNDERFUNDED: "underfunded",
+  APPROACHING_MATURITY: "approaching_maturity",
+  MATURITY_PASSED: "maturity_passed",
+  LEGAL_HOLD: "legal_hold",
+} as const;
+
+/**
+ * Human-readable descriptions for each warning type.
+ */
+export const HEALTH_CHECK_WARNING_LABELS: Record<string, string> = {
+  healthy: "Escrow is healthy with sufficient funding and time",
+  underfunded: "Escrow is underfunded relative to target",
+  approaching_maturity: "Escrow is approaching maturity deadline",
+  maturity_passed: "Escrow maturity has passed or is overdue",
+  legal_hold: "Escrow is under legal hold",
+};

@@ -1,298 +1,347 @@
-# karis-ky Escrow REPL CLI Tool
+# KARIS-KY REPL CLI - Health Check Commands
 
-Interactive REPL (read-eval-print loop) CLI for inspecting karis-ky escrow contract state without writing test code.
+This is a REPL (Read-Eval-Print Loop) command-line interface for the KARIS-KY escrow contract, with a focus on health check and diagnostic commands for on-call operators.
+
+## Overview
+
+The REPL CLI provides a command-line interface to interact with the KARIS-KY escrow contract deployed on the Stellar network. Currently, it exposes health check and health metrics endpoints with color-coded output to make diagnostics quick and easy for operators.
 
 ## Features
 
-**MVP supported commands:**
-- `get_escrow` — Fetch current escrow state
-- `get_version` — Fetch contract schema version  
-- `is_dispute_paused` — Check if dispute pause is active
-- `get_legal_hold` — Check if legal hold is active
-- `export_state` — Export complete state snapshot for backup or migration
+- **Health Check Command** (`check_health`) - Quick assessment of escrow health status
+- **Health Metrics Command** (`get_health`) - Detailed metrics view
+- **Color-Coded Output** - Visual indicators for severity levels:
+  - 🟢 **Green** - Healthy status (code 0)
+  - 🟡 **Yellow** - Warning conditions (codes 4001, 4002, 4004)
+  - 🔴 **Red** - Critical conditions (code 4003)
+- **Interactive REPL Loop** - Command history, line editing, autocomplete
 
-**Output format:** Pretty-printed JSON for easy parsing and display.
+## Installation & Build
 
-## Installation
+### Prerequisites
 
-```bash
-cd repl-cli
-cargo build --release
-```
+- Rust 1.75+ (for edition 2021)
+- Cargo
+- Stellar testnet/mainnet access (for live contract calls)
 
-Binary: `target/release/escrow-repl`
+### Build
 
-## Usage
-
-### Demo mode (no contract required)
+From the workspace root:
 
 ```bash
-escrow-repl
+cargo build -p repl-cli --release
 ```
 
-Runs in **demo mode** with mock data for testing commands.
+The binary will be at `target/release/repl-cli` (or `repl-cli.exe` on Windows).
 
-### Network presets
-
-The `--network` flag selects a predefined RPC endpoint. Supported values:
-
-| Network   | RPC URL                                        |
-|-----------|------------------------------------------------|
-| `testnet` | `https://soroban-testnet.stellar.org`          |
-| `mainnet` | `https://soroban-mainnet.stellar.org`          |
-| `local`   | `http://localhost:8000`                        |
-
-Unknown values print a helpful error listing the valid presets.
-
-### Connect to testnet
+### Run
 
 ```bash
-escrow-repl --network testnet --contract CBXYZ123...
+cargo run -p repl-cli
+
+# Or directly with the binary:
+./target/release/repl-cli
 ```
 
-### Connect to mainnet
+## Commands Reference
 
-```bash
-escrow-repl --network mainnet --contract CBXYZ123...
+### `check_health`
+
+**Purpose**: Perform a quick health check on the escrow contract.
+
+**Returns**: 
+- `warning_type` - Health warning code (u32)
+  - `0` - No warning (healthy)
+  - `4001` - Low funding ratio (< 50% funded)
+  - `4002` - Close to maturity (< 1 day remaining)
+  - `4003` - Over maturity (past maturity, unfunded, and open)
+  - `4004` - Reserved for future use
+
+- `funded_ratio_bps` - Funding ratio in basis points (0–10,000+)
+  - Example: `5000` = 50% funded
+  
+- `time_to_maturity_secs` - Seconds until maturity
+  - Positive = future maturity
+  - Negative = past maturity
+  - `i64::MAX` = no maturity constraint
+
+**Output**: Color-coded status line with warning description.
+
+**Usage**:
+```
+repl-cli> check_health
+
+═══════════════════════════════════════════════════════
+ESCROW HEALTH CHECK
+═══════════════════════════════════════════════════════
+
+Status: ✓ HEALTHY
+Warning Code: 0
+Description: Healthy - No warning
+
+Funding Ratio: 75.00%
+Time to Maturity: 5 days, 0 hours
+
+═══════════════════════════════════════════════════════
 ```
 
-### Connect to local validator
+**Severity Mapping**:
+| Code | Severity | Condition |
+|------|----------|-----------|
+| 0 | ✓ Green | Healthy |
+| 4001 | ⚠ Yellow | Low funding ratio (< 50%) |
+| 4002 | ⚠ Yellow | Close to maturity (< 1 day) |
+| 4003 | ✗ Red | Over maturity (past maturity, unfunded, open) |
 
-```bash
-escrow-repl --network local --contract CBXYZ123...
+### `get_health`
+
+**Purpose**: Retrieve detailed health metrics for the escrow contract.
+
+**Returns**:
+- `funding_progress_percent` (u32) - Funding progress as percentage (0–100)
+- `days_to_maturity` (i64) - Days until maturity
+  - Negative if past maturity
+  - 0 if no maturity constraint
+  
+- `unique_investor_count` (u32) - Number of unique investors
+- `average_contribution_size` (i128) - Average contribution per investor (stroops)
+- `estimated_yield_payout` (i128) - Total estimated yield (stroops)
+
+**Output**: Pretty-printed table with detailed metrics.
+
+**Usage**:
+```
+repl-cli> get_health
+
+═══════════════════════════════════════════════════════
+ESCROW HEALTH METRICS
+═══════════════════════════════════════════════════════
+
+Funding Progress: 75%
+Days to Maturity: 5
+Unique Investors: 42
+Avg. Contribution: 238095 stroops
+Est. Yield Payout: 500000 stroops
+
+═══════════════════════════════════════════════════════
 ```
 
-### Custom RPC endpoint
+### `help [command]`
 
-`--rpc-url` overrides the endpoint selected by `--network`:
+**Purpose**: Display help information for available commands.
 
-```bash
-escrow-repl --network testnet --rpc-url https://custom-rpc.example.com --contract CBXYZ123...
+**Usage**:
+```
+repl-cli> help
+repl-cli> help check_health
+repl-cli> help get_health
 ```
 
-## Commands
+### `fund_with_commitment`
 
-### `get_escrow`
+**Purpose**: Test and simulate first-time investor contribution with commitment lock and view selected yield tier.
 
-Fetch the current escrow state.
+**Arguments**:
+- `<investor>` - The investor address (Stellar format)
+- `<amount>` - Principal contribution in stroops
+- `<lock_secs>` - Lock duration in seconds
 
+**Usage**:
 ```
-escrow> get_escrow
-```
-
-**Output:**
-```json
+repl-cli> fund_with_commitment GDPM3QMXN3APYMYBNPIBMVJHD3FQJSCAEBFHDZZS3MSVVUAOTBMVYF2 50000000 86400
 {
-  "invoice_id": "INV_DEMO_001",
-  "admin": "GADMIN...",
-  "sme_address": "GASME...",
-  "amount": 100000000,
-  "funded_amount": 95000000,
-  "yield_bps": 500,
-  "status": 1,
-  "status_label": "funded",
-  "maturity": 1700000000,
-  "created_at": 1690000000,
-  "updated_at": 1690001000
-}
-```
-
-### `get_version`
-
-Fetch contract schema version and build metadata.
-
-```
-escrow> get_version
-```
-
-**Output:**
-```json
-{
-  "schema_version": 7,
-  "contract_version": "0.1.0",
-  "build_timestamp": "2026-08-29T09:15:05Z"
-}
-```
-
-### `is_dispute_paused`
-
-Check if a dispute pause is currently active (separate from legal hold).
-
-```
-escrow> is_dispute_paused
-```
-
-**Output:**
-```json
-{
-  "is_paused": false,
-  "pause_reason": null,
-  "pause_ticket_id": null,
-  "paused_at": null,
-  "resumes_at": null
-}
-```
-
-### `get_legal_hold`
-
-Check whether a compliance/legal hold is active using the read-only `get_legal_hold_status`
-contract entrypoint.
-
-```
-escrow> get_legal_hold
-```
-
-**Output:**
-```json
-{
-  "legal_hold_status": false
-}
-```
-
-### `export_state`
-
-Export complete escrow state snapshot (includes escrow, legal hold, funding snapshots, attestations, etc.).
-
-Useful for backup, migration, or audit.
-
-```
-escrow> export_state
-escrow> export_state | jq . | less
-```
-
-**Output:**
-```json
-{
-  "schema_version": 7,
-  "escrow": {
-    "invoice_id": "INV_DEMO_001",
-    "admin": "GADMIN...",
-    "sme_address": "GASME...",
-    "amount": 100000000,
-    "funded_amount": 95000000,
-    "yield_bps": 500,
-    "status": 1
+  "status": "success",
+  "investor": "GDPM3QMXN3APYMYBNPIBMVJHD3FQJSCAEBFHDZZS3MSVVUAOTBMVYF2",
+  "amount": 50000000,
+  "lock_secs": 86400,
+  "yield_tier_selected": {
+    "tier_index": 1,
+    "effective_yield_bps": 650
   },
-  "funding_token": "TOKEN...",
-  "treasury": "GTREASURY...",
-  "legal_hold": false,
-  "unique_funder_count": 42,
-  "funding_close_snapshot": {
-    "total_principal": 95000000,
-    "target": 100000000,
-    "closed_at": 1690001000,
-    "closed_ledger": 12345
-  }
+  "claim_not_before": 1700086400
 }
 ```
 
-## Examples
+### `quit` / `exit`
 
-### Basic inspection
+**Purpose**: Exit the REPL CLI.
 
-```bash
-$ escrow-repl --network testnet --contract CBXYZ123...
-
-karis-ky Escrow REPL v1.0
-Type 'help' for command list
-
-escrow> get_escrow
-{
-  "invoice_id": "INV_001",
-  "status": 1,
-  "status_label": "funded",
-  ...
-}
-
-escrow> get_version
-{
-  "schema_version": 7,
-  ...
-}
+**Usage**:
+```
+repl-cli> quit
+repl-cli> exit
 ```
 
-### Export and process with jq
+## Warning Codes Reference
 
-```bash
-$ escrow-repl --network testnet --contract CBXYZ123...
+The `check_health` command returns warning codes that indicate different health conditions:
 
-escrow> export_state | jq '.escrow | {status, funded_amount, funding_target}'
-{
-  "status": 1,
-  "funded_amount": 95000000,
-  "funding_target": 100000000
-}
-```
+### Code 0: Healthy ✓ (Green)
+No warning condition detected. The escrow is:
+- Adequately funded (≥ 50%)
+- Not close to maturity (> 1 day remaining)
+- Not past maturity (if maturity constraint exists)
 
-### Save snapshot to file
+### Code 4001: Low Funding Ratio ⚠ (Yellow)
+The escrow has a low funding ratio (< 50% funded):
+- If close to maturity (< 1 day), operators should accelerate fundraising
+- If time permits, monitor funding progress
 
-```bash
-escrow> export_state > escrow_snapshot.json
-```
+**Action**: Check funding progress and investor updates.
 
-### Check pause status
+### Code 4002: Close to Maturity ⚠ (Yellow)
+The escrow is approaching maturity (< 1 day remaining):
+- Funding is adequate (≥ 50%)
+- Operators should prepare for settlement
+- Monitor for last-minute investor withdrawals
 
-```bash
-escrow> is_dispute_paused
-{
-  "is_paused": true,
-  "pause_ticket_id": "DISPUTE_123",
-  "paused_at": 1690000000,
-  "resumes_at": 1690003600
-}
-```
+**Action**: Prepare settlement process; monitor funding stability.
 
-## Help
+### Code 4003: Over Maturity ✗ (Red) — CRITICAL
+The escrow has passed maturity, remains open, and is not fully funded:
+- **Critical**: Contract cannot settle until fully funded or closed by admin
+- Operator action required to resolve
 
-```
-escrow> help
-```
-
-Show all available commands and usage examples.
-
-```
-escrow> help export_state
-```
-
-Show detailed help for a specific command.
+**Action**: Immediately contact admin; consider closing or extending escrow.
 
 ## Architecture
 
-- `main.rs` — REPL loop, command parser, network abstraction
-- MVP implementation with demo mode (mock data)
-- Future: Real Soroban RPC integration via stellar-sdk
+### Data Flow
 
-## Status
+1. **User Input** → Command Parser
+2. **Command Parser** → Command Enum
+3. **Command Enum** → Handler (check_health/get_health)
+4. **Handler** → Contract RPC Call (Soroban)
+5. **Contract Response** → Formatter
+6. **Formatter** → Colored Output → Terminal
 
-**Current:** MVP with demo mode and command parsing  
-**Next:** Real Soroban RPC integration for live contract inspection
+### Color Output
 
-## Limitations
+Uses the `colored` crate for cross-platform ANSI color support:
+- 🟢 `.green()` for healthy status
+- 🟡 `.yellow()` for warnings
+- 🔴 `.red()` for critical issues
+- 🔵 `.bright_blue()` for section headers
 
-- **Demo mode only:** Commands return mock data until Soroban RPC integration is added
-- **Read-only:** Inspection only; no write operations (state mutations require `soroban contract invoke`)
-- **Single network:** Use `--network` to switch (no persistent profile storage yet)
+### REPL Loop
 
-## Testing
+Uses `rustyline` for an interactive command-line interface with:
+- Command history
+- Line editing
+- Interrupt handling (Ctrl+C)
+- EOF handling (Ctrl+D)
 
-```bash
-cargo test --lib
+## Configuration
+
+### Network Selection (Future Enhancement)
+
+The current implementation uses mock data. Future versions will support:
+```
+repl-cli> network switch testnet
+repl-cli> network switch mainnet
 ```
 
-Run unit tests for command parsing and help text generation.
+### Contract Address (Future Enhancement)
+
+Specify the escrow contract address:
+```
+repl-cli> contract set CDKLKDLKDLKDLKD...
+```
+
+## Development
+
+### Project Structure
+
+```
+repl-cli/
+├── Cargo.toml           # Dependencies and build configuration
+├── README.md            # This file
+└── src/
+    └── main.rs          # Main REPL loop and command handlers
+```
+
+### Dependencies
+
+- `rustyline = "14.0"` - Interactive REPL with line editing
+- `colored = "2.1"` - ANSI color output
+- `serde_json = "1.0"` - JSON serialization
+- `soroban-cli = "21.7"` - Soroban SDK for contract interaction
+- `tokio = "1.37"` - Async runtime
+- `anyhow = "1.0"` - Error handling
+
+### Adding New Commands
+
+1. Add variant to `Command` enum in `main.rs`
+2. Add parsing logic in `parse_command()`
+3. Add handler in the REPL loop
+4. Update help text in `display_help()`
+
+Example:
+```rust
+pub enum Command {
+    CheckHealth,
+    GetHealth,
+    MyNewCommand { arg: String },  // Add here
+    // ...
+}
+
+// In parse_command():
+Some("my_new_command") => {
+    let arg = parts.get(1).ok_or(anyhow!("Argument required"))?;
+    Ok(Command::MyNewCommand { arg: arg.to_string() })
+}
+
+// In REPL loop:
+Ok(Command::MyNewCommand { arg }) => {
+    // Handle command
+}
+```
+
+## Troubleshooting
+
+### Build Fails
+- Ensure Rust 1.75+ is installed: `rustc --version`
+- Update dependencies: `cargo update`
+
+### Commands Not Found
+- Type `help` to see available commands
+- Check spelling (commands are lowercase with underscores)
+
+### Connection Issues (Future)
+- Verify network connectivity
+- Check contract address: `network info`
+- Review RPC endpoint configuration
 
 ## Future Enhancements
 
-1. **Real RPC integration:** Call live contract via Soroban RPC
-2. **Transaction support:** Invoke state-mutating entrypoints (fund, settle, etc.)
-3. **Network profiles:** Persistent network configuration (.escrow-repl.toml)
-4. **Snapshots:** Save and restore local snapshots for debugging
-5. **Event history:** Query recent contract events
-6. **Batch operations:** Multi-command scripts
-7. **Interactive help:** Command completion and context-sensitive tips
+- [ ] Live contract invocation via Soroban RPC
+- [ ] Network switching (testnet/mainnet)
+- [ ] Contract address configuration
+- [ ] State inspection commands (get, state, history)
+- [ ] Debugging commands (trace, breakpoint, snapshot)
+- [ ] Transaction execution (call, dry-run)
+- [ ] Event history and indexing
+- [ ] CSV/JSON export of metrics
+- [ ] Automated alerting and notifications
 
-## See Also
+## Documentation
 
-- [FEATURE_220_REPL_DESIGN.md](../FEATURE_220_REPL_DESIGN.md) — Full design specification
-- [docs/escrow-sim-stellar-cli.md](../docs/escrow-sim-stellar-cli.md) — Stellar CLI recipes (reference)
-- [escrow contract](../escrow) — Main contract implementation
+For more information on the KARIS-KY contract health check implementation, see:
+- `docs/adr/ADR-008-escrow-health-warnings.md` - Architecture decision record
+- `FEATURE_220_REPL_DESIGN.md` - Full REPL CLI design specification
+- `escrow/src/lib.rs` - Contract implementation
+
+## Acceptance Criteria
+
+✅ Both `check_health` and `get_health` commands appear in help output  
+✅ Output is color-coded by warning severity (green/yellow/red)  
+✅ Commands are documented in repl-cli/README.md  
+✅ `cargo build` for repl-cli passes  
+
+## License
+
+Same as KARIS-KY main project.
+
+## Contact & Support
+
+For issues or questions, please open an issue on the project GitHub repository or contact the KARIS-KY team.

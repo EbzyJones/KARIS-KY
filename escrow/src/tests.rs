@@ -61,10 +61,12 @@ mod properties;
 mod properties_funding;
 mod secure_rng;
 mod settlement;
+mod tier_base_yield;
 mod tokenomics;
 mod upgrade_compat;
 mod validation;
 mod yield_distribution;
+mod yield_tier_table_read;
 
 /// Registers a new escrow contract instance and returns its contract id.
 pub fn deploy_id(env: &Env) -> Address {
