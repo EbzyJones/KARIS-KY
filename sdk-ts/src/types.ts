@@ -366,9 +366,34 @@ export enum EscrowErrorCode {
   // Beneficiary rotation + admin handover + funding deadline (160–164)
   LegalHoldBlocksBeneficiaryRotation = 160,
   RotationNotOpen = 161,
-  NewSmeSameAsCurrent = 162,
-  NoPendingAdmin = 163,
+  YieldSlippageDetected = 162,
+  YieldSlippageThresholdOutOfRange = 163,
   FundingDeadlinePassed = 164,
+
+  // Dispute pause (165–172)
+  DisputePausedBlocksFunding = 165,
+  DisputePausedBlocksSettlement = 166,
+  DisputePausedBlocksWithdrawal = 167,
+  DisputePausedBlocksInvestorClaims = 168,
+  DisputePauseDurationNotPositive = 169,
+  DisputeTicketIdEmpty = 170,
+  NoPauseActive = 171,
+  LedgerTimestampOverflow = 172,
+
+  // KYC + admin roles + multisig (173–180)
+  InvestorNotVerified = 173,
+  InsufficientAdminRole = 174,
+  InvalidAdminRoleList = 175,
+  MultisigThresholdInvalid = 176,
+  MultisigSignerListInvalid = 177,
+  MultisigOperationsListEmpty = 178,
+  MultisigInsufficientSigners = 179,
+  MultisigSignerNotAuthorized = 180,
+
+  // Admin handover + contract balance (181–183)
+  NewSmeSameAsCurrent = 181,
+  NoPendingAdmin = 182,
+  InsufficientContractBalance = 183,
 }
 
 /** Human-readable error descriptions keyed by error code. */
@@ -461,9 +486,28 @@ export const ESCROW_ERROR_LABELS: Record<number, string> = {
   213: "Legal-hold guardian must differ from admin",
   160: "Legal hold blocks beneficiary rotation",
   161: "Beneficiary rotation not permitted in current state",
-  162: "New SME must differ from current beneficiary",
-  163: "No pending admin",
+  162: "Yield slippage detected",
+  163: "Yield slippage threshold out of range",
   164: "Funding deadline has passed",
+  165: "Dispute pause blocks funding",
+  166: "Dispute pause blocks settlement",
+  167: "Dispute pause blocks withdrawal",
+  168: "Dispute pause blocks investor claims",
+  169: "Dispute pause duration must be positive",
+  170: "Dispute ticket ID must not be empty",
+  171: "No dispute pause active",
+  172: "Ledger timestamp overflow",
+  173: "Investor not verified by KYC provider",
+  174: "Insufficient admin role",
+  175: "Invalid admin role list",
+  176: "Multisig threshold invalid",
+  177: "Multisig signer list invalid",
+  178: "Multisig operations list empty",
+  179: "Multisig insufficient signers",
+  180: "Multisig signer not authorized",
+  181: "New SME must differ from current beneficiary",
+  182: "No pending admin",
+  183: "Insufficient contract balance",
 };
 
 /** Category groupings for error codes to help SDK consumers branch on categories. */
@@ -479,8 +523,10 @@ export const ESCROW_ERROR_CATEGORIES: Record<string, { range: [number, number]; 
   settlement: { range: [120, 129], label: "Settlement / payout failure" },
   cancelRefund: { range: [140, 143], label: "Cancel / refund failure" },
   legalHoldClear: { range: [150, 152], label: "Legal hold clear workflow failure" },
-  legalHoldActivation: { range: [207, 213], label: "Legal hold activation failure" },
-  beneficiary: { range: [160, 164], label: "Beneficiary / admin / deadline failure" },
+  beneficiary: { range: [160, 164], label: "Beneficiary / yield / deadline failure" },
+  disputePause: { range: [165, 172], label: "Dispute pause / timestamp failure" },
+  kycRolesMultisig: { range: [173, 180], label: "KYC / admin role / multisig failure" },
+  adminHandover: { range: [181, 183], label: "Admin handover / contract balance failure" },
 };
 
 /**
