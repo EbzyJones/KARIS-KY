@@ -2,7 +2,7 @@
 //!
 //! This module validates:
 //! 1. Enable/disable automatic yield distribution
-//! 2. Settlement-time snapshot creation with YieldDistributionSnapshotCreated event
+//! 2. Settlement-time snapshot creation with YieldDistSnapshotCreated event
 //! 3. Auto-distributed yield claim with AutoDistributedYieldClaimed event
 //! 4. Fallback to on-demand yield computation when auto-distribution disabled
 //! 5. Backwards compatibility (disabled by default)
@@ -71,36 +71,39 @@ fn setup_yield_distribution_test(
 #[test]
 fn enable_auto_distribution_sets_flag() {
     let env = Env::default();
-    let (client, _investors, _admin, _sme) = setup_yield_distribution_test(&env, 1, 100_000_000_000i128, false);
+    let (client, _investors, _admin, _sme) =
+        setup_yield_distribution_test(&env, 1, 100_000_000_000i128, false);
 
     // Initially disabled (default)
-    assert!(!client.is_yield_auto_distribution_enabled());
+    assert!(!client.is_yield_auto_dist_enabled());
 
     // Enable it
     client.enable_yield_auto_distribution();
-    assert!(client.is_yield_auto_distribution_enabled());
+    assert!(client.is_yield_auto_dist_enabled());
 }
 
 #[test]
 fn disable_auto_distribution_clears_flag() {
     let env = Env::default();
-    let (client, _investors, _admin, _sme) = setup_yield_distribution_test(&env, 1, 100_000_000_000i128, true);
+    let (client, _investors, _admin, _sme) =
+        setup_yield_distribution_test(&env, 1, 100_000_000_000i128, true);
 
     // Initially enabled
-    assert!(client.is_yield_auto_distribution_enabled());
+    assert!(client.is_yield_auto_dist_enabled());
 
     // Disable it
     client.disable_yield_auto_distribution();
-    assert!(!client.is_yield_auto_distribution_enabled());
+    assert!(!client.is_yield_auto_dist_enabled());
 }
 
 #[test]
 fn auto_distribution_defaults_to_disabled() {
     let env = Env::default();
-    let (client, _investors, _admin, _sme) = setup_yield_distribution_test(&env, 1, 100_000_000_000i128, false);
+    let (client, _investors, _admin, _sme) =
+        setup_yield_distribution_test(&env, 1, 100_000_000_000i128, false);
 
     // Default is false (backwards compatible)
-    assert!(!client.is_yield_auto_distribution_enabled());
+    assert!(!client.is_yield_auto_dist_enabled());
 }
 
 // ── 2. Settlement snapshot creation ──────────────────────────────────────────
@@ -108,7 +111,8 @@ fn auto_distribution_defaults_to_disabled() {
 #[test]
 fn settlement_with_auto_dist_disabled_no_snapshot() {
     let env = Env::default();
-    let (client, _investors, _admin, _sme) = setup_yield_distribution_test(&env, 2, 50_000_000_000i128, false);
+    let (client, _investors, _admin, _sme) =
+        setup_yield_distribution_test(&env, 2, 50_000_000_000i128, false);
 
     // Settle without auto-distribution enabled
     client.settle();
@@ -370,7 +374,7 @@ fn default_escrow_has_auto_dist_disabled() {
     );
 
     // Auto-distribution should be disabled by default
-    assert!(!client.is_yield_auto_distribution_enabled());
+    assert!(!client.is_yield_auto_dist_enabled());
 }
 
 // ── 7. Feature doesn't break existing claim flow ──────────────────────────────

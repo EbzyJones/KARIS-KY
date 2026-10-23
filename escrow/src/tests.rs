@@ -8,10 +8,11 @@
 )]
 #[allow(unused_imports)]
 use super::{
-    AttestationDigestRevoked, CollateralRecordedEvt, DataKey, EscrowError, EscrowFunded,
+    AttestationBoundEvt, AttestationDigestRevoked, CollateralRecordedEvt, DataKey, EscrowError, EscrowFunded,
     EscrowInitialized, FundingTargetUpdated, LiquifactEscrow, LiquifactEscrowClient,
     MaxUniqueInvestorsCapLowered, YieldClaimDelegationRevoked, YieldClaimDelegationSet, YieldTier,
-    MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT, MAX_FUND_BATCH, SCHEMA_VERSION,
+    LEGAL_HOLD_PROPOSAL_TTL_SECS, MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT,
+    MAX_FUND_BATCH, SCHEMA_VERSION,
 };
 use soroban_sdk::{
     symbol_short,
@@ -51,7 +52,6 @@ mod coverage;
 mod dos_analysis;
 mod external_calls;
 mod external_calls_mocked;
-mod validation;
 mod funding;
 mod health_and_events;
 mod init;
@@ -61,9 +61,12 @@ mod properties;
 mod properties_funding;
 mod secure_rng;
 mod settlement;
+mod tier_base_yield;
 mod tokenomics;
 mod upgrade_compat;
+mod validation;
 mod yield_distribution;
+mod yield_tier_table_read;
 
 /// Registers a new escrow contract instance and returns its contract id.
 pub fn deploy_id(env: &Env) -> Address {
@@ -301,8 +304,11 @@ fn test_escrow_error_codes_are_unique() {
         &None,
         &None,
         &None,
+        &None, // No max funding rate
         &None, // No yield slippage threshold
         &None, // No settlement notifier
+        &None, // No KYC provider
+        &None, // No admin roles
     );
 }
 
@@ -346,7 +352,8 @@ pub fn init_and_fund_with_real_token<'a>(
         &None,
         &None,
         &None,
-        &None,        &None,
+        &None,
+        &None,
         &None,
         &None,
         &None,

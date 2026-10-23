@@ -132,7 +132,7 @@ fn test_revoke_yield_claim_delegate_requires_investor_auth() {
 }
 
 #[test]
-fn test_claim_investor_payout_as_delegate_basic() {
+fn test_claim_payout_as_delegate_basic() {
     let env = Env::default();
     let (client, _admin, _sme) = auth_audit_init_funded(&env);
 
@@ -151,7 +151,7 @@ fn test_claim_investor_payout_as_delegate_basic() {
 }
 
 #[test]
-fn test_claim_investor_payout_as_delegate_requires_delegation() {
+fn test_claim_payout_as_delegate_requires_delegation() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
@@ -168,12 +168,12 @@ fn test_claim_investor_payout_as_delegate_requires_delegation() {
     client.settle();
 
     // Try to claim as delegate without delegation - should fail
-    let result = client.try_claim_investor_payout_as_delegate(&investor, &delegate);
+    let result = client.try_claim_payout_as_delegate(&investor, &delegate);
     assert_contract_error(result, EscrowError::NoDelegationSet);
 }
 
 #[test]
-fn test_claim_investor_payout_as_delegate_revoked_fails() {
+fn test_claim_payout_as_delegate_revoked_fails() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
@@ -194,12 +194,38 @@ fn test_claim_investor_payout_as_delegate_revoked_fails() {
     client.settle();
 
     // Try to claim as delegate - should fail because delegation is revoked
-    let result = client.try_claim_investor_payout_as_delegate(&investor, &delegate);
+    let result = client.try_claim_payout_as_delegate(&investor, &delegate);
     assert_contract_error(result, EscrowError::DelegationRevoked);
 }
 
 #[test]
-fn test_claim_investor_payout_as_delegate_wrong_delegate_fails() {
+fn test_redelegation_allows_new_delegate_and_rejects_former_delegate() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let investor = Address::generate(&env);
+    let former_delegate = Address::generate(&env);
+    let new_delegate = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.set_yield_claim_delegate(&investor, &former_delegate);
+    client.fund(&investor, &TARGET);
+    client.settle();
+    client.revoke_yield_claim_delegate(&investor);
+
+    let revoked_claim = client.try_claim_payout_as_delegate(&investor, &former_delegate);
+    assert_contract_error(revoked_claim, EscrowError::DelegationRevoked);
+
+    client.set_yield_claim_delegate(&investor, &new_delegate);
+    let former_claim = client.try_claim_payout_as_delegate(&investor, &former_delegate);
+    assert_contract_error(former_claim, EscrowError::NoDelegationSet);
+
+    client.claim_payout_as_delegate(&investor, &new_delegate);
+}
+
+#[test]
+fn test_claim_payout_as_delegate_wrong_delegate_fails() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
     default_init(&client, &env, &admin, &sme);
@@ -220,7 +246,7 @@ fn test_claim_investor_payout_as_delegate_wrong_delegate_fails() {
     client.settle();
 
     // Try to claim as wrong delegate - should fail
-    let result = client.try_claim_investor_payout_as_delegate(&investor, &wrong_delegate);
+    let result = client.try_claim_payout_as_delegate(&investor, &wrong_delegate);
     assert_contract_error(result, EscrowError::NoDelegationSet);
 }
 
@@ -273,6 +299,85 @@ fn test_reset_delegation_after_revocation() {
     // Re-set (new delegation should clear revocation)
     client.set_yield_claim_delegate(&investor, &delegate);
     assert!(!client.is_yield_claim_delegate_revoked(&investor));
+}
+
+#[test]
+fn test_get_investor_position_reflects_delegation_set() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let investor = Address::generate(&env);
+    let delegate = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Fund the investor so a position exists
+    client.fund(&investor, &1_000);
+
+    // No delegation yet
+    let position = client.get_investor_position(&investor);
+    assert_eq!(position.yield_claim_delegate, None);
+
+    // Set delegation
+    client.set_yield_claim_delegate(&investor, &delegate);
+
+    // Position should reflect the delegate
+    let position = client.get_investor_position(&investor);
+    assert_eq!(position.yield_claim_delegate, Some(delegate.clone()));
+}
+
+#[test]
+fn test_get_investor_position_reflects_delegation_revoked() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let investor = Address::generate(&env);
+    let delegate = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Fund the investor so a position exists
+    client.fund(&investor, &1_000);
+
+    // Set delegation
+    client.set_yield_claim_delegate(&investor, &delegate);
+    let position = client.get_investor_position(&investor);
+    assert_eq!(position.yield_claim_delegate, Some(delegate.clone()));
+
+    // Revoke delegation
+    client.revoke_yield_claim_delegate(&investor);
+
+    // Position should no longer reflect an active delegate
+    let position = client.get_investor_position(&investor);
+    assert_eq!(position.yield_claim_delegate, None);
+}
+
+#[test]
+fn test_get_investor_position_reflects_delegation_overwritten() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let investor = Address::generate(&env);
+    let delegate1 = Address::generate(&env);
+    let delegate2 = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Fund the investor so a position exists
+    client.fund(&investor, &1_000);
+
+    // Set first delegation
+    client.set_yield_claim_delegate(&investor, &delegate1);
+    let position = client.get_investor_position(&investor);
+    assert_eq!(position.yield_claim_delegate, Some(delegate1.clone()));
+
+    // Overwrite with second delegation
+    client.set_yield_claim_delegate(&investor, &delegate2);
+    let position = client.get_investor_position(&investor);
+    assert_eq!(position.yield_claim_delegate, Some(delegate2.clone()));
 }
 
 #[test]

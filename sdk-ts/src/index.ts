@@ -4,8 +4,11 @@
 
 export {
   EscrowClient,
+  ValidationError,
   type EscrowClientConfig,
   type SorobanRpcClient,
+  type SorobanEventFilter,
+  type SorobanEventQuery,
 } from "./client";
 
 export {
@@ -25,13 +28,25 @@ export {
   toBaseUnits,
   fromBaseUnits,
   parseResult,
+  HEALTH_CHECK_WARNINGS,
+  HEALTH_CHECK_WARNING_LABELS,
   type InvoiceEscrow,
   type YieldTier,
   type FundingCloseSnapshot,
   type SmeCollateralCommitment,
   type EscrowSummary,
+  type InvestorCapStatus,
+  type InvestorPosition,
+  type EscrowSnapshot,
   type ErrorDiagnostic,
   type EscrowTemplate,
   type InitParams,
+  type AdminRole,
   type SorobanResult,
+  type AttestationBoundEvt,
+  type EscrowEvent,
+  type SorobanEventPage,
+  type EscrowEventSubscriptionOptions,
+  type CheckEscrowHealth,
+  type EscrowHealth,
 } from "./types";

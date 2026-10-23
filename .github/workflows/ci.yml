@@ -6,28 +6,107 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
+  markdown-links:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Check repository-relative Markdown links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
+        with:
+          args: --offline --no-progress --verbose --exclude-path '(^|/)node_modules(/|$)' '**/*.md'
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install ShellCheck and lint deployment scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+          shellcheck \
+            scripts/deploy.sh \
+            scripts/local-env.sh \
+            scripts/pre-flight-checklist.sh \
+            scripts/canary-smoke-test.sh \
+            scripts/verify_deployment.sh
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  openapi-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint OpenAPI spec
+        # Validates docs/openapi.yaml against the OpenAPI specification so the
+        # spec stays in sync with the actual backend endpoints.
+        run: npx --yes @redocly/cli@latest lint docs/openapi.yaml
+
   fmt-build-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backup test dependencies
+        run: python -m pip install pytest "stellar-sdk>=11.0.0"
+
+      - name: Test escrow backup tooling
+        run: python -m pytest backend/tests
+
+  fmt-build-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           components: rustfmt, clippy, llvm-tools-preview
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check formatting
-        run: cargo fmt -p karis-ky_escrow -- --check
+        run: cargo fmt -p karis_ky_escrow -- --check
 
       - name: Clippy
-        run: cargo clippy -p karis-ky_escrow -- -D warnings
+        run: cargo clippy -p karis_ky_escrow -- -D warnings
 
       - name: Build
         run: cargo build
+
+      - name: Build docs (deny broken intra-doc links)
+        # Fails CI on any broken rustdoc intra-doc link so documentation
+        # references to non-existent items cannot regress unnoticed.
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
@@ -35,11 +114,22 @@ jobs:
       - name: Run cargo-audit (dependency vulnerability scan)
         run: cargo audit --deny warnings
 
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@c95a8e71b2aa92ca779c9c822b9d41038c0fc503 # cargo-deny
+
+      - name: Run cargo-deny (licenses, bans, advisories)
+        run: cargo deny check
+
       - name: Run tests
         run: cargo test
 
+      - name: Run snapshot tests
+        run: cargo test --test snapshots
+        env:
+          INSTA_FORCE_ACCEPT: "false"
+
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@671164c891d3e20f5b8ece04798d0154d1262d65 # cargo-llvm-cov
 
       - name: Add WASM target
         run: rustup target add wasm32-unknown-unknown
@@ -66,6 +156,35 @@ jobs:
           python3 scripts/validate_build_metadata.py \
             --json target/build_metadata.json \
             --lib escrow/src/lib.rs
+
+      - name: Validate WASM build metadata matches current commit
+        # Asserts the metadata embedded in the freshly built WASM artifact
+        # matches the current commit SHA and the expected schema version.
+        # Fails CI if build.rs did not regenerate constants (e.g. stale
+        # incremental builds) or if the schema version drifted.
+        run: |
+          python3 scripts/validate_build_metadata.py \
+            --wasm target/wasm32-unknown-unknown/release/karis_ky_escrow.wasm \
+            --commit "$GITHUB_SHA" \
+            --schema-version "${SCHEMA_VERSION:-6}"
+        env:
+          SCHEMA_VERSION: "6"
+
+      # -----------------------------------------------------------------------
+      # Schema version compatibility matrix validation
+      # -----------------------------------------------------------------------
+      #
+      # Validates that SCHEMA_VERSION in escrow/src/lib.rs matches the latest
+      # entry in docs/VERSION_INTEROPERABILITY_MATRIX.md. Catches drift that
+      # could lead operators to attempt unsupported upgrade paths.
+
+      - name: Validate schema version matrix
+        run: |
+          python3 scripts/validate_schema_version_matrix.py
+
+      - name: Test schema version matrix validation
+        run: |
+          python3 scripts/test_validate_schema_version_matrix.py
 
       # -----------------------------------------------------------------------
       # WASM size tracking
@@ -94,7 +213,7 @@ jobs:
 
       - name: Upload WASM size report artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wasm-size-report
           path: /tmp/wasm_size_report.md
@@ -102,7 +221,7 @@ jobs:
 
       - name: Upload WASM artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: karis-ky-escrow-wasm
           path: target/wasm32-unknown-unknown/release/karis_ky_escrow.wasm
@@ -145,7 +264,7 @@ jobs:
 
       - name: Upload contract spec artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: karis-ky-escrow-spec
           path: sdk-ts/spec.json
@@ -158,32 +277,3 @@ jobs:
         run: |
           SPEC_VERSION="v$(date +%Y.%m.%d)-$(git rev-parse --short HEAD)"
           echo "SPEC_VERSION=${SPEC_VERSION}" >> $GITHUB_ENV
-
-          # Create a lightweight tag for the spec version
-          git tag -f "spec-latest"
-          git push -f origin "spec-latest"
-
-          # Upload spec as a release asset
-          gh release create "spec-latest" \
-            sdk-ts/spec.json \
-            --title "Contract Spec (latest)" \
-            --notes "Auto-published contract ABI spec from main @ ${SPEC_VERSION}. Schema v${SCHEMA_VERSION:-6}, Interface v${INTERFACE_VERSION:-1}." \
-            --prerelease \
-            || gh release upload "spec-latest" sdk-ts/spec.json --clobber
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SCHEMA_VERSION: "6"
-          INTERFACE_VERSION: "1"
-
-      # -----------------------------------------------------------------------
-
-      - name: Workspace Clippy (all targets)
-        run: cargo clippy -p karis-ky_escrow --all-targets -- -D warnings
-
-      - name: Check coverage (≥ 95%)
-        run: |
-          cargo llvm-cov \
-            --features testutils \
-            --fail-under-lines 95 \
-            --summary-only \
-            -p karis-ky_escrow

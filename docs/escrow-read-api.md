@@ -64,11 +64,15 @@ Returns the current schema version (`SCHEMA_VERSION`). Returns `0` before `init`
 
 ---
 
-## `get_legal_hold() → bool`
+## `get_legal_hold_status() → bool`
 
 **Storage key:** `DataKey::LegalHold`
 
 Returns `true` when a compliance hold is active. Defaults to `false` when the key is absent.
+This lightweight read-only entrypoint returns only the hold status, without loading the full
+`InvoiceEscrow` snapshot. No authorization is required.
+
+The legacy `get_legal_hold() → bool` entrypoint remains available and returns the same value.
 
 ---
 
@@ -112,6 +116,92 @@ Returns the optional immutable cap on cumulative principal for a single investor
 **Storage key:** `DataKey::UniqueFunderCount`
 
 Returns the count of distinct addresses that have contributed principal. Initialized to `0` at `init`.
+
+---
+
+## `get_investor_cap_status() → InvestorCapStatus`
+
+Returns a self-explanatory, single-call answer to "can more investors contribute?" without requiring
+client-side arithmetic on `get_max_unique_investors_cap()` and `get_unique_funder_count()`.
+
+### Use case
+
+Investor-facing UIs need to display whether an escrow has room for new contributions. This entrypoint
+eliminates error-prone client-side computation.
+
+### Return Type: `InvestorCapStatus`
+
+A `#[contracttype]` struct containing:
+
+- `max: u32` — Maximum number of distinct investors allowed. Returns `u32::MAX` (4,294,967,295) when no cap is set (unlimited).
+- `current: u32` — Current number of distinct investors that have contributed.
+- `remaining: u32` — Remaining capacity for new investors, computed as `max - current`.
+- `is_full: bool` — `true` when `current == max` (escrow is at capacity for new investors).
+
+### Behavior
+
+- **No cap set:** When `get_max_unique_investors_cap()` returns `None`, `max` is set to `u32::MAX` and `is_full` is always `false`.
+- **Cap exists:** When a cap is configured, `remaining = max - current`. When `current >= max`, `is_full = true`.
+- **Existing investors:** An escrow at capacity (`is_full = true`) can still accept additional principal from existing investors; the cap applies to **distinct addresses**, not total principal per address.
+- **Cap changes:** If the admin calls `lower_max_unique_investors`, the status reflects the new lower cap immediately.
+
+### Examples
+
+```rust
+// Escrow with no cap (unlimited investors)
+let status = get_investor_cap_status();
+// status.max = u32::MAX
+// status.current = 42
+// status.remaining = u32::MAX - 42
+// status.is_full = false
+
+// Escrow with cap of 100, 95 investors so far
+let status = get_investor_cap_status();
+// status.max = 100
+// status.current = 95
+// status.remaining = 5
+// status.is_full = false
+
+// Escrow with cap of 50, exactly 50 investors
+let status = get_investor_cap_status();
+// status.max = 50
+// status.current = 50
+// status.remaining = 0
+// status.is_full = true
+```
+
+---
+
+## `get_investor_position(investor: Address) → InvestorPosition`
+
+Aggregates every per-investor read into a single host invocation, so indexers and UIs can render
+an investor's full position without issuing one call per field. View-only (no auth, no state writes).
+
+### Return Type: `InvestorPosition`
+
+A `#[contracttype]` struct containing:
+
+- `contribution: i128` — Cumulative principal contributed by `investor`. **Storage key:** `DataKey::InvestorContribution(investor)`. `0` when absent.
+- `effective_yield_bps: i64` — Effective annualized yield (bps) locked in at the investor's first deposit. **Storage key:** `DataKey::InvestorEffectiveYield(investor)`. Falls back to `InvoiceEscrow::yield_bps` when the key is absent (legacy positions).
+- `claim_not_before: u64` — Earliest ledger timestamp at which the investor may call `claim_investor_payout`. **Storage key:** `DataKey::InvestorClaimNotBefore(investor)`. `0` means no extra gate beyond settled status.
+- `claimed: bool` — Whether the investor has exercised `claim_investor_payout`. **Storage key:** `DataKey::InvestorClaimed(investor)`. Defaults to `false`.
+
+### Behavior
+
+- **Safe fallback** — each field matches its individual getter exactly, returning the same default when the optional key is absent.
+- **No panic on unknown investor** — an address that has never contributed yields an all-default position (`contribution = 0`, `claimed = false`, etc.).
+- **Panics only** when the escrow itself is uninitialized, consistent with `get_escrow_summary`.
+
+### Relationship to individual getters
+
+The individual entrypoints remain available and are the source of truth for each field:
+
+- `get_contribution(investor)`
+- `get_investor_yield_bps(investor)`
+- `get_investor_claim_not_before(investor)`
+- `is_investor_claimed(investor)`
+
+`get_investor_position` is a convenience aggregate over these; it introduces no new storage keys.
 
 ---
 
@@ -202,6 +292,9 @@ A `#[contracttype]` struct containing:
 - `funding_close_snapshot: EscrowCloseSnapshot` — Custom option-like representation of the captured pro-rata denominator snapshot (detailed below).
 - `unique_funder_count: u32` — Distinct address count of contributors.
 - `is_allowlist_active: bool` — True if the investor allowlist is active.
+- `allowlist_active: bool` — True if the investor allowlist is active. Mirrors `is_allowlist_active`; provided as a convenience alias for consumers that read the summary field directly.
+- `dispute_pause_active: bool` — True when a dispute pause is currently in effect. Reflects the **auto-expiry-aware** state: a pause whose expiry has already passed is reported as inactive even if it was never explicitly cleared.
+- `dispute_pause_expiry: Option<u64>` — The ledger timestamp at which the active dispute pause expires, or `None` when no pause is active. Because the value is auto-expiry-aware, this is `None` whenever `dispute_pause_active` is `false`.
 - `schema_version: u32` — The schema version of the contract state.
 - `sme_collateral_commitment: Option<SmeCollateralCommitment>` — SME collateral pledge metadata, or `None` when never recorded.
 - `has_primary_attestation: bool` — True when a primary attestation hash has been bound via `bind_primary_attestation_hash`.

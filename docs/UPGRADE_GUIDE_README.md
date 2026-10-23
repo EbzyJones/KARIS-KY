@@ -45,6 +45,13 @@ This folder contains **4 interconnected documents** totaling ~2,200 lines coveri
 - **NO** → You're on **Additive WASM Upgrade** (safer, faster)
 - **YES** → You're on **Redeploy** (riskier, more complex)
 
+**2 min:** Remember that **every** on-chain code swap now goes through the
+guarded two-step flow (`propose_upgrade` → wait out the minimum delay →
+`execute_upgrade`). The direct `upgrade` entrypoint is deprecated and gated
+behind this flow; do not use it for new upgrades. See
+[Two-step upgrade flow](#-two-step-upgrade-flow-propose_upgrade--execute_upgrade)
+below.
+
 **5 min:** Read UPGRADE_DOCUMENTATION_INDEX.md to see the two paths
 
 **30 min:** Read the relevant section in MULTI_INSTANCE_UPGRADE_GUIDE.md:
@@ -52,6 +59,46 @@ This folder contains **4 interconnected documents** totaling ~2,200 lines coveri
 - Redeploy: Read Part 1 + 3
 
 **Execution:** Print and use UPGRADE_CHECKLIST.md
+
+---
+
+## 🔐 Two-step upgrade flow (`propose_upgrade` / `execute_upgrade`)
+
+All code swaps are guarded by a propose/execute pair with a mandatory minimum
+delay. This prevents a single compromised admin key from swapping the contract
+code in one transaction.
+
+### How it works
+
+1. **`propose_upgrade(new_wasm_hash)`** — Admin-only. Records the proposed WASM
+   hash and the earliest execution timestamp (`now + MIN_UPGRADE_DELAY`).
+   Emits an `upgrade_proposed` event. Proposing again replaces the pending
+   proposal and restarts the delay clock.
+2. **Wait out the minimum delay.** During this window operators can review the
+   proposed hash, verify the build, and coordinate legal hold. Execution before
+   the delay elapses is rejected.
+3. **`execute_upgrade()`** — Admin-only. Requires a pending proposal whose delay
+   has elapsed. Performs the actual WASM swap and emits an `upgrade_executed`
+   event. The pending proposal is cleared.
+
+### Interaction with the additive vs. redeploy decision
+
+The propose/execute flow is **orthogonal** to the additive-vs-redeploy choice —
+it only governs *how* the new WASM is applied, not *which* path you take:
+
+| Path | What the guarded flow does |
+|------|----------------------------|
+| **Additive WASM Upgrade** | `propose_upgrade(new_hash)` then `execute_upgrade()` after the delay. Same contract ID; rollback is another propose/execute pair with the previous hash. |
+| **Redeploy** | The new instance is deployed and initialized normally; the guarded flow applies only if you later upgrade that instance's WASM in place. |
+
+### Operator rules
+
+- Never call the deprecated direct `upgrade` entrypoint; it is gated behind the
+  new flow and will be removed at the next interface version bump.
+- Always confirm the delay has elapsed before calling `execute_upgrade()`.
+- Treat the proposal window as a review gate: verify the hash, run the
+  pre-upgrade checklist, and complete legal hold coordination inside it.
+- Record both the proposal and execution events in the upgrade record.
 
 ---
 
@@ -104,6 +151,7 @@ This guide meets all requested criteria:
 
 ### "I'm executing an upgrade today"
 → UPGRADE_CHECKLIST.md (print this) + UPGRADE_DECISION_TREES.md (keep open)
+→ Remember: `propose_upgrade(hash)` first, wait out the minimum delay, then `execute_upgrade()`
 
 ### "What type of upgrade should I do?"
 → OPERATOR_RUNBOOK.md Section 1 (5 min) + UPGRADE_DECISION_TREES.md Decision Tree 1
@@ -150,6 +198,7 @@ This guide meets all requested criteria:
 - ✓ Clean slate for initialization
 
 ### Both paths include:
+- Guarded two-step upgrade (`propose_upgrade` → delay → `execute_upgrade`)
 - Legal hold coordination (blocks operations during upgrade)
 - Testnet staging before mainnet
 - Pre-flight build/test/lint verification
@@ -186,6 +235,7 @@ This guide meets all requested criteria:
 | Question | Answer location |
 |----------|-----------------|
 | What upgrade path should I use? | OPERATOR_RUNBOOK.md § 1 or UPGRADE_DECISION_TREES.md § DT1 |
+| How do I actually apply the new WASM? | This README § Two-step upgrade flow |
 | Should I call migrate()? | UPGRADE_DECISION_TREES.md § DT2 |
 | Is it safe to upgrade this instance now? | UPGRADE_DECISION_TREES.md § DT3 |
 | What do I do if the upgrade fails? | UPGRADE_DECISION_TREES.md § DT4 |
@@ -264,6 +314,9 @@ For upgrades affecting future versions, update:
 - ✓ Governance and access control workflow
 
 **Ready to upgrade safely across multiple instances.**
+
+All upgrades are applied through the guarded `propose_upgrade` / `execute_upgrade`
+flow with a mandatory minimum delay.
 
 ---
 
