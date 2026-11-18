@@ -28,3 +28,29 @@ includes what it means and the operator action required to remediate it.
 3. Apply the remediation for the specific finding type from the table above.
 4. Re-run `detect_state_inconsistencies` to confirm the finding no longer appears.
 5. If a finding recurs after remediation, escalate to engineering — it likely indicates an upstream bug rather than a one-off data issue.
+
+## Pre-Flight Checklist Validation
+
+`scripts/pre-flight-checklist.sh` must stay in sync with the actual deploy steps. CI runs a
+validation step that checks the checklist's references still exist, so a stale checklist
+fails the build instead of misleading an operator during a deploy.
+
+### What the check does
+
+- Extracts every file path referenced by the checklist script and verifies each one exists
+  in the repository.
+- Extracts every `stellar contract invoke` method referenced by the checklist and verifies
+  the method is still present in the contract source.
+- Fails the CI job (non-zero exit) if any referenced file or method is missing.
+
+### Updating the checklist
+
+When a contract entrypoint is renamed or removed, or a referenced file is moved or deleted:
+
+1. Update `scripts/pre-flight-checklist.sh` so it references the current file paths and
+   `stellar contract invoke` methods.
+2. Run the validation locally (the same command CI uses) to confirm it passes.
+3. Commit the checklist change together with the entrypoint/file change that caused it.
+
+If the validation fails in CI, treat it as a signal that the checklist is stale — fix the
+references rather than disabling the check.
