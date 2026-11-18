@@ -126,6 +126,18 @@ jobs:
       - name: Run cargo-deny (licenses, bans, advisories)
         run: cargo deny check
 
+      - name: Check advisory ignore sync (deny.toml vs cargo audit)
+        # Fails CI when an advisory ignored in deny.toml is not also handled
+        # by the cargo-audit ignore list (or vice versa), preventing drift
+        # between the two dependency-safety tools. See docs/DEPENDENCY_POLICY.md.
+        run: python3 scripts/check_advisory_ignore_sync.py
+
+      - name: Build and run basic_workflow example
+        # The example is a contributor's first touchpoint; a broken example
+        # must fail CI. Expected output is documented in
+        # examples/README.md (see "basic_workflow").
+        run: cargo run --example basic_workflow
+
       - name: Run tests
         run: cargo test
 
