@@ -1,3 +1,14 @@
+# Dependabot grouping strategy
+#
+# - Minor and patch updates are batched into a single group per ecosystem
+#   (cargo, npm per directory, github-actions) to reduce PR noise.
+# - Major-version updates are intentionally left ungrouped so each major bump
+#   arrives as its own individual PR for explicit review.
+# - Auto-merge is NOT enabled; every grouped PR still requires manual review.
+#
+# Validate changes with `dependabot validate .github/dependabot.yml` or a
+# YAML schema check against the Dependabot v2 schema.
+
 version: 2
 updates:
   # Cargo dependencies at the repository root (workspace)
