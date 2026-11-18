@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Nightly fuzzing run (see FUZZING_GUIDE.md). Runs the fuzz targets for a
+  # bounded duration so crashes surface as CI failures without always-on fuzzing.
+  schedule:
+    - cron: '0 3 * * *'
 
 permissions:
   contents: read
@@ -50,7 +54,7 @@ jobs:
             cd ..
           done
 
-  fmt-build-test:
+  backup-tooling-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -70,6 +74,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Supported toolchain range: the channel pinned in rust-toolchain.toml
+        # (currently `stable`) and `stable` itself. See README.md.
+        toolchain: [stable]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -78,6 +88,7 @@ jobs:
         # action reads it so CI and contributors use the same toolchain.
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy, llvm-tools-preview
           targets: wasm32-unknown-unknown
 
@@ -120,6 +131,15 @@ jobs:
 
       - name: Test REPL CLI
         run: cargo test -p repl-cli
+
+      - name: Validate pre-flight checklist references
+        # Ensures scripts/pre-flight-checklist.sh stays current: every file it
+        # references must exist and every `stellar contract invoke` method it
+        # calls must be a public entrypoint in escrow/src/lib.rs.
+        run: |
+          python3 scripts/validate_preflight_checklist.py \
+            --script scripts/pre-flight-checklist.sh \
+            --lib escrow/src/lib.rs
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@671164c891d3e20f5b8ece04798d0154d1262d65 # cargo-llvm-cov
@@ -270,3 +290,46 @@ jobs:
         run: |
           SPEC_VERSION="v$(date +%Y.%m.%d)-$(git rev-parse --short HEAD)"
           echo "SPEC_VERSION=${SPEC_VERSION}" >> $GITHUB_ENV
+
+  # ---------------------------------------------------------------------------
+  # Nightly fuzzing
+  # ---------------------------------------------------------------------------
+  #
+  # Runs each fuzz target for a bounded duration (FUZZ_DURATION seconds) via
+  # run_fuzz.sh. Any non-zero exit (crash, timeout, build failure) fails the
+  # job so regressions surface in CI. See FUZZING_GUIDE.md for details.
+  fuzz-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [escrow_fuzz]
+    env:
+      FUZZ_DURATION: "300"
+      FUZZ_WORKERS: "2"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzz target ${{ matrix.target }}
+        # Bounded run: exits non-zero on crash so CI fails.
+        run: ./run_fuzz.sh "${{ matrix.target }}" "$FUZZ_DURATION" "$FUZZ_WORKERS"
+
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          retention-days: 30
+          if-no-files-found: ignore
