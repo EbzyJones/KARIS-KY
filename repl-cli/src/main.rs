@@ -1,3 +1,25 @@
+//! KARIS-KY REPL command-line interface.
+//!
+//! This binary provides a minimal REPL entry point for the KARIS-KY
+//! workspace. It reads a single command from the process arguments and
+//! reports it back to the user.
+//!
+//! # Documentation policy
+//!
+//! The workspace documentation build is run with
+//! `RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links'` so that any stale or
+//! broken intra-doc links fail CI. When adding doc comments, only reference
+//! items that actually exist (for example [`parse_input`]) and verify with
+//! `cargo doc --workspace --no-deps`.
+
+/// Validates and normalizes a raw command-line input string.
+///
+/// The input is trimmed of surrounding whitespace. Empty (or
+/// whitespace-only) input is rejected.
+///
+/// # Errors
+///
+/// Returns an error message when the trimmed input is empty.
 fn parse_input(input: &str) -> Result<&str, &'static str> {
     let trimmed = input.trim();
 
@@ -8,6 +30,11 @@ fn parse_input(input: &str) -> Result<&str, &'static str> {
     Ok(trimmed)
 }
 
+/// Entry point for the REPL CLI.
+///
+/// Reads the first positional argument as the command (defaulting to
+/// `"status"`), validates it via [`parse_input`], and prints the result.
+/// Exits with a non-zero status code when the input is invalid.
 fn main() {
     let command = std::env::args()
         .nth(1)
