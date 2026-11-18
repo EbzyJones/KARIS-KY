@@ -162,6 +162,37 @@ repl-cli> fund_with_commitment GDPM3QMXN3APYMYBNPIBMVJHD3FQJSCAEBFHDZZS3MSVVUAOT
 }
 ```
 
+### `fund-batch`
+
+**Purpose**: Fund multiple investors in a single `fund_batch` contract call from a CSV file. This speeds up batch funding for operators.
+
+**Arguments**:
+- `<path-to-csv>` - Path to a CSV file containing `(address, amount)` pairs
+
+**CSV Format**:
+- One `address,amount` pair per line
+- `amount` is in stroops (integer)
+- Blank lines are ignored
+- Lines starting with `#` are treated as comments and ignored
+- At most 50 entries per call (matching the contract's `MAX_FUND_BATCH`)
+
+Example CSV (`investors.csv`):
+```
+# address,amount (stroops)
+GDPM3QMXN3APYMYBNPIBMVJHD3FQJSCAEBFHDZZS3MSVVUAOTBMVYF2,50000000
+GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUV,25000000
+```
+
+**Usage**:
+```
+repl-cli> fund-batch investors.csv
+{
+  "status": "success",
+  "entries": 2,
+  "total_amount": 75000000
+}
+```
+
 ### `quit` / `exit`
 
 **Purpose**: Exit the REPL CLI.

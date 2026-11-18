@@ -44,7 +44,8 @@ truth; everything else is a client of it.
 
 ### Run everything locally
 
-1. **Prerequisites** — Rust 1.70+ (stable), the `wasm32v1-none` target
+1. **Prerequisites** — the Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml)
+   (see [Supported Rust toolchain](#supported-rust-toolchain)), the `wasm32v1-none` target
    (`rustup target add wasm32v1-none`), Node.js 18+, and the Soroban / Stellar CLI.
 
 2. **Start the local chain and deploy the contract** — one command sets up a
@@ -152,11 +153,29 @@ See also: [Local development (one-command)](#local-development-one-command) and 
 
 ## Prerequisites
 
-- Rust 1.70+ (stable)
+- The Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (see
+  [Supported Rust toolchain](#supported-rust-toolchain))
 - `wasm32v1-none` target for WASM builds: `rustup target add wasm32v1-none`
 - Soroban / Stellar CLI (optional — for deployment and contract interaction)
 
 For local development and CI, Rust alone is sufficient.
+
+### Supported Rust toolchain
+
+The supported range is the channel pinned in [`rust-toolchain.toml`](rust-toolchain.toml)
+and `stable`:
+
+- **Pinned channel** — the exact toolchain declared in `rust-toolchain.toml`. `rustup`
+  selects it automatically when you work in this repository, so local builds match CI.
+- **`stable`** — the latest stable release, which contributors on a freshly updated
+  toolchain will typically have.
+
+CI runs `cargo fmt --check`, `cargo clippy`, and `cargo test` on **both** channels via a
+matrix build, so a regression on either channel surfaces as a failing job. Nightly-only
+features are out of scope.
+
+Bumping the minimum supported Rust version (MSRV) is a deliberate change: open an issue
+and discuss it before raising the pinned channel or relying on newer language features.
 
 ### SDK Examples
 
