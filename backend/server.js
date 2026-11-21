@@ -3,6 +3,9 @@ const { createEscrowHealthAlert } = require('./health-alerts');
 
 const HOST = '127.0.0.1';
 const PORT = 8000;
+const ENTRYPOINTS = contractSpec.entrypoints.map((entrypoint) => entrypoint.name);
+const DEFAULT_ALLOWED_ORIGINS = ['http://127.0.0.1:5500', 'http://localhost:5500'];
+const CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
 
 function sendJson(res, status, payload) {
   res.writeHead(status, {
