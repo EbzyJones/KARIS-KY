@@ -367,6 +367,14 @@ impl LiquifactEscrow {
         }
         .publish(&env);
 
+        // Emit FundingDeadlineSet event to give indexers an audit trail of deadline changes.
+        FundingDeadlineSet {
+            name: symbol_short!("fund_dl"),
+            invoice_id: invoice_sym,
+            deadline: funding_deadline,
+        }
+        .publish(&env);
+
         escrow
     }
 
