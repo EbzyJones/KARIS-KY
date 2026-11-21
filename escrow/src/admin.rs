@@ -1377,4 +1377,146 @@ impl LiquifactEscrow {
             .get(&DataKey::DistributedPrincipal)
             .unwrap_or(0)
     }
+
+    // ========================================================================
+    // Trace Mode Helpers (conditional on trace-mode feature)
+    // ========================================================================
+
+    /// Get current trace level if tracing is enabled; None if OFF or not set.
+    #[cfg(feature = "trace-mode")]
+    pub(crate) fn get_trace_level(env: &Env) -> Option<u32> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TraceLevel)
+    }
+
+    /// Emit a trace event if trace level is sufficient.
+    ///
+    /// Useful for admin operations like legal hold, dispute pause, attestation binding.
+    /// Only emits if trace-mode feature is enabled AND current level >= required level.
+    #[cfg(feature = "trace-mode")]
+    pub(crate) fn emit_trace_event(
+        env: &Env,
+        required_level: u32,
+        operation: Symbol,
+        key_name: Symbol,
+        message: String,
+    ) {
+        if let Some(level) = Self::get_trace_level(env) {
+            if level >= required_level {
+                TraceEvent {
+                    level: required_level,
+                    operation,
+                    key_name,
+                    timestamp: env.ledger().timestamp(),
+                    message,
+                }
+                .publish(env);
+            }
+        }
+    }
+
+    /// Enable tracing at specified verbosity level. Admin-only.
+    pub(crate) fn enable_tracing_impl(env: Env, level: u32) {
+        let escrow = Self::load_escrow_require_admin(&env);
+
+        ensure(
+            &env,
+            level <= TRACE_LEVEL_TRACE,
+            EscrowError::InvalidTraceLevel,
+        );
+
+        #[cfg(feature = "trace-mode")]
+        {
+            env.storage().instance().set(&DataKey::TraceLevel, &level);
+
+            TraceConfigured {
+                name: symbol_short!("trc_cfg"),
+                level,
+                timestamp: env.ledger().timestamp(),
+            }
+            .publish(&env);
+        }
+    }
+
+    /// Disable tracing. Admin-only.
+    pub(crate) fn disable_tracing_impl(env: Env) {
+        let _escrow = Self::load_escrow_require_admin(&env);
+
+        #[cfg(feature = "trace-mode")]
+        {
+            env.storage().instance().remove(&DataKey::TraceLevel);
+
+            TraceConfigured {
+                name: symbol_short!("trc_off"),
+                level: TRACE_LEVEL_OFF,
+                timestamp: env.ledger().timestamp(),
+            }
+            .publish(&env);
+        }
+    }
+
+    /// Get current trace level for query. Permissionless.
+    #[cfg(feature = "trace-mode")]
+    pub(crate) fn get_trace_level_impl(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TraceLevel)
+            .unwrap_or(TRACE_LEVEL_OFF)
+    }
+
+    /// Clear trace buffer. Admin-only.
+    pub(crate) fn clear_trace_buffer_impl(env: Env) {
+        let _escrow = Self::load_escrow_require_admin(&env);
+
+        #[cfg(feature = "trace-mode")]
+        {
+            TraceBufferCleared {
+                name: symbol_short!("trc_clr"),
+                timestamp: env.ledger().timestamp(),
+            }
+            .publish(&env);
+        }
+    }
+
+    // No-op versions when trace-mode is disabled
+    #[cfg(not(feature = "trace-mode"))]
+    pub(crate) fn enable_tracing_impl(env: Env, _level: u32) {
+        let _escrow = Self::load_escrow_require_admin(&env);
+        // No-op: tracing not compiled in
+    }
+
+    #[cfg(not(feature = "trace-mode"))]
+    pub(crate) fn disable_tracing_impl(env: Env) {
+        let _escrow = Self::load_escrow_require_admin(&env);
+        // No-op: tracing not compiled in
+    }
+
+    #[cfg(not(feature = "trace-mode"))]
+    pub(crate) fn get_trace_level_impl(env: Env) -> u32 {
+        let _escrow = Self::get_escrow_impl(env);
+        TRACE_LEVEL_OFF // Always OFF when feature disabled
+    }
+
+    #[cfg(not(feature = "trace-mode"))]
+    pub(crate) fn clear_trace_buffer_impl(env: Env) {
+        let _escrow = Self::load_escrow_require_admin(&env);
+        // No-op: tracing not compiled in
+    }
+
+    #[cfg(not(feature = "trace-mode"))]
+    pub(crate) fn emit_trace_event(
+        _env: &Env,
+        _required_level: u32,
+        _operation: Symbol,
+        _key_name: Symbol,
+        _message: String,
+    ) {
+        // No-op: tracing not compiled in
+    }
+
+    #[cfg(not(feature = "trace-mode"))]
+    pub(crate) fn get_trace_level(_env: &Env) -> Option<u32> {
+        None // Tracing always OFF
+    }
 }

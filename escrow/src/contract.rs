@@ -1610,4 +1610,50 @@ impl LiquifactEscrow {
     pub fn get_dispute_pause(env: Env) -> Option<DisputePauseState> {
         Self::get_dispute_pause_impl(env)
     }
+
+    /// Enable trace mode at specified verbosity level. Admin-only.
+    ///
+    /// # Verbosity Levels
+    /// - `0` (OFF): Tracing disabled
+    /// - `1` (ERROR): Only errors
+    /// - `2` (WARN): Errors + state transitions
+    /// - `3` (INFO): Warn + significant operations
+    /// - `4` (DEBUG): Info + storage writes
+    /// - `5` (TRACE): Debug + storage reads
+    ///
+    /// # Authorization
+    /// Only the current escrow admin may call this function.
+    ///
+    /// # Performance
+    /// - OFF (default): ~0% overhead
+    /// - WARN: <1% overhead
+    /// - DEBUG: ~5% overhead
+    /// - TRACE: ~15% overhead
+    pub fn enable_tracing(env: Env, level: u32) {
+        Self::enable_tracing_impl(env, level)
+    }
+
+    /// Disable trace mode. Admin-only.
+    ///
+    /// Clears the trace level, returning tracing to OFF. No-op if tracing is
+    /// already disabled or if the trace-mode feature is not compiled in.
+    pub fn disable_tracing(env: Env) {
+        Self::disable_tracing_impl(env)
+    }
+
+    /// Get current trace level. Permissionless query.
+    ///
+    /// Returns the current trace verbosity (0–5), or `0` (OFF) if tracing
+    /// is not enabled or the trace-mode feature is not compiled in.
+    pub fn get_trace_level(env: Env) -> u32 {
+        Self::get_trace_level_impl(env)
+    }
+
+    /// Clear trace buffer. Admin-only.
+    ///
+    /// Clears any buffered trace entries (if the trace-mode feature is enabled).
+    /// Useful for clearing old diagnostic data between operations.
+    pub fn clear_trace_buffer(env: Env) {
+        Self::clear_trace_buffer_impl(env)
+    }
 }

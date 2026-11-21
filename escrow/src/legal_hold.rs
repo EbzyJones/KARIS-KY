@@ -122,6 +122,16 @@ impl LiquifactEscrow {
             active: if active { 1 } else { 0 },
         }
         .publish(&env);
+
+        // Emit trace span when legal hold state changes (WARN level)
+        let state_str = if active { "activated" } else { "cleared" };
+        Self::emit_trace_event(
+            &env,
+            crate::TRACE_LEVEL_WARN,
+            symbol_short!("legalhld"),
+            symbol_short!("legal_hold"),
+            soroban_sdk::String::from_str(&env, &format!("Legal hold {}", state_str)),
+        );
     }
 
     /// Propose a legal hold for guardian confirmation. Proposals expire after
@@ -366,6 +376,15 @@ impl LiquifactEscrow {
             expires_at,
         }
         .publish(&env);
+
+        // Emit trace span when dispute is paused (WARN level)
+        Self::emit_trace_event(
+            &env,
+            crate::TRACE_LEVEL_WARN,
+            symbol_short!("disp_pse"),
+            symbol_short!("dispute_paused"),
+            soroban_sdk::String::from_str(&env, &format!("Dispute pause for ticket: {}", ticket_id)),
+        );
     }
 
     /// Resume (unpause) a dispute pause on the escrow.
@@ -400,6 +419,15 @@ impl LiquifactEscrow {
             ledger_timestamp: now,
         }
         .publish(&env);
+
+        // Emit trace span when dispute pause is cleared (WARN level)
+        Self::emit_trace_event(
+            &env,
+            crate::TRACE_LEVEL_WARN,
+            symbol_short!("disp_res"),
+            symbol_short!("dispute_resumed"),
+            soroban_sdk::String::from_str(&env, "Dispute pause resumed (cleared)"),
+        );
     }
 
     /// Check if a dispute pause is currently active on this escrow.
