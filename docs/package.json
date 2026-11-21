@@ -4,11 +4,16 @@
   "description": "OpenAPI schema conformance tests for karis-ky API",
   "private": true,
   "scripts": {
-    "test": "node --test tests/openapi.test.js"
+    "test": "node --test tests/openapi.test.js",
+    "test:a11y": "node --test tests/frontend-accessibility.test.js"
   },
   "dependencies": {
     "ajv": "^8.17.1",
     "ajv-formats": "^3.0.1",
     "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "axe-core": "^4.14.1",
+    "jsdom": "^31.0.1"
   }
 }
