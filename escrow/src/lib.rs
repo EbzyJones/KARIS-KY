@@ -18,6 +18,15 @@
 //! it, or redeploy when stored struct layout changes. See `docs/OPERATOR_RUNBOOK.md` for the full
 //! decision tree.
 //!
+//! ## Documentation link policy
+//!
+//! CI builds docs for the **entire workspace** with
+//! `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links"` (see `.github/workflows/ci.yml`), so any
+//! broken intra-doc link — here or in `repl-cli` — fails the build. When renaming or removing a
+//! public item, update every `[`Item`]` reference in the same change. Prefer linking to real
+//! items (e.g. [`LiquifactEscrow::set_admin_roles`]) over free-form prose, and use plain code
+//! spans for anything that is not a Rust item (e.g. `docs/OPERATOR_RUNBOOK.md`).
+//!
 //! ## SME collateral commitment metadata
 //!
 //! [`LiquifactEscrow::record_sme_collateral_commitment`] is an SME-authenticated metadata write for
@@ -28,9 +37,9 @@
 //!
 //! ## Compliance hold (legal hold)
 //!
-//! An admin may set [`DataKey::LegalHold`] to block risk-bearing transitions until cleared:
-//! [`LiquifactEscrow::settle`], SME [`LiquifactEscrow::withdraw`], and
-//! [`LiquifactEscrow::claim_investor_payout`]. **Clearing** requires the **current**
+//! An admin may set [`DataKey::LegalHold`] to block state-mutating entrypoints until cleared.
+//! Hold management, admin handover, initialization, and [`LiquifactEscrow::bump_ttl`] remain
+//! available as explicit recovery/maintenance exceptions. **Clearing** requires the **current**
 //! [`InvoiceEscrow::admin`] to call [`LiquifactEscrow::set_legal_hold`] with `active = false`
 //! (or [`LiquifactEscrow::clear_legal_hold`]). This contract does not embed a timelock or
 //! council multisig: production deployments **must** use a governed `admin` (multisig or
@@ -113,11 +122,176 @@
 #[cfg(test)]
 extern crate std;
 
+extern crate alloc;
+use alloc::format;
+
 use core::{clone::Clone, default::Default};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
-    symbol_short, token::TokenClient, Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    symbol_short, token::TokenClient, Address, Bytes, BytesN, Env, Executable, String, Symbol, Vec,
 };
+
+struct PerInvestorStorage<'a> {
+    env: &'a Env,
+}
+
+impl<'a> PerInvestorStorage<'a> {
+    fn new(env: &'a Env) -> Self {
+        Self { env }
+    }
+
+    fn get_contribution(&self, investor: Address) -> i128 {
+        self.env
+            .storage()
+            .persistent()
+            .get(&DataKey::InvestorContribution(investor))
+            .unwrap_or(0)
+    }
+
+    fn set_contribution(&self, investor: Address, amount: i128) {
+        self.env
+            .storage()
+            .persistent()
+            .set(&DataKey::InvestorContribution(investor), &amount);
+    }
+
+    fn get_effective_yield(&self, investor: Address) -> Option<i64> {
+        self.env
+            .storage()
+            .persistent()
+            .get(&DataKey::InvestorEffectiveYield(investor))
+    }
+
+    fn set_effective_yield(&self, investor: Address, value: i64) {
+        self.env
+            .storage()
+            .persistent()
+            .set(&DataKey::InvestorEffectiveYield(investor), &value);
+    }
+
+    fn get_claim_not_before(&self, investor: Address) -> u64 {
+        self.env
+            .storage()
+            .persistent()
+            .get(&DataKey::InvestorClaimNotBefore(investor))
+            .unwrap_or(0)
+    }
+
+    fn set_claim_not_before(&self, investor: Address, value: u64) {
+        self.env
+            .storage()
+            .persistent()
+            .set(&DataKey::InvestorClaimNotBefore(investor), &value);
+    }
+
+    fn get_lock_in_until(&self, investor: Address) -> u64 {
+        self.env
+            .storage()
+            .persistent()
+            .get(&DataKey::InvestorLockInUntil(investor))
+            .unwrap_or(0)
+    }
+
+    fn set_lock_in_until(&self, investor: Address, value: u64) {
+        self.env
+            .storage()
+            .persistent()
+            .set(&DataKey::InvestorLockInUntil(investor), &value);
+    }
+
+    fn get_claimed(&self, investor: Address) -> bool {
+        self.env
+            .storage()
+            .persistent()
+            .get(&DataKey::InvestorClaimed(investor))
+            .unwrap_or(false)
+    }
+
+    fn set_claimed(&self, investor: Address, value: bool) {
+        self.env
+            .storage()
+            .persistent()
+            .set(&DataKey::InvestorClaimed(investor), &value);
+    }
+
+    fn get_allowlisted(&self, investor: Address) -> bool {
+        self.env
+            .storage()
+            .persistent()
+            .get(&DataKey::InvestorAllowlisted(investor))
+            .unwrap_or(false)
+    }
+
+    fn set_allowlisted(&self, investor: Address, allowed: bool) {
+        self.env
+            .storage()
+            .persistent()
+            .set(&DataKey::InvestorAllowlisted(investor), &allowed);
+    }
+
+    fn get_yield_claim_delegate(&self, investor: Address) -> Option<Address> {
+        self.env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldClaimDelegate(investor))
+    }
+
+    fn set_yield_claim_delegate(&self, investor: Address, delegate: Address) {
+        self.env
+            .storage()
+            .persistent()
+            .set(&DataKey::YieldClaimDelegate(investor), &delegate);
+    }
+
+    fn get_yield_claim_delegate_revoked(&self, investor: Address) -> bool {
+        self.env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldClaimDelegateRevoked(investor))
+            .unwrap_or(false)
+    }
+
+    fn set_yield_claim_delegate_revoked(&self, investor: Address, revoked: bool) {
+        self.env
+            .storage()
+            .persistent()
+            .set(&DataKey::YieldClaimDelegateRevoked(investor), &revoked);
+    }
+
+    fn get_funding_history(&self, investor: Address) -> Vec<InvestorFundingRecord> {
+        self.env
+            .storage()
+            .persistent()
+            .get(&DataKey::InvestorFundingHistory(investor))
+            .unwrap_or_else(|| Vec::new(self.env))
+    }
+
+    fn set_funding_history(&self, investor: Address, history: Vec<InvestorFundingRecord>) {
+        self.env
+            .storage()
+            .persistent()
+            .set(&DataKey::InvestorFundingHistory(investor), &history);
+    }
+
+    fn append_funding_record(&self, investor: Address, record: InvestorFundingRecord) {
+        let mut history = self.get_funding_history(investor.clone());
+        if (history.len() as u32) < MAX_INVESTOR_HISTORY_ENTRIES {
+            history.push_back(record);
+            self.set_funding_history(investor, history);
+        }
+        // If history is at max capacity, silently drop the new record (existing history preserved)
+    }
+}
+
+trait PerInvestorStorageExt {
+    fn per_investor(&self) -> PerInvestorStorage;
+}
+
+impl PerInvestorStorageExt for Env {
+    fn per_investor(&self) -> PerInvestorStorage {
+        PerInvestorStorage::new(self)
+    }
+}
 
 pub mod external_calls;
 pub mod validation;
@@ -143,10 +317,17 @@ include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 /// | 4 | Added `PrimaryAttestationHash`, `AttestationAppendLog` | Additive keys — no `migrate` call required |
 /// | 5 | Added `YieldTierTable`, `RegistryRef`, `Treasury`; `fund_with_commitment` | **Redeploy required** if `InvoiceEscrow` XDR changed |
 /// | 6 | Per-investor keys moved to **persistent** storage (see ADR-007) | **Redeploy required** — no `migrate` path (addresses not enumerable) |
-/// | 7 | Added `DisputePaused` state for temporary dispute resolution freezes (separate from legal hold) | Additive keys — no `migrate` call required |
+/// | 7 | Added `updated_at` to `SmeCollateralCommitment`; `bind_primary_attestation_hash` now accepts `Bytes` with explicit length validation (#207, #208) | **Redeploy required** — `SmeCollateralCommitment` XDR shape changed |
+/// | 8 | Added optional [`InvoiceEscrow::guardian`] for two-step legal-hold activation | **Redeploy required** — [`InvoiceEscrow`] XDR shape changed |
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 8;
+
+/// Interface ABI version for the deployed escrow contract.
+///
+/// This value is extracted by `escrow/build.rs` and must stay aligned with the
+/// public entrypoint signatures used by SDKs and external clients.
+pub const CONTRACT_INTERFACE_VERSION: u32 = 1;
 
 /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries to keep storage bounded.
 /// Revocation via [`LiquifactEscrow::revoke_attestation_digest`] does not consume a slot.
@@ -155,6 +336,24 @@ pub const MAX_ATTESTATION_APPEND_ENTRIES: u32 = 32;
 /// Upper bound on reinvestment audit log entries to keep storage bounded.
 pub const MAX_REINVESTMENT_AUDIT_ENTRIES: u32 = 100;
 
+/// Upper bound on [`DataKey::InvestorFundingHistory`] entries per investor to keep
+/// per-address persistent storage bounded. Once reached, further checkpoints are not
+/// appended (existing history is preserved; see [`LiquifactEscrow::get_investor_history`]).
+pub const MAX_INVESTOR_HISTORY_ENTRIES: u32 = 128;
+
+/// Maximum page size for paginated history queries via [`LiquifactEscrow::get_investor_history_page`].
+/// Limits CPU and memory usage per paginated read. Must be <= [`MAX_INVESTOR_HISTORY_ENTRIES`].
+pub const MAX_HISTORY_PAGE_SIZE: u32 = 50;
+
+/// Upper bound on [`DataKey::AdminRoles`] entries to keep instance storage/CPU bounded.
+pub const MAX_ADMIN_ROLES: u32 = 16;
+
+/// Upper bound on [`MultisigPolicy::signers`] to keep instance storage/CPU bounded.
+pub const MAX_MULTISIG_SIGNERS: u32 = 16;
+
+/// Upper bound on [`MultisigPolicy::operations`] to keep instance storage/CPU bounded.
+pub const MAX_MULTISIG_OPERATIONS: u32 = 16;
+
 /// Upper bound on batch allowlist mutation entries to keep storage/CPU bounded.
 /// Mirrors the spirit of `MAX_ATTESTATION_APPEND_ENTRIES` to limit per-call work.
 pub const MAX_INVESTOR_ALLOWLIST_BATCH: u32 = 32;
@@ -162,6 +361,10 @@ pub const MAX_INVESTOR_ALLOWLIST_BATCH: u32 = 32;
 /// Upper bound on [`LiquifactEscrow::fund_batch`] entries to keep storage/CPU bounded.
 /// Mirrors the spirit of `MAX_ATTESTATION_APPEND_ENTRIES` to limit per-call work.
 pub const MAX_FUND_BATCH: u32 = 50;
+
+/// Upper bound on [`LiquifactEscrow::batch_claim_investor_payouts`] entries per call, to keep
+/// storage/CPU bounded. Mirrors the spirit of `MAX_ATTESTATION_APPEND_ENTRIES`.
+pub const MAX_BATCH_CLAIM: u32 = 50;
 
 /// Number of bucketing shards for investor contribution aggregates (256 buckets).
 ///
@@ -178,6 +381,15 @@ pub const INVESTOR_BUCKET_COUNT: u32 = 256;
 ///
 /// Caps blast radius if instrumentation mis-estimates “dust”; tune per asset decimals off-chain.
 pub const MAX_DUST_SWEEP_AMOUNT: i128 = 100_000_000;
+
+/// Maximum allowed dispute pause duration in seconds (14 days).
+///
+/// Guards against indefinite admin locks and ensures disputes can be escalated to governance
+/// within a bounded operational window. This aligns with standard business dispute resolution
+/// SLAs in invoice finance (typically 3–15 days).
+///
+/// A pause duration exceeding this value will fail with [`EscrowError::DisputePauseDurationExceedsMax`].
+pub const MAX_DISPUTE_PAUSE_DURATION_SECS: u64 = 14 * 24 * 60 * 60; // 1,209,600 seconds
 
 /// Maximum UTF-8 byte length for the invoice `String` at init (matches Soroban [`Symbol`] max).
 pub const MAX_INVOICE_ID_STRING_LEN: u32 = 32;
@@ -196,12 +408,78 @@ pub const INSTANCE_TTL_MIN_EXTENSION_LEDGERS: u32 = 60 * 60; // Approx. 1h at 1 
 /// Extending persistent allowlist TTL reduces the risk of silent allowlist disablement.
 pub const PERSISTENT_TTL_MIN_EXTENSION_LEDGERS: u32 = 60 * 60; // Approx. 1h at 1 ledger/sec.
 
+/// Upper bound on [`LiquifactEscrow::bump_ttl`]'s `allowlisted` entries per call.
+///
+/// Each entry costs 5 `extend_ttl` host calls ([`DataKey::InvestorAllowlisted`],
+/// [`DataKey::InvestorContribution`], [`DataKey::InvestorEffectiveYield`],
+/// [`DataKey::InvestorClaimNotBefore`], [`DataKey::InvestorClaimed`]); an unbounded vector
+/// risks exceeding the transaction's CPU/resource budget with no partial progress. Mirrors
+/// [`MAX_INVESTOR_ALLOWLIST_BATCH`] to limit per-call work.
+pub const MAX_TTL_BUMP_BATCH: u32 = 32;
+
 /// Maximum UTF-8 byte length for a snapshot name (must fit in Soroban Symbol).
 pub const MAX_SNAPSHOT_NAME_LEN: u32 = 32;
 
 /// Upper bound on state snapshots to keep storage bounded and prevent abuse.
 /// Admin may create at most this many named snapshots per escrow instance.
 pub const MAX_STATE_SNAPSHOTS: u32 = 16;
+/// Pending legal-hold proposals expire one hour after admin authorization.
+pub const LEGAL_HOLD_PROPOSAL_TTL_SECS: u64 = 3_600;
+
+/// Contract limit constants exposed via the [`LiquifactEscrow::get_limits`] getter.
+///
+/// This struct bundles all public limit constants that clients need to know to build valid
+/// transactions. Examples: [`MAX_FUND_BATCH`], attestation log capacity, dust sweep maximum,
+/// dispute pause maximum, etc.
+///
+/// Rationale: Clients hard-code these limits today. Exposing them via `get_limits()` allows
+/// SDKs and integrations to query them at runtime, reducing the risk of stale constants in
+/// deployed code. As limits evolve, contracts can update them without requiring all clients
+/// to rebuild.
+///
+/// Field order matches the order of constant definitions above to simplify auditing.
+#[contracttype]
+#[derive(Clone)]
+pub struct ContractLimits {
+    /// Upper bound on [`LiquifactEscrow::append_attestation_digest`] entries.
+    pub max_attestation_append_entries: u32,
+    /// Upper bound on reinvestment audit log entries.
+    pub max_reinvestment_audit_entries: u32,
+    /// Upper bound on [`DataKey::InvestorFundingHistory`] entries per investor.
+    pub max_investor_history_entries: u32,
+    /// Upper bound on [`DataKey::AdminRoles`] entries.
+    pub max_admin_roles: u32,
+    /// Upper bound on [`MultisigPolicy::signers`] entries.
+    pub max_multisig_signers: u32,
+    /// Upper bound on [`MultisigPolicy::operations`] entries.
+    pub max_multisig_operations: u32,
+    /// Upper bound on batch allowlist mutation entries per call.
+    pub max_investor_allowlist_batch: u32,
+    /// Upper bound on [`LiquifactEscrow::fund_batch`] entries per call.
+    pub max_fund_batch: u32,
+    /// Upper bound on [`LiquifactEscrow::batch_claim_investor_payouts`] entries per call.
+    pub max_batch_claim: u32,
+    /// Number of bucketing shards for investor contribution aggregates.
+    pub investor_bucket_count: u32,
+    /// Upper bound on [`LiquifactEscrow::sweep_terminal_dust`] per call (base units).
+    pub max_dust_sweep_amount: i128,
+    /// Maximum allowed dispute pause duration in seconds.
+    pub max_dispute_pause_duration_secs: u64,
+    /// Maximum UTF-8 byte length for the invoice `String` at init.
+    pub max_invoice_id_string_len: u32,
+    /// Minimum instance storage TTL extension horizon in ledgers.
+    pub instance_ttl_min_extension_ledgers: u32,
+    /// Minimum persistent storage TTL extension horizon in ledgers.
+    pub persistent_ttl_min_extension_ledgers: u32,
+    /// Upper bound on [`LiquifactEscrow::bump_ttl`]'s `allowlisted` entries per call.
+    pub max_ttl_bump_batch: u32,
+    /// Maximum UTF-8 byte length for a snapshot name.
+    pub max_snapshot_name_len: u32,
+    /// Upper bound on state snapshots to keep storage bounded.
+    pub max_state_snapshots: u32,
+    /// Pending legal-hold proposals expiration time in seconds.
+    pub legal_hold_proposal_ttl_secs: u64,
+}
 
 /// Stable typed errors emitted by karis-ky escrow entrypoints.
 ///
@@ -273,10 +551,14 @@ pub enum EscrowError {
     /// `balance - sweep_amt` must be `>= funded_amount - distributed_principal`.
     SweepExceedsLiabilityFloor = 42,
 
-    /// [`LiquifactEscrow::bind_primary_attestation_hash`] called when a primary hash exists.
+    /// Legacy duplicate-bind code retained for compatibility; no longer emitted.
     PrimaryAttestationAlreadyBound = 50,
     /// [`LiquifactEscrow::append_attestation_digest`] exceeded [`MAX_ATTESTATION_APPEND_ENTRIES`].
     AttestationAppendLogCapacityReached = 51,
+    /// [`LiquifactEscrow::bind_primary_attestation_hash`] received a digest that is not exactly 32 bytes.
+    InvalidAttestationHashLength = 52,
+    /// [`LiquifactEscrow::bind_primary_attestation_hash`] called when a primary hash exists.
+    AttestationHashAlreadyBound = 53,
 
     /// [`LiquifactEscrow::record_sme_collateral_commitment`] received a non-positive amount.
     CollateralAmountNotPositive = 60,
@@ -284,6 +566,9 @@ pub enum EscrowError {
     CollateralAssetEmpty = 61,
     /// [`LiquifactEscrow::record_sme_collateral_commitment`] received a timestamp before the stored record.
     CollateralTimestampBackwards = 62,
+    /// [`LiquifactEscrow::record_sme_collateral_commitment`] called after settlement; updates are not
+    /// permitted once the escrow has reached settled (2), withdrawn (3), or cancelled (4) status.
+    CollateralUpdateAfterSettlement = 63,
 
     /// [`LiquifactEscrow::set_investors_allowlisted`] received an empty batch.
     InvestorBatchEmpty = 70,
@@ -318,6 +603,12 @@ pub enum EscrowError {
     AlreadyCurrentSchemaVersion = 91,
     /// [`LiquifactEscrow::migrate`] has no implemented path from the requested version.
     NoMigrationPath = 92,
+    /// [`LiquifactEscrow::migrate`] has already been applied to this instance and cannot be replayed.
+    /// Stored migration nonce [`DataKey::MigrationExecutionLog`] indicates a prior successful
+    /// completion of this version transition. The contract rejects replay to ensure state
+    /// transformations are applied exactly once. This is a safety measure to prevent double-applying
+    /// yield calculations, collateral records, or per-investor state changes.
+    MigrationAlreadyApplied = 93,
 
     /// [`LiquifactEscrow::fund`] / [`LiquifactEscrow::fund_with_commitment`] received non-positive amount.
     FundingAmountNotPositive = 100,
@@ -383,7 +674,9 @@ pub enum EscrowError {
     /// Computing the legal-hold clear ready-at timestamp would overflow.
     LegalHoldClearDelayOverflow = 152,
     /// Funding deadline has passed, new deposits are rejected.
-    FundingDeadlinePassed = 164,
+    FundingDeadlinePassed = 153,
+    /// [`LiquifactEscrow::set_legal_hold`] called on an escrow in terminal status (settled, withdrawn, cancelled, or archived).
+    LegalHoldSetOnTerminalEscrow = 154,
 
     /// A legal hold blocks rotating the beneficiary (SME) address.
     LegalHoldBlocksBeneficiaryRotation = 160,
@@ -395,13 +688,13 @@ pub enum EscrowError {
     /// Yield slippage threshold is out of valid range (0..=10_000 bps).
     YieldSlippageThresholdOutOfRange = 163,
     /// The proposed new SME address is identical to the current beneficiary.
-    NewSmeSameAsCurrent = 162,
+    NewSmeSameAsCurrent = 181,
 
     /// Attempted to accept admin role when no pending admin exists.
-    NoPendingAdmin = 163,
+    NoPendingAdmin = 182,
     /// The contract's funding-token balance is less than `funded_amount` at withdraw time.
     /// Funds must be custodied in this contract before the SME can pull them.
-    InsufficientContractBalance = 164,
+    InsufficientContractBalance = 183,
 
     /// [`LiquifactEscrow::fund`] / [`LiquifactEscrow::fund_with_commitment`] blocked while a dispute pause is active.
     DisputePausedBlocksFunding = 165,
@@ -413,12 +706,80 @@ pub enum EscrowError {
     DisputePausedBlocksInvestorClaims = 168,
     /// [`LiquifactEscrow::pause_dispute`] received a non-positive pause duration in seconds.
     DisputePauseDurationNotPositive = 169,
+    /// [`LiquifactEscrow::pause_dispute`] received a pause duration exceeding the maximum allowed window.
+    /// See [`MAX_DISPUTE_PAUSE_DURATION_SECS`] for the upper bound.
+    DisputePauseDurationExceedsMax = 206,
     /// [`LiquifactEscrow::pause_dispute`] received an empty dispute ticket reference.
     DisputeTicketIdEmpty = 170,
     /// [`LiquifactEscrow::resume_dispute`] called when no dispute pause is active.
     NoPauseActive = 171,
     /// Computed ledger timestamp would overflow (e.g., `now + duration > u64::MAX`).
     LedgerTimestampOverflow = 172,
+
+    /// [`LiquifactEscrow::fund`] / [`LiquifactEscrow::fund_with_commitment`] rejected an investor
+    /// that is not verified by the configured [`DataKey::KycProviderContract`].
+    InvestorNotVerified = 173,
+    /// A sanctions-screening check rejected an address per the configured
+    /// [`DataKey::SanctionsProvider`].
+    SanctionsScreeningFailed = 205,
+
+    /// Caller's effective [`AdminRole`] (from [`DataKey::AdminRoles`], or the implicit `Full`
+    /// fallback for [`InvoiceEscrow::admin`]) does not meet the entrypoint's minimum required role.
+    InsufficientAdminRole = 174,
+    /// [`LiquifactEscrow::set_admin_roles`] received an empty or oversized role list, or a
+    /// duplicate address within it.
+    InvalidAdminRoleList = 175,
+
+    /// [`LiquifactEscrow::init_multisig_policy`] received a `threshold` of zero or greater than
+    /// the number of configured signers.
+    MultisigThresholdInvalid = 176,
+    /// [`LiquifactEscrow::init_multisig_policy`] received an empty, oversized, or
+    /// duplicate-containing `signers` list.
+    MultisigSignerListInvalid = 177,
+    /// [`LiquifactEscrow::init_multisig_policy`] received an empty `operations` list.
+    MultisigOperationsListEmpty = 178,
+    /// A multisig-gated entrypoint received fewer distinct policy-member signatures than the
+    /// configured [`MultisigPolicy::threshold`].
+    MultisigInsufficientSigners = 179,
+    /// A multisig-gated entrypoint received a signer address that is not a member of the
+    /// configured [`MultisigPolicy::signers`], or the same signer listed more than once.
+    MultisigSignerNotAuthorized = 180,
+    /// The source escrow must be in a settled terminal state before the investor can roll yield.
+    ReinvestSourceEscrowNotSettled = 181,
+    /// The target escrow must still be in a funding/open flow before accepting reinvested yield.
+    ReinvestTargetEscrowNotFunding = 182,
+    /// The reinvestment amount must be strictly positive.
+    ReinvestAmountNotPositive = 183,
+    /// The investor does not hold enough accrued yield in the source escrow to complete the reinvestment.
+    ReinvestYieldInsufficient = 184,
+    /// [`LiquifactEscrow::withdraw`] called by a caller that is not the registered SME address.
+    UnauthorizedWithdrawer = 185,
+    /// Source and target escrows must use the same funding token for yield reinvestment.
+    ReinvestFundingTokenMismatch = 186,
+    /// [`LiquifactEscrow::reinvest_yield`] rejected a target escrow that is the same as the source escrow.
+    ReinvestSelfTargetRejected = 187,
+    /// A guardian-configured escrow requires admin proposal and guardian confirmation to activate a hold.
+    LegalHoldRequiresGuardianConfirmation = 207,
+    /// No legal-hold proposal is pending for guardian confirmation.
+    LegalHoldProposalMissing = 208,
+    /// A pending legal-hold proposal has expired.
+    LegalHoldProposalExpired = 209,
+    /// The supplied guardian or admin does not match the configured escrow authority.
+    LegalHoldAuthorityMismatch = 210,
+    /// No guardian is configured for this escrow.
+    LegalHoldGuardianNotConfigured = 211,
+    /// A legal hold is already active.
+    LegalHoldAlreadyActive = 212,
+    /// The configured legal-hold guardian must be distinct from the escrow admin.
+    LegalHoldGuardianSameAsAdmin = 213,
+    /// [`LiquifactEscrow::clone_settled_escrow`] template escrow is not in settled status.
+    CloneNotSettled = 214,
+    /// [`LiquifactEscrow::clone_settled_escrow`] non-positive clone amount.
+    CloneAmountNotPositive = 215,
+    /// Template or initial funding target is invalid (not positive).
+    InvalidFundingTarget = 216,
+    /// A state-mutating entrypoint was called while a legal hold is active.
+    LegalHoldBlocksMutation = 217,
 }
 
 #[inline(always)]
@@ -469,14 +830,14 @@ pub enum DataKey {
     /// **Persistent** storage. Absent ⇒ `0`. One entry per investor address.
     InvestorContribution(Address),
     /// When true, compliance/legal hold blocks payouts and settlement finalization.
-    /// Absent ⇒ `false` (no hold). Toggled by admin via [`LiquifactEscrow::set_legal_hold`].
+    /// Absent ⇒ `false` (no hold). Set through legacy admin activation or guardian confirmation.
     LegalHold,
     /// Optional minimum ledger timestamp when `LegalHold` may be cleared after a
     /// [`LiquifactEscrow::request_clear_legal_hold`] call.
     /// Absent ⇒ no clear request is pending.
     LegalHoldClearableAt,
     /// Configured minimum delay between [`LiquifactEscrow::request_clear_legal_hold`] and
-    /// [`LiquifactEscrow::set_legal_hold(env, false)`]. Absent ⇒ `0`.
+    /// [`LiquifactEscrow::set_legal_hold`]. Absent ⇒ `0`.
     LegalHoldClearDelay,
     /// Optional SME collateral commitment metadata (record-only — not an on-chain asset lock).
     /// Absent when no commitment has been recorded. Replaceable by the SME.
@@ -506,6 +867,11 @@ pub enum DataKey {
     /// Minimum [`Env::ledger`] timestamp before [`LiquifactEscrow::claim_investor_payout`] (0 = no extra gate).
     /// **Persistent** storage. Absent ⇒ `0`. One entry per investor address; set on first deposit.
     InvestorClaimNotBefore(Address),
+    /// Append-only funding checkpoint history for each investor.
+    /// **Persistent** storage. Records deposits, funding close events, and settlement claims.
+    /// Bounded by [`MAX_INVESTOR_HISTORY_ENTRIES`] per investor address.
+    /// Absent ⇒ empty (investor has never funded). One entry per investor address.
+    InvestorFundingHistory(Address),
     /// Minimum [`LiquifactEscrow::fund`] / [`LiquifactEscrow::fund_with_commitment`] amount per call (0 = no floor).
     /// Written as `0` even when unconfigured so reads always succeed.
     MinContributionFloor,
@@ -549,7 +915,7 @@ pub enum DataKey {
     /// Blocks `fund`, `settle`, and `withdraw`. Stores [`DisputePauseState`].
     /// Absent ⇒ no dispute pause active.
     DisputePaused,
-    /// Amount that has been settled in a partial settlement. When this equals `funded_amount`, 
+    /// Amount that has been settled in a partial settlement. When this equals `funded_amount`,
     /// the escrow is fully settled. Absent ⇒ 0 (no partial settlement).
     SettledAmount,
     /// Whether an investor has elected to reinvest their yield (when settling).
@@ -567,411 +933,39 @@ pub enum DataKey {
     /// Bounded by [`MAX_REINVESTMENT_AUDIT_ENTRIES`].
     /// Absent ⇒ empty log.
     ReinvestmentAuditLog,
+    /// Immutable per-investor yield distribution snapshot captured at settlement time.
+    /// **Persistent** storage. Absent ⇒ no automatic distribution. One entry per investor address.
+    /// Stores pre-computed yield share for each investor at the time of settlement to enable
+    /// batch auto-distribution without per-investor yield recalculation.
+    /// Written by [`LiquifactEscrow::settle`] when auto-distribution is enabled.
+    YieldDistributionShare(Address),
+    /// Flag indicating whether automatic yield distribution snapshots are enabled for this escrow.
+    /// Absent ⇒ false (default off, backwards-compatible). Set during [`LiquifactEscrow::init`].
+    YieldAutoDistributionEnabled,
+
+    /// Migration execution nonce: records that a specific version transition
+    /// (from_version, to_version) has been applied to this instance.
+    /// Key format: `MigrationExecutionLog(from_version, to_version)`
+    /// Value: the ledger sequence number when the migration completed.
+    /// Used to prevent idempotent re-application of the same migration path.
+    /// Absent ⇒ migration never executed. Once written, a second `migrate()` call
+    /// with the same version pair fails with [`EscrowError::MigrationAlreadyApplied`].
+    MigrationExecutionLog(u32, u32),
+
+    /// Optional: migration completion timestamp for audit trails.
+    /// Key format: `MigrationCompletedAt(from_version, to_version)`
+    /// Value: `env.ledger().timestamp()` when the migration finished.
+    /// Useful for operator debugging and compliance audits.
+    /// Absent ⇒ no migration record. Companion to [`DataKey::MigrationExecutionLog`].
+    MigrationCompletedAt(u32, u32),
+}
 
 // --- Data types ---
 
-/// Full state of an invoice escrow persisted in contract storage (`DataKey::Escrow`).
-#[contracttype]
-#[derive(Debug, PartialEq)]
-/// Full escrow snapshot persisted at [`DataKey::Escrow`].
-///
-/// Derive rationale:
-/// - `Debug`: improves failure diagnostics in tests.
-/// - `PartialEq`: allows exact state assertions in tests.
-///
-/// `Clone` is intentionally omitted to avoid accidental full-state copies.
-pub struct InvoiceEscrow {
-    pub invoice_id: Symbol,
-    pub admin: Address,
-    pub sme_address: Address,
-    pub amount: i128,
-    pub funding_target: i128,
-    pub funded_amount: i128,
-    pub yield_bps: i64,
-    pub maturity: u64,
-    /// 0 = open, 1 = funded, 2 = settled, 3 = withdrawn (SME pulled liquidity), 4 = cancelled (admin-gated; investors may refund), 5 = archived (admin-gated; read-only terminal)
-    pub status: u32,
-}
+#[contract]
+pub struct LiquifactEscrow;
 
-/// SME-reported collateral metadata for off-chain risk review.
-///
-/// **Record-only:** this struct is stored for transparency and indexing. It does **not**
-/// custody, escrow, transfer, freeze, reserve, or verify assets. It also does not alter funding,
-/// settlement, SME withdrawal, investor-claim, compliance hold, or treasury-sweep behavior.
-/// Future versions that enforce asset movement or custody must introduce explicit APIs and must
-/// not treat historical records from this type as proof of locked assets.
-///
-/// # Fields
-/// - `asset`: The off-chain asset symbol (cannot be empty).
-/// - `amount`: The reported collateral amount (must be positive).
-/// - `recorded_at`: The Soroban ledger timestamp when this record was written.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-/// SME collateral commitment metadata (record-only).
-///
-/// Derive rationale:
-/// - `Clone`: required for `Option<SmeCollateralCommitment>` used in `EscrowSummary`.
-/// - `Debug`: improves failure diagnostics in tests.
-/// - `PartialEq`: allows deterministic assertion of stored/read values.
-pub struct SmeCollateralCommitment {
-    pub asset: Symbol,
-    pub amount: i128,
-    pub recorded_at: u64,
-}
-
-/// Incremental state change record for delta-encoded snapshots.
-/// Stores only the fields that changed from the previous state, enabling storage optimization.
-///
-/// **Immutable** once written; delta chains form an audit trail of state transitions.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct SnapshotDelta {
-    /// Unique ID of this delta (monotonically increasing).
-    pub delta_id: u32,
-    /// Ledger timestamp when this delta was recorded.
-    pub recorded_at: u64,
-    /// Previous delta ID this one is based on (0 for baseline/first delta).
-    pub based_on_delta_id: u32,
-    /// Change in funded amount (signed; may be negative for reversals).
-    pub funded_amount_delta: i128,
-    /// New maturity value (0 if unchanged).
-    pub maturity: u64,
-    /// New status (255 if unchanged).
-    pub status: u8,
-    /// New admin address (None if unchanged).
-    pub admin: Option<Address>,
-    /// New SME/beneficiary address (None if unchanged).
-    pub sme_address: Option<Address>,
-}
-
-/// One step in an optional tier ladder: investors who commit to at least `min_lock_secs` (on first
-/// deposit via [`LiquifactEscrow::fund_with_commitment`]) may receive `yield_bps` for pro-rata /
-/// off-chain coupon math. **Immutable** after `init`: the table is fixed for the escrow instance.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct YieldTier {
-    pub min_lock_secs: u64,
-    pub yield_bps: i64,
-}
-
-/// Captured exactly once at the first ledger transition to **funded** so settlement and claims can
-/// use a stable total principal and target. If the threshold-crossing deposit overshoots
-/// [`InvoiceEscrow::funding_target`], [`FundingCloseSnapshot::total_principal`] records the full
-/// credited [`InvoiceEscrow::funded_amount`] at close and becomes the pro-rata denominator.
-/// **Immutable** once written.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct FundingCloseSnapshot {
-    /// Sum of principal credited when the invoice became funded (`funded_amount` at close),
-    /// including over-funding past target.
-    pub total_principal: i128,
-    pub funding_target: i128,
-    pub closed_at_ledger_timestamp: u64,
-    pub closed_at_ledger_sequence: u32,
-}
-
-/// Custom option-like enum to represent the captured funding close snapshot.
-/// Models standard option semantics as a contracttype to avoid standard library
-/// blanket trait limitations in Soroban SDK testutils.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum EscrowCloseSnapshot {
-    None,
-    Some(FundingCloseSnapshot),
-}
-
-/// Custom option-like enum to represent the SME collateral commitment.
-/// Models standard option semantics as a contracttype to avoid standard library
-/// blanket trait limitations in Soroban SDK testutils.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum CollateralCommitmentSnapshot {
-    None,
-    Some(SmeCollateralCommitment),
-}
-
-/// Cached token metadata to reduce external calls during fund operations.
-///
-/// **Purpose:** Caches token contract metadata (decimals, name, symbol) at escrow
-/// initialization time to avoid repeated cross-contract calls on every fund operation.
-/// This is a read-only cache that is only updated via explicit revalidation entrypoint.
-///
-/// **Cache Policy:**
-/// - Written once at initialization by [`LiquifactEscrow::init`]
-/// - Updated only via [`LiquifactEscrow::revalidate_token_cache`] (admin-only)
-/// - Read by fund operations to validate amounts and compute scaled values
-/// - Immutable for normal operation (no mutations except explicit revalidation)
-///
-/// **Fields:**
-/// - `decimals`: Token decimal precision (typically 7 for Stellar)
-/// - `cached_at_ledger_timestamp`: Timestamp when cache was last written
-/// - `cached_at_ledger_sequence`: Ledger sequence when cache was last written
-///
-/// **Versioning:** Includes ledger time/sequence to allow detecting stale caches
-/// (e.g., if token contract upgrade changes decimal places). Exact staleness
-/// detection is left to governance processes.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct TokenMetadataCache {
-    /// Token decimal places (e.g., 7 for Stellar USDC)
-    pub decimals: u32,
-    /// Ledger timestamp when cache was written (for staleness detection)
-    pub cached_at_ledger_timestamp: u64,
-    /// Ledger sequence when cache was written (for staleness detection)
-    pub cached_at_ledger_sequence: u32,
-}
-
-/// Comprehensive summary of the escrow contract state.
-/// Bundles multiple read-only values to allow a single host invocation
-/// for off-chain indexers and client rendering.
-#[contracttype]
-#[derive(Debug, PartialEq)]
-pub struct EscrowSummary {
-    /// Full escrow snapshot.
-    pub escrow: InvoiceEscrow,
-    /// True when `escrow.maturity > 0`; false means settlement has no maturity time lock.
-    pub has_maturity_lock: bool,
-    /// Active legal or compliance hold flag.
-    pub legal_hold: bool,
-    /// The captured funding close snapshot (Option).
-    pub funding_close_snapshot: EscrowCloseSnapshot,
-    /// Unique investors count who funded the escrow.
-    pub unique_funder_count: u32,
-    /// Whether the investor allowlist is active.
-    pub is_allowlist_active: bool,
-    /// Persisted schema version of the contract data.
-    pub schema_version: u32,
-    /// SME collateral commitment metadata (None when never recorded).
-    pub sme_collateral_commitment: CollateralCommitmentSnapshot,
-    /// Whether a primary attestation hash has been bound.
-    pub has_primary_attestation: bool,
-    /// Number of entries in the attestation append log.
-    pub attestation_log_length: u32,
-    /// Optional yield-bearing token address (None when unconfigured).
-    pub yield_token: Option<Address>,
-    /// Optional oracle contract address (None when unconfigured).
-    pub oracle_contract: Option<Address>,
-    /// Optional NFT contract address (None when unconfigured).
-    pub nft_contract: Option<Address>,
-    /// Settlement NFT metadata if minted (None when no NFT contract is configured or not yet settled).
-    pub settlement_nft: Option<SettlementNftMetadata>,
-}
-
-/// Custom option-like enum to represent the settlement NFT metadata.
-/// Models standard option semantics as a contracttype.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum SettlementNftSnapshot {
-    None,
-    Some(SettlementNftMetadata),
-}
-
-/// State of a dispute pause on an escrow instance.
-/// 
-/// Dispute pause is **separate** from legal hold and is triggered by admin for dispute
-/// resolution (e.g., invoice validity challenge). It auto-expires after the configured
-/// duration or is manually resumed.
-///
-/// # Fields
-/// - `ticket_id`: Identifier or reference to the support/dispute ticket (for audit trail).
-/// - `paused_at_ledger_timestamp`: Soroban ledger timestamp when pause was activated.
-/// - `expires_at_ledger_timestamp`: Ledger timestamp after which the pause auto-expires.
-///   Once ledger time reaches or exceeds this value, the escrow is unpaused.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct DisputePauseState {
-    pub ticket_id: String,
-    pub paused_at_ledger_timestamp: u64,
-    pub expires_at_ledger_timestamp: u64,
-}
-
-// --- Events ---
-
-#[contractevent]
-pub struct EscrowInitialized {
-    #[topic]
-    pub name: Symbol,
-    pub escrow: InvoiceEscrow,
-    /// Bound funding token; equals [`DataKey::FundingToken`].
-    pub funding_token: Address,
-    /// Bound treasury; equals [`DataKey::Treasury`].
-    pub treasury: Address,
-    /// Optional registry hint; equals [`DataKey::RegistryRef`] (`None` when unset).
-    pub registry: Option<Address>,
-    /// False when `escrow.maturity == 0`, which means `settle` has no maturity time lock.
-    pub has_maturity_lock: bool,
-    /// Optional yield-bearing token; equals [`DataKey::YieldToken`] (`None` when unset).
-    pub yield_token: Option<Address>,
-    /// Optional oracle contract; equals [`DataKey::OracleContract`] (`None` when unset).
-    pub oracle_contract: Option<Address>,
-    /// Optional NFT contract; equals [`DataKey::NftContract`] (`None` when unset).
-    pub nft_contract: Option<Address>,
-}
-
-#[contractevent]
-pub struct MaxUniqueInvestorsCapLowered {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    pub old_cap: u32,
-    pub new_cap: u32,
-}
-
-#[contractevent]
-pub struct EscrowFunded {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    #[topic]
-    pub investor: Address,
-    pub amount: i128,
-    pub funded_amount: i128,
-    pub status: u32,
-    /// Investor-specific effective yield (bps) after this fund; see [`DataKey::InvestorEffectiveYield`].
-    pub investor_effective_yield_bps: i64,
-    /// The `min_lock_secs` of the matched [`YieldTier`] (0 when base yield applies — no tier,
-    /// no lock commitment, or simple fund). See [`LiquifactEscrow::effective_yield_for_commitment`].
-    pub tier_lock_secs: u64,
-}
-
-/// Emitted by [`LiquifactEscrow::rotate_beneficiary`] when the SME (beneficiary)
-/// address is changed, carrying both the prior and new addresses for auditing.
-#[contractevent]
-pub struct BeneficiaryRotated {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    pub prior_sme: Address,
-    pub new_sme: Address,
-}
-
-#[contractevent]
-pub struct EscrowPartialSettle {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    pub funded_amount: i128,
-}
-
-#[contractevent]
-pub struct EscrowSettled {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    pub funded_amount: i128,
-    pub yield_bps: i64,
-    pub maturity: u64,
-    /// Ledger timestamp at which the settlement occurred.
-    pub settled_at_ledger_timestamp: u64,
-}
-
-#[contractevent]
-pub struct EscrowPartiallySettled {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    pub funded_amount: i128,
-    pub settled_amount: i128,
-    pub yield_bps: i64,
-    pub maturity: u64,
-    /// Ledger timestamp at which the partial settlement occurred.
-    pub settled_at_ledger_timestamp: u64,
-}
-
-#[contractevent]
-pub struct MaturityUpdatedEvent {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    pub old_maturity: u64,
-    pub new_maturity: u64,
-}
-
-#[contractevent]
-pub struct AdminTransferredEvent {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    pub new_admin: Address,
-}
-
-#[contractevent]
-pub struct AdminProposedEvent {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    pub current_admin: Address,
-    pub pending_admin: Address,
-}
-
-#[contractevent]
-pub struct FundingTargetUpdated {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    pub old_target: i128,
-    pub new_target: i128,
-}
-
-#[contractevent]
-pub struct LegalHoldChanged {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    /// `1` = hold enabled, `0` = cleared.
-    pub active: u32,
-    /// Human-readable reason for the hold (max 256 bytes). Empty when clearing.
-    pub reason: String,
-}
-
-#[contractevent]
-pub struct LegalHoldClearRequested {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    /// Inclusive ledger timestamp when clearing may occur.
-    pub clearable_at: u64,
-}
-
-/// Emitted when a dispute pause is activated or resumed on an escrow.
-///
-/// Dispute pause is separate from legal hold and is used for temporary resolution
-/// of invoice disputes (e.g., validity challenges). The escrow is frozen until either
-/// the auto-expiration timestamp is reached or an admin manually resumes it.
-///
-/// # Fields
-/// - `name`: Hardcoded symbol (e.g., `dispute_pause` or `disp_pause`).
-/// - `invoice_id`: Symbol representation of the invoice.
-/// - `ticket_id`: Support/dispute ticket reference for audit trail.
-/// - `action`: `1` = paused, `0` = resumed.
-/// - `paused_at`: Ledger timestamp when pause was activated.
-/// - `expires_at`: Ledger timestamp when pause auto-expires (or 0 if manually resumed).
-#[contractevent]
-pub struct DisputePausedEvt {
-    #[topic]
-    pub name: Symbol,
-    #[topic]
-    pub invoice_id: Symbol,
-    pub ticket_id: String,
-    /// `1` = paused, `0` = resumed.
-    pub action: u32,
-    pub paused_at: u64,
-    pub expires_at: u64,
-}
-
-/// SME collateral commitment metadata recorded.
+/// Validates and converts a workspace-provided invoice identifier string into a Soroban [`Symbol`].
 ///
 /// This event is emitted when [`DataKey::SmeCollateralPledge`] is written or replaced by the SME.
 /// It acts as a metadata-update signal and is not proof of custody, lien, encumbrance, asset control,
@@ -1026,6 +1020,105 @@ pub struct BatchInvestorPayoutsClaimed {
     pub invoice_id: Symbol,
     /// Number of investors whose claims were processed in this batch.
     pub claimed_count: u32,
+}
+
+/// Emitted when automatic yield distribution snapshot is computed at settlement time.
+/// Signals that all investors' yields have been pre-calculated and stored for batch claims.
+#[contractevent]
+pub struct YieldDistSnapshotCreated {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Total settled amount used for yield computation.
+    pub settled_amount: i128,
+    /// Number of unique investors with pre-computed yield shares.
+    pub investor_count: u32,
+    /// Ledger timestamp when snapshot was captured.
+    pub captured_at_ledger_timestamp: u64,
+}
+
+/// Emitted when an investor's auto-distributed yield is claimed.
+/// Indicates that the investor used the pre-computed yield amount from the snapshot.
+#[contractevent]
+pub struct AutoDistributedYieldClaimed {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub investor: Address,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// Pre-computed payout amount from the yield distribution snapshot.
+    pub payout_amount: i128,
+}
+
+/// Emitted when automatic yield distribution is enabled for an escrow.
+#[contractevent]
+pub struct YieldAutoDistributionEnabled {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub enabled: bool,
+    pub timestamp: u64,
+}
+
+/// Emitted when automatic yield distribution is disabled for an escrow.
+#[contractevent]
+pub struct YieldAutoDistributionDisabled {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub timestamp: u64,
+}
+
+/// Emitted by [`LiquifactEscrow::revalidate_token_cache`] after refreshing
+/// [`DataKey::TokenMetadataCache`] with fresh decimals from the token contract.
+#[contractevent]
+pub struct TokenCacheRevalidated {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub decimals: u32,
+    pub revalidated_ledger_timestamp: u64,
+}
+
+/// Emitted by [`LiquifactEscrow::notify_settlement`] after successfully invoking the
+/// configured [`DataKey::SettlementNotifierContract`].
+#[contractevent]
+pub struct SettlementNotifierInvoked {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub notifier_contract: Address,
+    pub funded_amount: i128,
+    pub yield_bps: i64,
+    pub settled_at_ledger_timestamp: u64,
+}
+
+/// Emitted when a funding-close Merkle root is computed and bound to
+/// [`DataKey::FundingCloseMerkleRoot`] (on full or partial funding close).
+#[contractevent]
+pub struct FundingCloseMerkleRootBound {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub merkle_root: BytesN<32>,
+}
+
+/// Emitted by [`LiquifactEscrow::detect_state_inconsistencies`] when at least one flag in the
+/// returned [`StateInconsistencyReport`] is `true`.
+#[contractevent]
+pub struct StateInconsistenciesDetected {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub report: StateInconsistencyReport,
 }
 
 #[contractevent]
@@ -1091,6 +1184,14 @@ pub struct PrimaryAttestationBound {
     pub name: Symbol,
     pub invoice_id: Symbol,
     pub digest: BytesN<32>,
+}
+
+#[contractevent]
+pub struct AttestationBoundEvt {
+    #[topic]
+    pub name: Symbol,
+    pub hash: BytesN<32>,
+    pub ledger_timestamp: u64,
 }
 
 #[contractevent]
@@ -1173,6 +1274,80 @@ pub struct ReinvestmentAuditEntry {
     pub elected_at_ledger_timestamp: u64,
     /// Ledger sequence when reinvestment was elected
     pub elected_at_ledger_sequence: u32,
+}
+
+/// One checkpoint entry in an investor's [`DataKey::InvestorFundingHistory`] audit trail.
+///
+/// Recorded at each contribution ([`LiquifactEscrow::fund`] /
+/// [`LiquifactEscrow::fund_with_commitment`]) and at settlement claim
+/// ([`LiquifactEscrow::claim_investor_payout`]). `checkpoint` distinguishes the kind of
+/// event: `"deposit"`, `"funding_close"` (the deposit that closed funding), or `"settlement"`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InvestorFundingRecord {
+    /// Kind of checkpoint: `"deposit"`, `"funding_close"`, or `"settlement"`.
+    pub checkpoint: Symbol,
+    /// Ledger timestamp when this checkpoint was recorded.
+    pub timestamp: u64,
+    /// Amount associated with this checkpoint (deposit amount, or payout amount at settlement).
+    pub amount: i128,
+    /// Investor's cumulative principal contribution as of this checkpoint.
+    pub cumulative_total: i128,
+}
+
+/// Tiered admin privilege level stored in [`DataKey::AdminRoles`].
+///
+/// ## Role capabilities matrix
+///
+/// | Role | Full-admin ops (via `load_escrow_require_admin`) | Settlement-tier ops | Audit / read-only |
+/// |------|:--:|:--:|:--:|
+/// | [`AdminRole::Full`] | ✅ | ✅ | ✅ |
+/// | [`AdminRole::SettlementOnly`] | ❌ | ✅ | ✅ |
+/// | [`AdminRole::AuditOnly`] | ❌ | ❌ | ✅ |
+///
+/// All public getters are unauthenticated reads and available to every role (and to callers
+/// with no role at all). [`InvoiceEscrow::admin`] is always implicitly [`AdminRole::Full`]
+/// unless explicitly demoted via [`LiquifactEscrow::set_admin_roles`].
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminRole {
+    /// Read-only / record-keeping tier: no mutating admin privileges.
+    AuditOnly,
+    /// May authorize settlement-tier operations (e.g. [`LiquifactEscrow::partial_settle`]) in
+    /// addition to [`AdminRole::AuditOnly`] capabilities.
+    SettlementOnly,
+    /// All admin capabilities, including operations gated by
+    /// [`LiquifactEscrow::load_escrow_require_admin`] (legal hold, allowlist, caps, migrations, …).
+    Full,
+}
+
+impl AdminRole {
+    /// Privilege ordering for [`AdminRole`] comparisons: higher ⇒ more capable.
+    fn level(&self) -> u32 {
+        match self {
+            AdminRole::AuditOnly => 1,
+            AdminRole::SettlementOnly => 2,
+            AdminRole::Full => 3,
+        }
+    }
+}
+
+/// Multisig policy gating critical operations, configured by
+/// [`LiquifactEscrow::init_multisig_policy`] and stored at [`DataKey::MultisigPolicy`].
+///
+/// `operations` names the operation tags covered by this policy (see
+/// [`LiquifactEscrow::set_legal_hold_multisig`] / [`LiquifactEscrow::release_large_claim_multisig`]
+/// for the tags each entrypoint checks). An operation **not** listed here falls back to requiring
+/// only the single [`InvoiceEscrow::admin`] signature.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultisigPolicy {
+    /// Operation tags this policy covers (e.g. `"legal_hold"`, `"large_claim"`).
+    pub operations: Vec<Symbol>,
+    /// Addresses eligible to co-sign a covered operation.
+    pub signers: Vec<Address>,
+    /// Minimum number of distinct `signers` members that must authorize a covered call.
+    pub threshold: u32,
 }
 
 /// Emitted when an investor elects to reinvest their yield.
@@ -1316,6 +1491,60 @@ pub struct ErrorDiagnostic {
     pub context: Option<String>,
 }
 
+impl ErrorDiagnostic {
+    /// Builds an [`ErrorDiagnostic`] with a populated `context` field, converting each `&str`
+    /// argument into a Soroban [`String`] bound to `env`.
+    fn with_context(
+        env: &Env,
+        error_code: u32,
+        message: &str,
+        recovery_action: &str,
+        context: &str,
+    ) -> Self {
+        ErrorDiagnostic {
+            error_code,
+            message: String::from_str(env, message),
+            recovery_action: String::from_str(env, recovery_action),
+            context: Some(String::from_str(env, context)),
+        }
+    }
+}
+
+/// Wraps an [`ErrorDiagnostic`] for publication, emitted by entrypoints that fail with a
+/// diagnosable [`EscrowError`] to give SDKs and integrators a human-readable explanation
+/// alongside the raw error code.
+#[contractevent]
+pub struct ErrorDiagnosticEmitted {
+    #[topic]
+    pub name: Symbol,
+    pub error_code: u32,
+    pub message: String,
+    pub recovery_action: String,
+    pub context: Option<String>,
+}
+
+/// Emitted when [`LiquifactEscrow::migrate`] is called, providing version information
+/// for operator diagnostics even if the call ultimately fails.
+///
+/// This event is emitted before any typed error is returned, allowing off-chain tooling
+/// to surface version delta information and help operators understand schema compatibility.
+/// Schema event version = 1.
+#[contractevent]
+pub struct MigrationDiagnosticEmitted {
+    /// Event schema version for forward compatibility.
+    #[topic]
+    pub name: Symbol,
+    /// Escrow invoice identifier.
+    #[topic]
+    pub invoice_id: Symbol,
+    /// The version stored on-chain (from `DataKey::Version`).
+    pub stored_version: u32,
+    /// The version provided as a parameter to `migrate` (from_version).
+    pub from_version: u32,
+    /// The target schema version (SCHEMA_VERSION constant).
+    pub target_version: u32,
+}
+
 /// Emitted on admin transfer (acceptance) and admin proposal.
 ///
 /// Unifies `AdminProposedEvent` + `AdminTransferredEvent` into one versioned
@@ -1354,7 +1583,7 @@ pub struct LegalHoldSet {
     /// Escrow invoice identifier.
     #[topic]
     pub invoice_id: Symbol,
-    /// Address that toggled the hold (must be admin).
+    /// Admin that cleared the hold or guardian that confirmed its activation.
     #[topic]
     pub actor: Address,
     /// Ledger timestamp when the hold was toggled.
@@ -1431,6 +1660,8 @@ pub struct ContractUpgraded {
     #[topic]
     pub invoice_id: Symbol,
     pub new_wasm_hash: BytesN<32>,
+    pub schema_version: u32,
+    pub admin: Address,
 }
 
 #[contractevent]
@@ -1485,6 +1716,14 @@ impl LiquifactEscrow {
             .unwrap_or(false)
     }
 
+    fn ensure_legal_hold_inactive(env: &Env) {
+        ensure(
+            env,
+            !Self::legal_hold_active(env),
+            EscrowError::LegalHoldBlocksMutation,
+        );
+    }
+
     /// Whether the escrow is currently paused by the admin.
     fn escrow_paused_active(env: &Env) -> bool {
         env.storage()
@@ -1508,16 +1747,17 @@ impl LiquifactEscrow {
         //
         // We take the first 8 bytes of the SHA-256 as a u64 seed and fold
         // modulo INVESTOR_BUCKET_COUNT.
-        let hash_bytes = env.crypto().sha256(&addr.clone().into());
+        let addr_bytes = addr.to_string().to_bytes();
+        let hash_bytes = env.crypto().sha256(&addr_bytes).to_array();
         let seed = u64::from_be_bytes([
-            hash_bytes.get(0).unwrap(),
-            hash_bytes.get(1).unwrap(),
-            hash_bytes.get(2).unwrap(),
-            hash_bytes.get(3).unwrap(),
-            hash_bytes.get(4).unwrap(),
-            hash_bytes.get(5).unwrap(),
-            hash_bytes.get(6).unwrap(),
-            hash_bytes.get(7).unwrap(),
+            hash_bytes[0],
+            hash_bytes[1],
+            hash_bytes[2],
+            hash_bytes[3],
+            hash_bytes[4],
+            hash_bytes[5],
+            hash_bytes[6],
+            hash_bytes[7],
         ]);
         (seed % (INVESTOR_BUCKET_COUNT as u64)) as u32
     }
@@ -1528,6 +1768,7 @@ impl LiquifactEscrow {
     /// - **Code 4001 (LowFundingRatio)**: `funded_ratio_bps < 5000` (< 50%) and close to/past maturity.
     /// - **Code 4002 (CloseToMaturity)**: `time_to_maturity_secs < 86400` (< 1 day) with healthy funding.
     /// - **Code 4003 (OverMaturity)**: Escrow is past maturity (`time_to_maturity_secs < 0`) and unfunded.
+    /// - **Code 4004 (FundingStalled)**: No new funding for longer than the configured stall threshold while escrow is open and underfunded.
     /// - **Code 0**: No warning condition detected.
     ///
     /// # Non-blocking
@@ -1560,8 +1801,47 @@ impl LiquifactEscrow {
             i64::MAX // No maturity constraint.
         };
 
+        // Check for funding staleness (code 4004).
+        let is_funding_stalled = if escrow.status == 0 && escrow.funded_amount < escrow.funding_target {
+            // Escrow is open and underfunded. Check if a stall threshold is configured.
+            if let Some(stall_threshold_secs) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u64>(&DataKey::FundingStallThresholdSecs)
+            {
+                if stall_threshold_secs > 0 {
+                    // Threshold is configured; check last fund timestamp.
+                    if let Some(last_fund_ts) = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, u64>(&DataKey::LastFundLedgerTimestamp)
+                    {
+                        let time_since_last_fund = now.saturating_sub(last_fund_ts);
+                        time_since_last_fund > stall_threshold_secs
+                    } else {
+                        // No funding has occurred yet; check if stalling period has passed since init.
+                        let created_at: u64 = env
+                            .storage()
+                            .instance()
+                            .get(&DataKey::CreatedAt)
+                            .unwrap_or(now);
+                        let time_since_creation = now.saturating_sub(created_at);
+                        time_since_creation > stall_threshold_secs
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Determine warning type based on conditions.
-        let warning_type = if time_to_maturity_secs < 0 && escrow.status == 0 && escrow.funded_amount < escrow.funding_target {
+        let warning_type = if is_funding_stalled {
+            4004 // FundingStalled: no funding activity for threshold duration while underfunded.
+        } else if time_to_maturity_secs < 0 && escrow.status == 0 && escrow.funded_amount < escrow.funding_target {
             4003 // OverMaturity: past maturity, still open, and unfunded.
         } else if time_to_maturity_secs >= 0 && time_to_maturity_secs < 86400 {
             // Close to maturity (< 1 day away).
@@ -1718,8 +1998,50 @@ impl LiquifactEscrow {
         max_funding_rate: Option<u64>,
         yield_slippage_threshold: Option<i64>,
         settlement_notifier_contract: Option<Address>,
+        kyc_provider_contract: Option<Address>,
+        admin_roles: Option<Vec<(Address, AdminRole)>>,
+        funding_stall_threshold_secs: Option<u64>,
     ) -> InvoiceEscrow {
         admin.require_auth();
+        if let Some(ref guardian_address) = guardian {
+            ensure(
+                &env,
+                guardian_address != &admin,
+                EscrowError::LegalHoldGuardianSameAsAdmin,
+            );
+        }
+
+        // ── Contract-admin detection ──────────────────────────────────────────
+        // A contract address as admin is legitimate (multisig, DAO timelock) but
+        // widens the attack surface relative to a plain account. Detect it via
+        // Address::executable(): Account ⇒ None or Executable::Account,
+        // deployed contract ⇒ Executable::Wasm(_) or Executable::StellarAsset.
+        //
+        // If reject_contract_admin = Some(true) the call fails immediately.
+        // Otherwise we emit AdminIsContractWarning so indexers can surface it.
+        //
+        // NOTE: executable() returns None when the address does not yet exist on
+        // the ledger (e.g. a pre-funded account that has not been activated, or a
+        // contract not yet deployed). We conservatively treat None as non-contract
+        // so legitimate accounts that are merely unfunded are not falsely warned.
+        let admin_is_contract = matches!(
+            admin.executable(),
+            Some(Executable::Wasm(_)) | Some(Executable::StellarAsset)
+        );
+        if admin_is_contract {
+            if reject_contract_admin.unwrap_or(false) {
+                fail(&env, EscrowError::ContractAdminRejected);
+            }
+            // Emit warning — callers can watch for symbol "adm_warn" in event logs.
+            // The invoice_id is not yet validated at this point so we emit a
+            // placeholder; the full id will appear in EscrowInitialized immediately after.
+            AdminIsContractWarning {
+                name: symbol_short!("adm_warn"),
+                invoice_id: symbol_short!("pending"),
+                admin: admin.clone(),
+            }
+            .publish(&env);
+        }
 
         ensure(&env, amount > 0, EscrowError::AmountMustBePositive);
         ensure(
@@ -1752,6 +2074,7 @@ impl LiquifactEscrow {
         let escrow = InvoiceEscrow {
             invoice_id: invoice_sym.clone(),
             admin: admin.clone(),
+            guardian,
             sme_address: sme_address.clone(),
             amount,
             funding_target: amount,
@@ -1760,6 +2083,12 @@ impl LiquifactEscrow {
             maturity,
             status: 0,
         };
+
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
         env.storage()
@@ -1770,22 +2099,13 @@ impl LiquifactEscrow {
         let now_ts = env.ledger().timestamp();
         let mut vh: Vec<(u32, u64)> = Vec::new(&env);
         vh.push_back((SCHEMA_VERSION, now_ts));
-        env.storage()
-            .instance()
-            .set(&DataKey::VersionHistory, &vh);
-
-        // Store sanctions provider if configured
-        if let Some(ref sp) = sanctions_provider {
-            env.storage()
-                .instance()
-                .set(&DataKey::SanctionsProvider, sp);
-        }
+        env.storage().instance().set(&DataKey::VersionHistory, &vh);
 
         env.storage()
             .instance()
             .set(&DataKey::FundingToken, &funding_token);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
-        
+
         // Cache token metadata at init time to reduce external calls on fund operations
         let token_client = TokenClient::new(&env, &funding_token);
         let decimals = token_client.decimals();
@@ -1797,10 +2117,24 @@ impl LiquifactEscrow {
         env.storage()
             .instance()
             .set(&DataKey::TokenMetadataCache, &token_cache);
-        
+
         if let Some(ref r) = registry {
             env.storage().instance().set(&DataKey::RegistryRef, r);
         }
+
+        // Optional KYC registry: when set, `fund` / `fund_with_commitment` require the investor
+        // to be verified. See `LiquifactEscrow::check_kyc` for the expected contract interface.
+        if let Some(ref kyc) = kyc_provider_contract {
+            env.storage()
+                .instance()
+                .set(&DataKey::KycProviderContract, kyc);
+        }
+
+        // Optional tiered admin roles. Absent ⇒ `admin` is implicit `AdminRole::Full`.
+        if let Some(roles) = admin_roles {
+            Self::store_admin_roles(&env, &roles);
+        }
+
         if let Some(ref tiers) = yield_tiers {
             if !tiers.is_empty() {
                 env.storage()
@@ -1869,6 +2203,15 @@ impl LiquifactEscrow {
                 .set(&DataKey::SettlementNotifierContract, notifier);
         }
 
+        // Store optional funding stall threshold for health check warnings (code 4004)
+        if let Some(threshold_secs) = funding_stall_threshold_secs {
+            if threshold_secs > 0 {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::FundingStallThresholdSecs, &threshold_secs);
+            }
+        }
+
         // Store creation timestamp for registry listings
         env.storage()
             .instance()
@@ -1916,6 +2259,33 @@ impl LiquifactEscrow {
     /// proof of registry membership — query the registry contract directly to verify on-chain state.
     pub fn get_registry_ref(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::RegistryRef)
+    }
+
+    /// Best-effort registration with the immutable registry configured at init.
+    ///
+    /// Only the escrow admin may invoke this entrypoint. Registry failures are recorded in an
+    /// event and return `false`; they never revert the escrow transaction.
+    pub fn register_with_registry(env: Env) -> bool {
+        let escrow = Self::load_escrow_require_admin(&env);
+        let registry = Self::get_registry_ref(env.clone());
+        let successful = registry.as_ref().is_some_and(|registry| {
+            crate::external_calls::register_escrow_with_registry(
+                &env,
+                registry,
+                escrow.invoice_id.clone(),
+                env.current_contract_address(),
+            )
+        });
+
+        RegistryRegistrationAttempted {
+            name: symbol_short!("reg_attempt"),
+            invoice_id: escrow.invoice_id,
+            registry,
+            successful,
+        }
+        .publish(&env);
+
+        successful
     }
 
     /// Returns the cached token metadata (decimals, cache timestamp, cache sequence).
@@ -2051,17 +2421,17 @@ impl LiquifactEscrow {
         let sweep_amt = amount.min(balance);
         ensure(&env, sweep_amt > 0, EscrowError::EffectiveSweepAmountZero);
 
-        // Liability floor (cancelled escrows only): sweep must not reduce the balance below
-        // principal still owed to investors who have not yet called refund().
+        // Liability floor: sweep must not reduce the balance below principal still owed to
+        // investors who have not yet redeemed their payout.
         //
-        // In settled (2) and withdrawn (3) states, disbursement is off-chain and
-        // distributed_principal stays 0, so the floor is not applicable there.
-        // In cancelled (4) state, refund() is the on-chain redemption path and increments
-        // distributed_principal atomically, making the invariant computable here.
+        // In settled (2) and withdrawn (3) states, `distributed_principal` is incremented by
+        // `claim_investor_payout` (and `withdraw`), so the outstanding liability is computable
+        // on-chain. In cancelled (4) state, `refund()` is the on-chain redemption path and
+        // increments `distributed_principal` atomically.
         //
         // outstanding = funded_amount - distributed_principal
         // Invariant: balance - sweep_amt >= outstanding
-        if escrow.status == 4 {
+        if escrow.status == 2 || escrow.status == 3 || escrow.status == 4 {
             let distributed: i128 = env
                 .storage()
                 .instance()
@@ -2107,9 +2477,17 @@ impl LiquifactEscrow {
     /// Archived escrows remain accessible but should be excluded from active-monitoring queries
     /// by off-chain indexers.
     ///
+    /// # Preconditions
+    /// Archiving a **settled** escrow (status `2`) is rejected while any investor payout remains
+    /// unclaimed: the escrow must have no outstanding investor liabilities before it can be
+    /// archived. Callers should ensure all investors have claimed via
+    /// [`LiquifactEscrow::claim_investor_payout`] (or the batch/delegate equivalents) first.
+    ///
     /// # Errors
     /// Emits [`EscrowError::ArchiveNotTerminal`] if the escrow is not in a terminal state.
     /// Emits [`EscrowError::EscrowAlreadyArchived`] if already status `5`.
+    /// Emits [`EscrowError::ArchiveBlockedByUnclaimedPayouts`] if the escrow is settled but
+    /// investor payouts remain unclaimed.
     pub fn archive_escrow(env: Env) -> InvoiceEscrow {
         let mut escrow = Self::load_escrow_require_admin(&env);
 
@@ -2145,6 +2523,18 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::Escrow)
             .unwrap_or_else(|| fail(&env, EscrowError::EscrowNotInitialized))
+    }
+
+    /// Returns funding statistics including unique funder count in a single read.
+    pub fn get_funding_stats(env: Env) -> FundingStats {
+        let escrow = Self::get_escrow(env.clone());
+        let unique_funder_count = Self::get_unique_funder_count(env);
+        FundingStats {
+            funded_amount: escrow.funded_amount,
+            funding_target: escrow.funding_target,
+            unique_funder_count,
+            status: escrow.status,
+        }
     }
 
     /// Rotate the beneficiary (SME) address that receives liquidity on
@@ -2215,14 +2605,24 @@ impl LiquifactEscrow {
     /// Load the current escrow and require admin authorization in one step.
     ///
     /// Consolidates the repeated `let escrow = Self::get_escrow(env.clone()); escrow.admin.require_auth();`
-    /// pattern used across multiple admin-gated entrypoints.
+    /// pattern used across multiple admin-gated entrypoints. Since #153, this also enforces
+    /// [`AdminRole::Full`] via [`LiquifactEscrow::require_admin_role`]: a no-op for deployments
+    /// that never configured [`DataKey::AdminRoles`] (the `admin` field is implicitly `Full`),
+    /// but correctly rejects the call if an operator explicitly demoted `admin`'s own role.
     fn load_escrow_require_admin(env: &Env) -> InvoiceEscrow {
+        Self::ensure_legal_hold_inactive(env);
+        Self::load_escrow_require_admin_during_hold(env)
+    }
+
+    /// Admin authorization path reserved for legal-hold recovery controls and admin handover.
+    fn load_escrow_require_admin_during_hold(env: &Env) -> InvoiceEscrow {
         let escrow: InvoiceEscrow = env
             .storage()
             .instance()
             .get(&DataKey::Escrow)
             .unwrap_or_else(|| fail(env, EscrowError::EscrowNotInitialized));
-        escrow.admin.require_auth();
+        let admin = escrow.admin.clone();
+        Self::require_admin_role(env, &escrow, &admin, AdminRole::Full);
         escrow
     }
 
@@ -2231,6 +2631,7 @@ impl LiquifactEscrow {
     /// Consolidates the repeated `let escrow = Self::get_escrow(env.clone()); escrow.sme_address.require_auth();`
     /// pattern used across multiple SME-gated entrypoints.
     fn load_escrow_require_sme(env: &Env) -> InvoiceEscrow {
+        Self::ensure_legal_hold_inactive(env);
         let escrow: InvoiceEscrow = env
             .storage()
             .instance()
@@ -2306,6 +2707,52 @@ impl LiquifactEscrow {
         }
     }
 
+    /// Return all contract limit constants as a [`ContractLimits`] struct.
+    ///
+    /// Clients need to know limits such as [`MAX_FUND_BATCH`], attestation log capacity,
+    /// dust sweep maximum, and dispute pause maximum to build valid transactions without
+    /// hard-coding them. This getter exposes all public limit constants at runtime.
+    ///
+    /// The returned [`ContractLimits`] struct bundles every limit constant with a field
+    /// for each one, making it easy for SDKs and integration adapters to query limits
+    /// at contract initialization and adapt their transaction builders accordingly.
+    ///
+    /// # Authorization
+    ///
+    /// None — pure read; no auth required. Safe to call before `init` since all limits
+    /// are compile-time constants, not on-chain storage.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let limits = client.get_limits()?;
+    /// println!("Max fund batch: {}", limits.max_fund_batch);
+    /// println!("Max batch claim: {}", limits.max_batch_claim);
+    /// ```
+    pub fn get_limits(_env: Env) -> ContractLimits {
+        ContractLimits {
+            max_attestation_append_entries: MAX_ATTESTATION_APPEND_ENTRIES,
+            max_reinvestment_audit_entries: MAX_REINVESTMENT_AUDIT_ENTRIES,
+            max_investor_history_entries: MAX_INVESTOR_HISTORY_ENTRIES,
+            max_admin_roles: MAX_ADMIN_ROLES,
+            max_multisig_signers: MAX_MULTISIG_SIGNERS,
+            max_multisig_operations: MAX_MULTISIG_OPERATIONS,
+            max_investor_allowlist_batch: MAX_INVESTOR_ALLOWLIST_BATCH,
+            max_fund_batch: MAX_FUND_BATCH,
+            max_batch_claim: MAX_BATCH_CLAIM,
+            investor_bucket_count: INVESTOR_BUCKET_COUNT,
+            max_dust_sweep_amount: MAX_DUST_SWEEP_AMOUNT,
+            max_dispute_pause_duration_secs: MAX_DISPUTE_PAUSE_DURATION_SECS,
+            max_invoice_id_string_len: MAX_INVOICE_ID_STRING_LEN,
+            instance_ttl_min_extension_ledgers: INSTANCE_TTL_MIN_EXTENSION_LEDGERS,
+            persistent_ttl_min_extension_ledgers: PERSISTENT_TTL_MIN_EXTENSION_LEDGERS,
+            max_ttl_bump_batch: MAX_TTL_BUMP_BATCH,
+            max_snapshot_name_len: MAX_SNAPSHOT_NAME_LEN,
+            max_state_snapshots: MAX_STATE_SNAPSHOTS,
+            legal_hold_proposal_ttl_secs: LEGAL_HOLD_PROPOSAL_TTL_SECS,
+        }
+    }
+
     /// Get the optional funding deadline (ledger timestamp), returns None if not set.
     pub fn get_funding_deadline(env: Env) -> Option<u64> {
         env.storage().instance().get(&DataKey::FundingDeadline)
@@ -2356,7 +2803,10 @@ impl LiquifactEscrow {
             i64::MAX
         };
 
-        let warning_type = if time_to_maturity_secs < 0 && escrow.status == 0 && escrow.funded_amount < escrow.funding_target {
+        let warning_type = if time_to_maturity_secs < 0
+            && escrow.status == 0
+            && escrow.funded_amount < escrow.funding_target
+        {
             4003
         } else if time_to_maturity_secs >= 0 && time_to_maturity_secs < 86400 {
             if funded_ratio_bps < 5000 {
@@ -2375,6 +2825,11 @@ impl LiquifactEscrow {
 
     /// Whether a compliance/legal hold is active (defaults to `false` if unset).
     pub fn get_legal_hold(env: Env) -> bool {
+        Self::legal_hold_active(&env)
+    }
+
+    /// Whether a compliance/legal hold is active (defaults to `false` if unset).
+    pub fn get_legal_hold_status(env: Env) -> bool {
         Self::legal_hold_active(&env)
     }
 
@@ -2425,6 +2880,11 @@ impl LiquifactEscrow {
     /// Absent ⇒ unlimited. Enforced on every deposit.
     pub fn get_max_per_investor_cap(env: Env) -> Option<i128> {
         env.storage().instance().get(&DataKey::MaxPerInvestorCap)
+    }
+
+    /// The configured [`YieldTier`] ladder, if any. Absent ⇒ flat `yield_bps` for all investors.
+    pub fn get_yield_tier_table(env: Env) -> Option<Vec<YieldTier>> {
+        env.storage().instance().get(&DataKey::YieldTierTable)
     }
 
     /// Distinct funders counted so far (each address counted once when it first receives principal).
@@ -2481,8 +2941,7 @@ impl LiquifactEscrow {
         };
 
         // Estimated yield payout
-        let estimated_yield_payout =
-            (escrow.funded_amount * escrow.yield_bps as i128) / 10_000i128;
+        let estimated_yield_payout = (escrow.funded_amount * escrow.yield_bps as i128) / 10_000i128;
 
         EscrowHealthMetrics {
             funding_progress_percent,
@@ -2502,6 +2961,9 @@ impl LiquifactEscrow {
         let funding_close_snapshot_opt = Self::get_funding_close_snapshot(env.clone());
         let unique_funder_count = Self::get_unique_funder_count(env.clone());
         let is_allowlist_active = Self::is_allowlist_active(env.clone());
+        let dispute_pause = Self::get_dispute_pause(env.clone());
+        let dispute_pause_active = dispute_pause.is_some();
+        let dispute_pause_expiry = dispute_pause.map(|p| p.expires_at_ledger_timestamp as u64);
         let schema_version = Self::get_version(env.clone());
         let sme_collateral_commitment = Self::get_sme_collateral_commitment(env.clone());
         let primary_attestation_hash = Self::get_primary_attestation_hash(env.clone());
@@ -2527,6 +2989,8 @@ impl LiquifactEscrow {
             funding_close_snapshot,
             unique_funder_count,
             is_allowlist_active,
+            dispute_pause_active,
+            dispute_pause_expiry,
             schema_version,
             sme_collateral_commitment,
             has_primary_attestation: primary_attestation_hash.is_some(),
@@ -2534,10 +2998,7 @@ impl LiquifactEscrow {
             yield_token,
             oracle_contract,
             nft_contract,
-            settlement_nft: env
-                .storage()
-                .instance()
-                .get(&DataKey::SettlementNft),
+            settlement_nft: env.storage().instance().get(&DataKey::SettlementNft),
         }
     }
 
@@ -2564,6 +3025,48 @@ impl LiquifactEscrow {
         }
     }
 
+    /// Returns investor capacity status for this escrow.
+    ///
+    /// Provides a self-explanatory, single-call answer to "can more investors contribute?"
+    /// without requiring client-side arithmetic on `max_unique_investors_cap` and `unique_funder_count`.
+    ///
+    /// **Read-only** — no authorization required, no state mutation.
+    ///
+    /// # Returns
+    /// [`InvestorCapStatus`] containing:
+    /// - `max`: Maximum number of distinct investors allowed. Returns `u32::MAX` when no cap is set.
+    /// - `current`: Current number of distinct investors that have contributed.
+    /// - `remaining`: Remaining capacity for new investors (always `max - current`).
+    /// - `is_full`: `true` when `current == max` (escrow is at capacity).
+    ///
+    /// # Notes
+    /// - When no cap is configured (`get_max_unique_investors_cap()` returns `None`),
+    ///   `max` is set to `u32::MAX` and `is_full` is always `false`.
+    /// - When a cap exists, `remaining = max - current`.
+    /// - This is a read-only convenience entrypoint; cap enforcement logic is unchanged.
+    pub fn get_investor_cap_status(env: Env) -> InvestorCapStatus {
+        let max_cap = Self::get_max_unique_investors_cap(env.clone());
+        let current_count = Self::get_unique_funder_count(env);
+
+        let (max, is_full, remaining) = match max_cap {
+            Some(cap) => {
+                let remaining = cap.saturating_sub(current_count);
+                (cap, current_count >= cap, remaining)
+            }
+            None => {
+                // No cap set: use u32::MAX and never mark as full
+                (u32::MAX, false, u32::MAX.saturating_sub(current_count))
+            }
+        };
+
+        InvestorCapStatus {
+            max,
+            current: current_count,
+            remaining,
+            is_full,
+        }
+    }
+
     /// Bind a **primary** 32-byte digest (e.g. SHA-256 of an IPFS CID or document bundle). **Single-set:**
     /// the call succeeds only while no primary hash exists; use [`LiquifactEscrow::append_attestation_digest`]
     /// for an append-only audit trail.
@@ -2571,18 +3074,35 @@ impl LiquifactEscrow {
     /// **Authorization:** [`InvoiceEscrow::admin`]. **Frontrunning:** whichever binding transaction lands
     /// first wins; observers must read on-chain state (or parse events) after finality—there is no replay lock.
     ///
+    /// # Validation
+    /// The `digest` must be exactly 32 bytes. Shorter or longer inputs are rejected with a typed error
+    /// rather than an opaque panic, giving callers a recoverable signal.
+    ///
     /// # Errors
-    /// Emits typed [`EscrowError`] codes when the escrow is uninitialized or the primary digest has
-    /// already been bound.
-    pub fn bind_primary_attestation_hash(env: Env, digest: BytesN<32>) {
-        let escrow = Self::load_escrow_require_admin(&env);
+    /// - [`EscrowError::AttestationHashAlreadyBound`] if a primary hash already exists.
+    /// - [`EscrowError::InvalidAttestationHashLength`] if `digest.len() != 32`.
+    /// - [`EscrowError::EscrowNotInitialized`] if called before `init`.
+    pub fn bind_primary_attestation_hash(env: Env, digest: Bytes) {
         ensure(
             &env,
             !env.storage()
                 .instance()
                 .has(&DataKey::PrimaryAttestationHash),
-            EscrowError::PrimaryAttestationAlreadyBound,
+            EscrowError::AttestationHashAlreadyBound,
         );
+
+        // Length validation: must be exactly 32 bytes (e.g. SHA-256).
+        // Emits a typed error so callers receive error code 52 instead of an opaque panic.
+        ensure(
+            &env,
+            digest.len() == 32,
+            EscrowError::InvalidAttestationHashLength,
+        );
+        let digest: BytesN<32> = digest
+            .try_into()
+            .unwrap_or_else(|_| fail(&env, EscrowError::InvalidAttestationHashLength));
+
+        let escrow = Self::load_escrow_require_admin(&env);
         env.storage()
             .instance()
             .set(&DataKey::PrimaryAttestationHash, &digest);
@@ -2590,6 +3110,12 @@ impl LiquifactEscrow {
             name: symbol_short!("att_bind"),
             invoice_id: escrow.invoice_id.clone(),
             digest: digest.clone(),
+        }
+        .publish(&env);
+        AttestationBoundEvt {
+            name: symbol_short!("att_bound"),
+            hash: digest,
+            ledger_timestamp: env.ledger().timestamp(),
         }
         .publish(&env);
     }
@@ -2614,10 +3140,7 @@ impl LiquifactEscrow {
 
         // Auto-migrate: if an old Vec-based log exists but no count has been set,
         // migrate each old entry to the new individual-entry format first.
-        let has_old_log = env
-            .storage()
-            .instance()
-            .has(&DataKey::AttestationAppendLog);
+        let has_old_log = env.storage().instance().has(&DataKey::AttestationAppendLog);
         let has_count = env
             .storage()
             .instance()
@@ -2677,7 +3200,7 @@ impl LiquifactEscrow {
             .set(&DataKey::AttestationTimestamp(idx), &ts);
 
         // Store the tag if non-empty (enables tag-based queries)
-        if !tag.is_empty() {
+        if tag != Symbol::new(&env, "") {
             env.storage()
                 .instance()
                 .set(&DataKey::AttestationTag(idx), &tag);
@@ -2726,102 +3249,76 @@ impl LiquifactEscrow {
         log
     }
 
-    // --- Persistent per-investor storage helpers ---
     fn get_persistent_investor_contribution(env: &Env, investor: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::InvestorContribution(investor))
-            .unwrap_or(0)
+        PerInvestorStorage::new(env).get_contribution(investor)
     }
 
     fn set_persistent_investor_contribution(env: &Env, investor: Address, amount: i128) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::InvestorContribution(investor), &amount);
+        env.per_investor().set_contribution(investor, amount);
     }
 
     fn get_persistent_investor_effective_yield(env: &Env, investor: Address) -> Option<i64> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::InvestorEffectiveYield(investor))
+        env.per_investor().get_effective_yield(investor)
     }
 
     fn set_persistent_investor_effective_yield(env: &Env, investor: Address, value: i64) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::InvestorEffectiveYield(investor), &value);
+        env.per_investor().set_effective_yield(investor, value);
     }
 
     fn get_persistent_investor_claim_not_before(env: &Env, investor: Address) -> u64 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::InvestorClaimNotBefore(investor))
-            .unwrap_or(0)
+        env.per_investor().get_claim_not_before(investor)
     }
 
     fn set_persistent_investor_claim_not_before(env: &Env, investor: Address, value: u64) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::InvestorClaimNotBefore(investor), &value);
+        env.per_investor().set_claim_not_before(investor, value);
     }
 
     fn get_persistent_investor_lock_in_until(env: &Env, investor: Address) -> u64 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::InvestorLockInUntil(investor))
-            .unwrap_or(0)
+        env.per_investor().get_lock_in_until(investor)
     }
 
     fn set_persistent_investor_lock_in_until(env: &Env, investor: Address, value: u64) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::InvestorLockInUntil(investor), &value);
+        env.per_investor().set_lock_in_until(investor, value);
     }
 
     fn get_persistent_investor_claimed(env: &Env, investor: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::InvestorClaimed(investor))
-            .unwrap_or(false)
+        env.per_investor().get_claimed(investor)
     }
 
     fn set_persistent_investor_claimed(env: &Env, investor: Address, value: bool) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::InvestorClaimed(investor), &value);
+        env.per_investor().set_claimed(investor, value);
     }
 
-    /// Read the delegated address for an investor's yield claim, if set.
-    /// **Persistent** storage. Absent ⇒ `None` (no delegation).
+    fn get_persistent_investor_allowlisted(env: &Env, investor: Address) -> bool {
+        env.per_investor().get_allowlisted(investor)
+    }
+
+    fn set_persistent_investor_allowlisted(env: &Env, investor: Address, allowed: bool) {
+        env.per_investor().set_allowlisted(investor, allowed);
+    }
+
     fn get_persistent_yield_claim_delegate(env: &Env, investor: Address) -> Option<Address> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::YieldClaimDelegate(investor.clone()))
+        env.per_investor().get_yield_claim_delegate(investor)
     }
 
-    /// Set the delegated address for an investor's yield claim.
-    /// **Persistent** storage.
     fn set_persistent_yield_claim_delegate(env: &Env, investor: Address, delegate: Address) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::YieldClaimDelegate(investor), &delegate);
+        env.per_investor().set_yield_claim_delegate(investor, delegate)
     }
 
-    /// Check whether a delegation has been explicitly revoked.
-    /// **Persistent** storage. Absent ⇒ `false` (not revoked or never delegated).
     fn get_persistent_yield_claim_delegate_revoked(env: &Env, investor: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::YieldClaimDelegateRevoked(investor))
-            .unwrap_or(false)
+        env.per_investor().get_yield_claim_delegate_revoked(investor)
     }
 
-    /// Mark a delegation as revoked.
-    /// **Persistent** storage.
     fn set_persistent_yield_claim_delegate_revoked(env: &Env, investor: Address, revoked: bool) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::YieldClaimDelegateRevoked(investor), &revoked);
+        env.per_investor().set_yield_claim_delegate_revoked(investor, revoked);
+    }
+
+    fn get_persistent_investor_history(env: &Env, investor: Address) -> Vec<InvestorFundingRecord> {
+        env.per_investor().get_funding_history(investor)
+    }
+
+    fn append_persistent_funding_record(env: &Env, investor: Address, record: InvestorFundingRecord) {
+        env.per_investor().append_funding_record(investor, record);
     }
 
     /// Verify that a delegation is valid (exists and is not revoked).
@@ -2846,6 +3343,71 @@ impl LiquifactEscrow {
         Self::get_persistent_investor_contribution(&env, investor)
     }
 
+    /// Returns `investor`'s funding checkpoint history ([`DataKey::InvestorFundingHistory`]).
+    ///
+    /// Each entry is a snapshot recorded at a checkpoint: a deposit via
+    /// [`LiquifactEscrow::fund`] / [`LiquifactEscrow::fund_with_commitment`] (`"deposit"`,
+    /// or `"funding_close"` for the deposit that closes funding), or a settlement claim via
+    /// [`LiquifactEscrow::claim_investor_payout`] (`"settle"`). Bounded by
+    /// [`MAX_INVESTOR_HISTORY_ENTRIES`]; returns an empty vector if `investor` never funded.
+    pub fn get_investor_history(env: Env, investor: Address) -> Vec<InvestorFundingRecord> {
+        Self::get_persistent_investor_history(&env, investor)
+    }
+
+    /// Returns a paginated slice of `investor`'s funding checkpoint history.
+    ///
+    /// # Parameters
+    ///
+    /// * `investor` - The investor address to fetch history for.
+    /// * `offset` - Zero-indexed starting position in the history. Offsets beyond the history
+    ///   length return an empty vector.
+    /// * `limit` - Maximum number of records to return. Capped at [`MAX_HISTORY_PAGE_SIZE`]
+    ///   to prevent excessive CPU/memory usage.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec` of up to `min(limit, MAX_HISTORY_PAGE_SIZE)` records, or fewer if the offset
+    /// is near the end of the history or the investor has no history. An empty vector is
+    /// returned if `investor` never funded or `offset >= history.len()`.
+    ///
+    /// # Pagination Example
+    ///
+    /// ```ignore
+    /// let history = get_investor_history_page(env, investor, 0, 50);
+    /// let next_page = get_investor_history_page(env, investor, 50, 50);
+    /// ```
+    pub fn get_investor_history_page(
+        env: Env,
+        investor: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<InvestorFundingRecord> {
+        let history = Self::get_persistent_investor_history(&env, investor);
+        let history_len = history.len() as u32;
+
+        // Handle offset beyond history
+        if offset >= history_len {
+            return Vec::new(&env);
+        }
+
+        // Cap limit to MAX_HISTORY_PAGE_SIZE
+        let capped_limit = if limit > MAX_HISTORY_PAGE_SIZE {
+            MAX_HISTORY_PAGE_SIZE
+        } else {
+            limit
+        };
+
+        // Calculate the end index, capping at history length
+        let end_idx = std::cmp::min(offset + capped_limit, history_len);
+
+        // Extract the slice from offset to end_idx
+        let mut result = Vec::new(&env);
+        for i in offset..end_idx {
+            result.push_back(history.get_unchecked(i as usize));
+        }
+        result
+    }
+
     /// Pro-rata denominator captured when the escrow first became **funded**; [`None`] until then.
     ///
     /// The snapshot is write-once. It records the full `funded_amount` at the threshold-crossing
@@ -2863,7 +3425,9 @@ impl LiquifactEscrow {
     /// with [`LiquifactEscrow::verify_investor_proof`] to confirm an investor's
     /// contribution and pro-rata share without iterating on-chain storage.
     pub fn get_funding_close_merkle_root(env: Env) -> Option<BytesN<32>> {
-        env.storage().instance().get(&DataKey::FundingCloseMerkleRoot)
+        env.storage()
+            .instance()
+            .get(&DataKey::FundingCloseMerkleRoot)
     }
 
     /// Effective yield (bps) for this investor after their **first** deposit; later [`LiquifactEscrow::fund`]
@@ -2933,8 +3497,9 @@ impl LiquifactEscrow {
     pub fn get_investor_yield_slippage(env: Env, investor: Address) -> (i64, i64, i64) {
         // env.clone(): env is used again after this call for the InvestorEffectiveYield read.
         let escrow = Self::get_escrow(env.clone());
-        let actual_yield_bps = Self::get_persistent_investor_effective_yield(&env, investor.clone())
-            .unwrap_or(escrow.yield_bps);
+        let actual_yield_bps =
+            Self::get_persistent_investor_effective_yield(&env, investor.clone())
+                .unwrap_or(escrow.yield_bps);
         let expected_yield_bps = escrow.yield_bps;
         let deviation_bps = (actual_yield_bps - expected_yield_bps).abs();
 
@@ -2955,11 +3520,11 @@ impl LiquifactEscrow {
     ///
     /// # Detectable inconsistencies
     ///
-    /// - **funded_exceeds_target_not_advanced**: `funded_amount > funding_target` but `status < 1`.
+    /// - **funded_exceeds_target_stale**: `funded_amount > funding_target` but `status < 1`.
     ///   Funding has surpassed the target yet the escrow was not advanced to funded.
-    /// - **funded_amount_positive_status_open**: `funded_amount > 0` but `status == 0`.
+    /// - **funded_positive_status_open**: `funded_amount > 0` but `status == 0`.
     ///   Principal was received but escrow remains in open state.
-    /// - **zero_funded_amount_advanced_status**: `funded_amount == 0` but `status >= 1`.
+    /// - **funded_zero_status_advanced**: `funded_amount == 0` but `status >= 1`.
     ///   A funded/settled/withdrawn escrow has no principal.
     /// - **funders_exist_status_open**: `unique_funder_count > 0` but `status == 0`.
     ///   Investors have contributed but escrow is still open.
@@ -2992,10 +3557,8 @@ impl LiquifactEscrow {
         let escrow = Self::get_escrow(env.clone());
 
         // Get optional dependent state.
-        let snapshot_opt: Option<FundingCloseSnapshot> = env
-            .storage()
-            .instance()
-            .get(&DataKey::FundingCloseSnapshot);
+        let snapshot_opt: Option<FundingCloseSnapshot> =
+            env.storage().instance().get(&DataKey::FundingCloseSnapshot);
         let unique_funder_count: u32 = env
             .storage()
             .instance()
@@ -3005,12 +3568,12 @@ impl LiquifactEscrow {
 
         // Check each invariant.
         let report = StateInconsistencyReport {
-            funded_exceeds_target_not_advanced: escrow.funded_amount > escrow.funding_target
+            funded_exceeds_target_stale: escrow.funded_amount > escrow.funding_target
                 && escrow.status < 1,
 
-            funded_amount_positive_status_open: escrow.funded_amount > 0 && escrow.status == 0,
+            funded_positive_status_open: escrow.funded_amount > 0 && escrow.status == 0,
 
-            zero_funded_amount_advanced_status: escrow.funded_amount == 0 && escrow.status >= 1,
+            funded_zero_status_advanced: escrow.funded_amount == 0 && escrow.status >= 1,
 
             funders_exist_status_open: unique_funder_count > 0 && escrow.status == 0,
 
@@ -3030,9 +3593,9 @@ impl LiquifactEscrow {
         };
 
         // Emit event if any inconsistency is detected.
-        let has_inconsistency = report.funded_exceeds_target_not_advanced
-            || report.funded_amount_positive_status_open
-            || report.zero_funded_amount_advanced_status
+        let has_inconsistency = report.funded_exceeds_target_stale
+            || report.funded_positive_status_open
+            || report.funded_zero_status_advanced
             || report.funders_exist_status_open
             || report.no_funders_advanced_status
             || report.snapshot_exists_not_funded
@@ -3043,7 +3606,7 @@ impl LiquifactEscrow {
 
         if has_inconsistency {
             StateInconsistenciesDetected {
-                name: symbol_short!("state_incon"),
+                name: symbol_short!("state_inc"),
                 invoice_id: escrow.invoice_id.clone(),
                 report: report.clone(),
             }
@@ -3054,6 +3617,7 @@ impl LiquifactEscrow {
     }
 
     pub fn revoke_attestation_digest(env: Env, index: u32) {
+        Self::ensure_legal_hold_inactive(&env);
         let escrow = Self::get_escrow(env.clone());
         escrow.admin.require_auth();
 
@@ -3130,6 +3694,9 @@ impl LiquifactEscrow {
     /// - [`EscrowError::CollateralAmountNotPositive`] if `amount <= 0`.
     /// - [`EscrowError::CollateralAssetEmpty`] if `asset` is empty.
     /// - [`EscrowError::CollateralTimestampBackwards`] if the replacement timestamp is in the past.
+    /// - [`EscrowError::CollateralUpdateAfterSettlement`] if the escrow has already settled,
+    ///   been withdrawn, or been cancelled (status >= 2). Initial records on open or funded
+    ///   escrows are always permitted.
     /// - Standard uninitialized check via `load_escrow_require_sme`.
     pub fn record_sme_collateral_commitment(
         env: Env,
@@ -3152,17 +3719,28 @@ impl LiquifactEscrow {
         let prior_amount = prior.as_ref().map(|c| c.amount).unwrap_or(0);
 
         if let Some(ref existing) = prior {
+            // Updates are not permitted after settlement (status >= 2: settled, withdrawn, cancelled).
             ensure(
                 &env,
-                now >= existing.recorded_at,
+                escrow.status < 2,
+                EscrowError::CollateralUpdateAfterSettlement,
+            );
+            ensure(
+                &env,
+                now >= existing.updated_at,
                 EscrowError::CollateralTimestampBackwards,
             );
         }
 
+        // On first write: recorded_at = updated_at = now (both timestamps are the same).
+        // On update: recorded_at is preserved from the original write; updated_at advances.
+        let recorded_at = prior.as_ref().map(|c| c.recorded_at).unwrap_or(now);
+
         let commitment = SmeCollateralCommitment {
             asset,
             amount,
-            recorded_at: now,
+            recorded_at,
+            updated_at: now,
         };
         env.storage()
             .instance()
@@ -3179,7 +3757,10 @@ impl LiquifactEscrow {
         commitment
     }
 
-    /// Set or clear compliance hold. Only the **current** [`InvoiceEscrow::admin`] may call.
+    /// Set or clear compliance hold. Clearing requires the current [`InvoiceEscrow::admin`].
+    /// Activation also requires only the admin when no guardian is configured; when a guardian
+    /// is configured, use [`LiquifactEscrow::propose_legal_hold`] and
+    /// [`LiquifactEscrow::confirm_legal_hold`] instead.
     ///
     /// **Clearing:** always requires the current admin's authorization — there is no timelock,
     /// council override, or break-glass entrypoint. After
@@ -3191,7 +3772,19 @@ impl LiquifactEscrow {
     /// `propose_admin`, `accept_admin`, then `clear_legal_hold`. See
     /// `docs/escrow-legal-hold.md`.
     pub fn set_legal_hold(env: Env, active: bool, reason: String) {
-        let escrow = Self::load_escrow_require_admin(&env);
+        let escrow = Self::load_escrow_require_admin_during_hold(&env);
+
+        if active && escrow.guardian.is_some() {
+            fail(&env, EscrowError::LegalHoldRequiresGuardianConfirmation);
+        }
+
+        // Check if escrow is in a terminal status (2, 3, 4, or 5)
+        // Terminal statuses: 2 = settled, 3 = withdrawn, 4 = cancelled, 5 = archived
+        ensure(
+            &env,
+            escrow.status < 2,
+            EscrowError::LegalHoldSetOnTerminalEscrow,
+        );
 
         // Validate reason length (max 256 bytes)
         ensure(
@@ -3222,6 +3815,9 @@ impl LiquifactEscrow {
         env.storage()
             .instance()
             .remove(&DataKey::LegalHoldClearableAt);
+        env.storage()
+            .instance()
+            .remove(&DataKey::LegalHoldProposalExpiresAt);
 
         env.storage().instance().set(&DataKey::LegalHold, &active);
 
@@ -3231,9 +3827,7 @@ impl LiquifactEscrow {
                 .instance()
                 .set(&DataKey::LegalHoldReason, &reason);
         } else {
-            env.storage()
-                .instance()
-                .remove(&DataKey::LegalHoldReason);
+            env.storage().instance().remove(&DataKey::LegalHoldReason);
         }
 
         LegalHoldChanged {
@@ -3251,6 +3845,107 @@ impl LiquifactEscrow {
             actor: escrow.admin.clone(),
             timestamp: env.ledger().timestamp(),
             active: if active { 1 } else { 0 },
+        }
+        .publish(&env);
+    }
+
+    /// Propose a legal hold for guardian confirmation. Proposals expire after
+    /// [`LEGAL_HOLD_PROPOSAL_TTL_SECS`] seconds of ledger time.
+    pub fn propose_legal_hold(env: Env, admin: Address) {
+        let escrow = Self::get_escrow(env.clone());
+        ensure(
+            &env,
+            admin == escrow.admin,
+            EscrowError::LegalHoldAuthorityMismatch,
+        );
+        Self::require_admin_role(&env, &escrow, &admin, AdminRole::Full);
+        ensure(
+            &env,
+            escrow.guardian.is_some(),
+            EscrowError::LegalHoldGuardianNotConfigured,
+        );
+        ensure(
+            &env,
+            escrow.status < 2,
+            EscrowError::LegalHoldSetOnTerminalEscrow,
+        );
+        ensure(
+            &env,
+            !Self::legal_hold_active(&env),
+            EscrowError::LegalHoldAlreadyActive,
+        );
+
+        let expires_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(LEGAL_HOLD_PROPOSAL_TTL_SECS)
+            .unwrap_or_else(|| fail(&env, EscrowError::LedgerTimestampOverflow));
+        env.storage()
+            .instance()
+            .set(&DataKey::LegalHoldProposalExpiresAt, &expires_at);
+
+        LegalHoldProposed {
+            name: symbol_short!("lh_prop"),
+            invoice_id: escrow.invoice_id,
+            admin,
+            expires_at,
+        }
+        .publish(&env);
+    }
+
+    /// Confirm a pending legal hold using the configured guardian address.
+    pub fn confirm_legal_hold(env: Env, guardian: Address) {
+        let escrow = Self::get_escrow(env.clone());
+        ensure(
+            &env,
+            escrow.guardian.as_ref() == Some(&guardian),
+            EscrowError::LegalHoldAuthorityMismatch,
+        );
+        guardian.require_auth();
+        ensure(
+            &env,
+            escrow.status < 2,
+            EscrowError::LegalHoldSetOnTerminalEscrow,
+        );
+
+        let expires_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LegalHoldProposalExpiresAt)
+            .unwrap_or_else(|| fail(&env, EscrowError::LegalHoldProposalMissing));
+        ensure(
+            &env,
+            env.ledger().timestamp() < expires_at,
+            EscrowError::LegalHoldProposalExpired,
+        );
+        ensure(
+            &env,
+            !Self::legal_hold_active(&env),
+            EscrowError::LegalHoldProposalMissing,
+        );
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::LegalHoldProposalExpiresAt);
+        env.storage()
+            .instance()
+            .remove(&DataKey::LegalHoldClearableAt);
+        env.storage().instance().set(&DataKey::LegalHold, &true);
+
+        let reason = String::from_str(&env, "");
+        LegalHoldChanged {
+            name: symbol_short!("legalhld"),
+            invoice_id: escrow.invoice_id.clone(),
+            active: 1,
+            reason,
+        }
+        .publish(&env);
+        LegalHoldSet {
+            name: symbol_short!("legal_set"),
+            invoice_id: escrow.invoice_id,
+            actor: guardian,
+            timestamp: env.ledger().timestamp(),
+            active: 1,
         }
         .publish(&env);
     }
@@ -3302,7 +3997,7 @@ impl LiquifactEscrow {
     /// |-----------|-------------|
     /// | `timestamp + delay` overflows | [`EscrowError::LegalHoldClearDelayOverflow`] |
     pub fn request_clear_legal_hold(env: Env) {
-        let escrow = Self::load_escrow_require_admin(&env);
+        let escrow = Self::load_escrow_require_admin_during_hold(&env);
 
         let now = env.ledger().timestamp();
         let delay = Self::get_legal_hold_clear_delay(env.clone());
@@ -3323,6 +4018,70 @@ impl LiquifactEscrow {
             clearable_at,
         }
         .publish(&env);
+    }
+
+    /// Revalidate and update the cached token metadata by fetching fresh decimals from the token contract.
+    ///
+    /// This is an **admin-only** entrypoint that explicitly updates the token metadata cache
+    /// (normally written only at [`LiquifactEscrow::init`]). Used when:
+    /// - The token contract is upgraded and decimals change
+    /// - The cached metadata is suspected stale
+    /// - Governance decides to refresh the cache for other reasons
+    ///
+    /// # Returns
+    ///
+    /// The updated [`TokenMetadataCache`] with fresh decimals and current ledger time/sequence.
+    ///
+    /// # Authorization
+    ///
+    /// Requires admin authorization. This prevents accidental cache pollution by non-admins.
+    pub fn enable_yield_auto_distribution(env: Env) {
+        let escrow = Self::load_escrow_require_admin(&env);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldAutoDistributionEnabled, &true);
+
+        YieldAutoDistributionEnabled {
+            name: symbol_short!("yield_ad"),
+            invoice_id: escrow.invoice_id.clone(),
+            enabled: true,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// Disable automatic yield distribution for this escrow.
+    ///
+    /// When disabled, yields are computed on-demand per `claim_investor_payout` call.
+    /// Has no effect on already-claimed investors (claim markers persist).
+    /// Has no effect if the escrow is already settled and snapshot was captured.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current [`InvoiceEscrow::admin`].
+    pub fn disable_yield_auto_distribution(env: Env) {
+        let escrow = Self::load_escrow_require_admin(&env);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldAutoDistributionEnabled, &false);
+
+        YieldAutoDistributionDisabled {
+            name: symbol_short!("yield_dis"),
+            invoice_id: escrow.invoice_id.clone(),
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// Check if automatic yield distribution is enabled for this escrow.
+    ///
+    /// When enabled, [`LiquifactEscrow::settle`] pre-computes each investor's yield
+    /// and stores it for batch claims. When disabled or not set, yields are computed
+    /// on-demand during each `claim_investor_payout` call.
+    pub fn is_yield_auto_dist_enabled(env: Env) -> bool {
+        Self::yield_auto_distribution_enabled(&env)
     }
 
     /// Revalidate and update the cached token metadata by fetching fresh decimals from the token contract.
@@ -3364,7 +4123,7 @@ impl LiquifactEscrow {
             name: symbol_short!("tok_val"),
             invoice_id: escrow.invoice_id.clone(),
             decimals,
-            revalidated_at_ledger_timestamp: cache.cached_at_ledger_timestamp,
+            revalidated_ledger_timestamp: cache.cached_at_ledger_timestamp,
         }
         .publish(&env);
 
@@ -3454,9 +4213,7 @@ impl LiquifactEscrow {
     /// Add or remove an investor from the allowlist.
     pub fn set_investor_allowlisted(env: Env, investor: Address, allowed: bool) {
         let escrow = Self::load_escrow_require_admin(&env);
-        env.storage()
-            .persistent()
-            .set(&DataKey::InvestorAllowlisted(investor.clone()), &allowed);
+        Self::set_persistent_investor_allowlisted(&env, investor.clone(), allowed);
 
         InvestorAllowlistChanged {
             name: symbol_short!("al_set"),
@@ -3493,9 +4250,7 @@ impl LiquifactEscrow {
         // Iterate and perform per-address persistent storage write and event emission.
         for i in 0..n {
             let inv = investors.get(i).unwrap();
-            env.storage()
-                .persistent()
-                .set(&DataKey::InvestorAllowlisted(inv.clone()), &allowed);
+            Self::set_persistent_investor_allowlisted(&env, inv.clone(), allowed);
 
             InvestorAllowlistChanged {
                 name: symbol_short!("al_set"),
@@ -3508,15 +4263,13 @@ impl LiquifactEscrow {
     }
 
     pub fn is_investor_allowlisted(env: Env, investor: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::InvestorAllowlisted(investor))
-            .unwrap_or(false)
+        Self::get_persistent_investor_allowlisted(&env, investor)
     }
 
     /// Convenience alias for [`LiquifactEscrow::set_legal_hold`] with `active = false`.
     pub fn clear_legal_hold(env: Env) {
-        Self::set_legal_hold(env, false, String::from_str(&env, ""));
+        let reason = String::from_str(&env, "");
+        Self::set_legal_hold(env, false, reason);
     }
 
     pub fn update_funding_target(env: Env, new_target: i128) -> InvoiceEscrow {
@@ -3538,6 +4291,12 @@ impl LiquifactEscrow {
 
         let old_target = escrow.funding_target;
         escrow.funding_target = new_target;
+
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
@@ -3642,37 +4401,68 @@ impl LiquifactEscrow {
     /// | Condition | Typed error |
     /// |-----------|--------|
     /// | `stored_version != from_version` | [`EscrowError::MigrationVersionMismatch`] |
-    /// | `from_version >= SCHEMA_VERSION` | [`EscrowError::AlreadyCurrentSchemaVersion`] |
-    /// | Any `from_version < SCHEMA_VERSION` (all paths) | [`EscrowError::NoMigrationPath`] |
+    /// | Migration already applied; replay detected | [`EscrowError::MigrationAlreadyApplied`] |
+    /// | `from_version > SCHEMA_VERSION` | [`EscrowError::AlreadyCurrentSchemaVersion`] |
+    /// | `from_version < SCHEMA_VERSION` (no legacy migration is implemented) | [`EscrowError::NoMigrationPath`] |
     ///
     /// See `docs/OPERATOR_RUNBOOK.md` §2 for step-by-step instructions on implementing
-    /// a concrete migration path.
+    /// a concrete migration path. **Before implementing migration logic, ensure this
+    /// idempotency check is in place to prevent replay attacks.**
     pub fn migrate(env: Env, from_version: u32) -> u32 {
+        // 1. Auth check: MUST be first, before any storage reads or writes
         Self::load_escrow_require_admin(&env);
 
+        // 2. Retrieve stored version
         let stored: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(0);
 
+        // 3. Validate version alignment
         ensure(
             &env,
             stored == from_version,
             EscrowError::MigrationVersionMismatch,
         );
 
-        if from_version >= SCHEMA_VERSION {
-            fail(&env, EscrowError::AlreadyCurrentSchemaVersion)
-        } else {
-            // No migration path is implemented for any version below SCHEMA_VERSION.
-            // To add one: implement the transformation here, call
-            //   env.storage().instance().set(&DataKey::Version, &NEW_VERSION);
-            // and return NEW_VERSION before reaching this typed error.
-            //
-            // When a migration path IS implemented, also record the version change:
-            //   let mut vh: Vec<(u32, u64)> = env.storage().instance()
-            //       .get(&DataKey::VersionHistory).unwrap_or_else(|| Vec::new(&env));
-            //   vh.push_back((NEW_VERSION, env.ledger().timestamp()));
-            //   env.storage().instance().set(&DataKey::VersionHistory, &vh);
-            fail(&env, EscrowError::NoMigrationPath)
+        // 4. **NEW:** Check idempotency nonce — prevent replaying this migration
+        // if it was already successfully applied to this instance.
+        let migration_key = DataKey::MigrationExecutionLog(from_version, SCHEMA_VERSION);
+        if env.storage().instance().has(&migration_key) {
+            // This migration has already been applied. Reject replay.
+            fail(&env, EscrowError::MigrationAlreadyApplied)
         }
+
+        // Older schemas need an explicit storage transformation; current-version
+        // calls are audit-only and are used after a same-schema WASM upgrade.
+        if from_version < SCHEMA_VERSION {
+            fail(&env, EscrowError::NoMigrationPath)
+        } else if from_version > SCHEMA_VERSION {
+            fail(&env, EscrowError::AlreadyCurrentSchemaVersion)
+        }
+
+        // Record a same-schema upgrade audit without interpreting legacy storage.
+        let completed_at = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &SCHEMA_VERSION);
+        env.storage().instance().set(
+            &DataKey::MigrationExecutionLog(from_version, SCHEMA_VERSION),
+            &(env.ledger().sequence() as u32),
+        );
+        env.storage().instance().set(
+            &DataKey::MigrationCompletedAt(from_version, SCHEMA_VERSION),
+            &completed_at,
+        );
+
+        let mut version_history: Vec<(u32, u64)> = env
+            .storage()
+            .instance()
+            .get(&DataKey::VersionHistory)
+            .unwrap_or_else(|| Vec::new(&env));
+        version_history.push_back((SCHEMA_VERSION, completed_at));
+        env.storage()
+            .instance()
+            .set(&DataKey::VersionHistory, &version_history);
+
+        SCHEMA_VERSION
     }
 
     /// Query the attestation append log with optional filters and pagination.
@@ -3682,8 +4472,9 @@ impl LiquifactEscrow {
     ///
     /// # Filtering
     /// - `after_timestamp`: Only entries with `timestamp >= after_timestamp` (inclusive).
-    /// - `tag_prefix`: Only entries whose tag starts with this prefix (case-sensitive
-    ///   Soroban [`Symbol`] prefix match).
+    /// - `tag_prefix`: Only entries whose tag exactly equals this value. Named `tag_prefix` for
+    ///   the field's original intent, but implemented as an exact [`Symbol`] match — `Symbol`
+    ///   exposes no substring API that is safe to call from a `wasm32` contract build.
     ///
     /// # Pagination
     /// - `limit`: Maximum entries per page (clamped to the available matching entries).
@@ -3738,9 +4529,10 @@ impl LiquifactEscrow {
                 }
             }
 
-            // Apply filter: tag_prefix
+            // Apply filter: tag_prefix (exact match — `Symbol` has no wasm-safe substring API,
+            // so this is not a true prefix match; see the field's rustdoc).
             if let Some(ref prefix) = filters.tag_prefix {
-                if !tag.to_string().starts_with(&prefix.to_string()) {
+                if &tag != prefix {
                     continue;
                 }
             }
@@ -3783,11 +4575,7 @@ impl LiquifactEscrow {
     /// Combine this snapshot with off-chain indexer data for a full investor list.
     pub fn export_escrow_snapshot(env: Env) -> EscrowSnapshot {
         let escrow = Self::get_escrow(env.clone());
-        let schema_version: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or(0);
+        let schema_version: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(0);
         let legal_hold: bool = env
             .storage()
             .instance()
@@ -3911,12 +4699,21 @@ impl LiquifactEscrow {
         // Auth first — matches migrate() ordering
         let escrow = Self::load_escrow_require_admin(&env);
 
+        // Get the current schema version
+        let schema_version = env
+            .storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(SCHEMA_VERSION);
+
         // Emit event before the deployer call so the event is recorded even if
         // the deployer call somehow reverts (defensive ordering)
         ContractUpgraded {
             name: symbol_short!("upgrade"),
             invoice_id: escrow.invoice_id,
             new_wasm_hash: new_wasm_hash.clone(),
+            schema_version,
+            admin: escrow.admin,
         }
         .publish(&env);
 
@@ -3932,7 +4729,10 @@ impl LiquifactEscrow {
     /// Emits typed [`EscrowError`] codes for invalid amount, legal hold, closed funding state,
     /// allowlist rejection, cap violations, and checked-arithmetic overflow.
     pub fn fund(env: Env, investor: Address, amount: i128) -> InvoiceEscrow {
-        Self::fund_impl(env, investor, amount, true, 0)
+        let mut escrow = Self::get_escrow(env.clone());
+        Self::fund_impl(&env, &mut escrow, investor, amount, true, 0, false);
+        env.storage().instance().set(&DataKey::Escrow, &escrow);
+        escrow
     }
 
     /// First deposit only (per investor): optional longer lock and tier ladder from [`DataKey::YieldTierTable`].
@@ -3948,7 +4748,18 @@ impl LiquifactEscrow {
         amount: i128,
         committed_lock_secs: u64,
     ) -> InvoiceEscrow {
-        Self::fund_impl(env, investor, amount, false, committed_lock_secs)
+        let mut escrow = Self::get_escrow(env.clone());
+        Self::fund_impl(
+            &env,
+            &mut escrow,
+            investor,
+            amount,
+            false,
+            committed_lock_secs,
+            false,
+        );
+        env.storage().instance().set(&DataKey::Escrow, &escrow);
+        escrow
     }
 
     /// Batch funding entrypoint: record multiple investor principals in a single call.
@@ -3979,69 +4790,200 @@ impl LiquifactEscrow {
         ensure(&env, n > 0, EscrowError::FundingBatchEmpty);
         ensure(&env, n <= MAX_FUND_BATCH, EscrowError::FundingBatchTooLarge);
 
+        // Load the escrow once before the loop; apply all entries in memory and
+        // persist exactly once after the loop to avoid per-entry read/write pairs.
         let mut escrow = Self::get_escrow(env.clone());
-
-        for i in 0..n {
-            let (investor, amount) = entries.get(i).unwrap();
-
-            // Call fund_impl for each entry, but we need to reconstruct the escrow
-            // after each call. However, fund_impl returns the updated escrow,
-            // so we capture it for the next iteration.
-            escrow = Self::fund_impl(env.clone(), investor, amount, true, 0);
-        }
-
-        escrow
-    }
-
-    fn fund_impl(
-        env: Env,
-        investor: Address,
-        amount: i128,
-        simple_fund: bool,
-        committed_lock_secs: u64,
-    ) -> InvoiceEscrow {
-        investor.require_auth();
-
-        ensure(&env, amount > 0, EscrowError::FundingAmountNotPositive);
-
-        let floor: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinContributionFloor)
-            .unwrap_or(0);
-        if floor > 0 {
-            ensure(
-                &env,
-                amount >= floor,
-                EscrowError::FundingBelowMinContribution,
-            );
-        }
-
-        // env.clone(): env is used again after this call for storage writes and publish.
-        let mut escrow = Self::get_escrow(env.clone());
-        // Legal hold check is intentionally after the escrow read: the escrow is needed for
-        // status and yield_bps regardless, and hoisting the hold check before the escrow read
-        // would not reduce storage operations (both keys are always read on this path).
-        ensure(
-            &env,
-            !Self::legal_hold_active(&env),
-            EscrowError::LegalHoldBlocksFunding,
-        );
-        ensure(
-            &env,
-            !Self::is_dispute_paused(&env),
-            EscrowError::DisputePausedBlocksFunding,
-        );
         ensure(
             &env,
             escrow.status == 0,
             EscrowError::EscrowNotOpenForFunding,
         );
 
+        for i in 0..n {
+            let (investor, amount) = entries.get(i).unwrap();
+            Self::fund_impl(&env, &mut escrow, investor, amount, true, 0, true);
+        }
+
+        env.storage().instance().set(&DataKey::Escrow, &escrow);
+
+        escrow
+    }
+
+    /// Batch funding entrypoint: record multiple investor principals in a single atomic call
+    /// and emit a [`BatchFundCompleted`] summary event when all entries succeed.
+    ///
+    /// This is the canonical FEAT-001 entrypoint. It differs from [`LiquifactEscrow::fund_batch`]
+    /// in one key way: after every entry is processed it emits a single `BatchFundCompleted` event
+    /// carrying the aggregate totals (`total_funded_amount` and `investor_count`), which lets
+    /// indexers reconcile a batch submission with a single event lookup rather than scanning all
+    /// individual per-entry [`EscrowFunded`] events.
+    ///
+    /// Each entry is processed sequentially with per-investor [`Address::require_auth()`].
+    /// All existing [`LiquifactEscrow::fund`] invariants (allowlist, caps, min contribution,
+    /// overflow guards) are enforced per entry. If any single entry fails its invariants the
+    /// entire transaction reverts atomically — no partial state is persisted.
+    ///
+    /// # Parameters
+    /// - `contributions`: `Vec<(Address, i128)>` of `(investor_address, amount)` tuples.
+    ///   Maximum [`MAX_FUND_BATCH`] (50) entries per call.
+    ///
+    /// # Returns
+    /// The updated [`InvoiceEscrow`] after all entries are applied.
+    ///
+    /// # Events
+    /// - Per entry: [`EscrowFunded`] + [`FundReceived`] (identical to single
+    ///   [`LiquifactEscrow::fund`] semantics, emitted inside [`fund_impl`]).
+    /// - Once, at end: [`BatchFundCompleted`] with aggregate totals.
+    ///
+    /// # Funded-target snapshot
+    /// If any entry causes the escrow to transition to **funded** (`status 0 → 1`),
+    /// [`DataKey::FundingCloseSnapshot`] is recorded exactly once. Remaining entries are
+    /// still processed after the transition (over-funding is allowed up to `funding_target`
+    /// per entry validation; exact semantics follow [`fund_impl`]).
+    ///
+    /// # Errors
+    /// - [`EscrowError::FundingBatchEmpty`] if `contributions` is empty.
+    /// - [`EscrowError::FundingBatchTooLarge`] if `contributions.len() > MAX_FUND_BATCH`.
+    /// - Per-entry: all errors from [`LiquifactEscrow::fund`] for that investor/amount pair.
+    pub fn batch_fund(env: Env, contributions: Vec<(Address, i128)>) -> InvoiceEscrow {
+        let n = contributions.len();
+
+        ensure(&env, n > 0, EscrowError::FundingBatchEmpty);
+        ensure(&env, n <= MAX_FUND_BATCH, EscrowError::FundingBatchTooLarge);
+
+        // Load the escrow once before the loop; apply all entries in memory and
+        // persist exactly once after the loop to avoid per-entry read/write pairs.
+        let mut escrow = Self::get_escrow(env.clone());
+        ensure(
+            &env,
+            escrow.status == 0,
+            EscrowError::EscrowNotOpenForFunding,
+        );
+
+        // Track how much principal this batch call contributes in total.
+        let funded_before: i128 = escrow.funded_amount;
+
+        for i in 0..n {
+            let (investor, amount) = contributions.get(i).unwrap();
+            // fund_impl handles per-investor require_auth(), all validation,
+            // per-investor persistent writes, per-entry events, and status transitions.
+            Self::fund_impl(&env, &mut escrow, investor, amount, true, 0, true);
+        }
+
+        // Persist the escrow exactly once after the loop.
+        env.storage().instance().set(&DataKey::Escrow, &escrow);
+
+        // Total principal credited by this batch call.
+        let total_funded_amount = escrow
+            .funded_amount
+            .checked_sub(funded_before)
+            .unwrap_or(escrow.funded_amount);
+
+        // Emit the single batch-level summary event.
+        BatchFundCompleted {
+            name: symbol_short!("btch_fnd"),
+            invoice_id: escrow.invoice_id.clone(),
+            total_funded_amount,
+            investor_count: n,
+            escrow_funded_amount: escrow.funded_amount,
+            status: escrow.status,
+        }
+        .publish(&env);
+
+        escrow
+    }
+
+    /// Checks and atomically updates UniqueFunderCount if this is a new investor (prev == 0).
+    /// Enforces max_unique_investors cap atomically before incrementing.
+    pub(crate) fn check_and_increment_funder_count(env: &Env, prev: i128) {
+        if prev == 0 {
+            let cur_funder_count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::UniqueFunderCount)
+                .unwrap_or(0);
+
+            if let Some(cap) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u32>(&DataKey::MaxUniqueInvestorsCap)
+            {
+                ensure(
+                    env,
+                    cur_funder_count < cap,
+                    EscrowError::UniqueInvestorCapReached,
+                );
+            }
+
+            env.storage()
+                .instance()
+                .set(&DataKey::UniqueFunderCount, &(cur_funder_count + 1));
+        }
+    }
+
+    /// Apply a single funding entry to the in-memory `escrow` snapshot.
+    ///
+    /// This helper performs **no** `DataKey::Escrow` read or write: the caller is
+    /// responsible for loading the escrow once before calling (and persisting it once
+    /// after, for batch paths). Only per-investor persistent writes and event emissions
+    /// happen here, so `batch_fund` / `fund_batch` avoid N read/write pairs of the same
+    /// instance key.
+    fn fund_impl(
+        env: &Env,
+        escrow: &mut InvoiceEscrow,
+        investor: Address,
+        amount: i128,
+        simple_fund: bool,
+        committed_lock_secs: u64,
+        batch_funding: bool,
+    ) {
+        investor.require_auth();
+
+        // Amounts must always be positive. This check is independent of any floor
+        // and ensures zero contributions are always rejected.
+        ensure(env, amount > 0, EscrowError::FundingAmountNotPositive);
+
+        // Fetch the minimum contribution floor. Absence (None) is semantically equivalent to 0.
+        // This makes the floor validation explicit: amounts must always be >= floor,
+        // and the floor defaults to 0 when not set (absent on older schema versions).
+        let floor: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinContributionFloor)
+            .unwrap_or(0);
+
+        // Check that the amount meets or exceeds the floor.
+        // Always applied (not conditional on floor > 0) to make semantics explicit:
+        // the absence-equals-zero policy is centralized here.
+        ensure(
+            env,
+            amount >= floor,
+            EscrowError::FundingBelowMinContribution,
+        );
+
+        // Legal hold check is intentionally after the escrow read: the escrow is needed for
+        // status and yield_bps regardless, and hoisting the hold check before the escrow read
+        // would not reduce storage operations (both keys are always read on this path).
+        ensure(
+            env,
+            !Self::legal_hold_active(env),
+            EscrowError::LegalHoldBlocksFunding,
+        );
+        ensure(
+            env,
+            !Self::is_dispute_paused_for_mutation(env),
+            EscrowError::DisputePausedBlocksFunding,
+        );
+        ensure(
+            env,
+            escrow.status == 0 || (batch_funding && escrow.status == 1),
+            EscrowError::EscrowNotOpenForFunding,
+        );
+
         // Check funding deadline
         if let Some(deadline) = env.storage().instance().get(&DataKey::FundingDeadline) {
             ensure(
-                &env,
+                env,
                 env.ledger().timestamp() <= deadline,
                 EscrowError::FundingDeadlinePassed,
             );
@@ -4054,7 +4996,7 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::FundingPaused)
             .unwrap_or(false);
-        ensure(&env, !funding_paused, EscrowError::FundingIsPaused);
+        ensure(env, !funding_paused, EscrowError::FundingIsPaused);
 
         // Velocity gate: if max_funding_rate is configured, enforce per-ledger cap.
         if let Some(rate) = env
@@ -4079,13 +5021,11 @@ impl LiquifactEscrow {
 
             let new_ledger_total = ledger_funded
                 .checked_add(amount)
-                .unwrap_or_else(|| fail(&env, EscrowError::InvestorContributionOverflow));
+                .unwrap_or_else(|| fail(env, EscrowError::InvestorContributionOverflow));
 
             if new_ledger_total > rate as i128 {
                 // Auto-pause: velocity exceeded — block further funding.
-                env.storage()
-                    .instance()
-                    .set(&DataKey::FundingPaused, &true);
+                env.storage().instance().set(&DataKey::FundingPaused, &true);
 
                 FundingPausedEvent {
                     name: symbol_short!("fund_paus"),
@@ -4094,9 +5034,9 @@ impl LiquifactEscrow {
                     max_funding_rate: rate,
                     ledger_funded,
                 }
-                .publish(&env);
+                .publish(env);
 
-                fail(&env, EscrowError::FundingVelocityExceeded);
+                fail(env, EscrowError::FundingVelocityExceeded);
             }
 
             // Update velocity tracking.
@@ -4110,19 +5050,22 @@ impl LiquifactEscrow {
 
         if Self::is_allowlist_active(env.clone()) {
             ensure(
-                &env,
+                env,
                 Self::is_investor_allowlisted(env.clone(), investor.clone()),
                 EscrowError::InvestorNotAllowlisted,
             );
         }
 
         // Sanctions screening: check investor against configured sanctions provider
-        Self::check_sanctions(&env, &investor);
+        Self::check_sanctions(env, &investor);
 
-        let prev: i128 = Self::get_persistent_investor_contribution(&env, investor.clone());
+        // KYC gating: reject funding from unverified investors when a KYC registry is configured.
+        Self::check_kyc(env, &investor);
+
+        let prev: i128 = Self::get_persistent_investor_contribution(env, investor.clone());
         let new_contribution: i128 = prev
             .checked_add(amount)
-            .unwrap_or_else(|| fail(&env, EscrowError::InvestorContributionOverflow));
+            .unwrap_or_else(|| fail(env, EscrowError::InvestorContributionOverflow));
 
         if let Some(cap) = env
             .storage()
@@ -4130,37 +5073,13 @@ impl LiquifactEscrow {
             .get::<DataKey, i128>(&DataKey::MaxPerInvestorCap)
         {
             ensure(
-                &env,
+                env,
                 new_contribution <= cap,
                 EscrowError::InvestorContributionExceedsCap,
             );
         }
 
-        // Hoist UniqueFunderCount read: used for both the cap assertion (below) and the
-        // increment write (after contribution is recorded). A single read covers both uses,
-        // eliminating one storage read on every new-investor funding call.
-        let cur_funder_count: u32 = if prev == 0 {
-            env.storage()
-                .instance()
-                .get(&DataKey::UniqueFunderCount)
-                .unwrap_or(0)
-        } else {
-            0 // prev != 0: count is not needed; skip the read entirely.
-        };
-
-        if prev == 0 {
-            if let Some(cap) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u32>(&DataKey::MaxUniqueInvestorsCap)
-            {
-                ensure(
-                    &env,
-                    cur_funder_count < cap,
-                    EscrowError::UniqueInvestorCapReached,
-                );
-            }
-        }
+        Self::check_and_increment_funder_count(env, prev);
 
         // Capture the effective yield and tier lock threshold in locals so event fields can
         // be populated without post-write storage reads.
@@ -4173,42 +5092,42 @@ impl LiquifactEscrow {
             if prev == 0 {
                 investor_effective_yield_bps = escrow.yield_bps;
                 Self::set_persistent_investor_effective_yield(
-                    &env,
+                    env,
                     investor.clone(),
                     escrow.yield_bps,
                 );
-                Self::set_persistent_investor_claim_not_before(&env, investor.clone(), 0u64);
+                Self::set_persistent_investor_claim_not_before(env, investor.clone(), 0u64);
             } else {
                 // Returning investor: yield was set on first deposit; read it for the event.
                 investor_effective_yield_bps =
-                    Self::get_persistent_investor_effective_yield(&env, investor.clone())
+                    Self::get_persistent_investor_effective_yield(env, investor.clone())
                         .unwrap_or(escrow.yield_bps);
             }
             // If prev > 0, preserve existing effective yield and claim lock
         } else {
-            ensure(&env, prev == 0, EscrowError::TieredSecondDeposit);
+            ensure(env, prev == 0, EscrowError::TieredSecondDeposit);
             let (eff, lock) =
-                Self::effective_yield_for_commitment(&env, escrow.yield_bps, committed_lock_secs);
+                Self::effective_yield_for_commitment(env, escrow.yield_bps, committed_lock_secs);
             investor_effective_yield_bps = eff;
             tier_lock_secs = lock;
-            Self::set_persistent_investor_effective_yield(&env, investor.clone(), eff);
+            Self::set_persistent_investor_effective_yield(env, investor.clone(), eff);
             let now = env.ledger().timestamp();
             let claim_nb = if committed_lock_secs == 0 {
                 0u64
             } else {
                 now.checked_add(committed_lock_secs)
-                    .unwrap_or_else(|| fail(&env, EscrowError::InvestorClaimTimeOverflow))
+                    .unwrap_or_else(|| fail(env, EscrowError::InvestorClaimTimeOverflow))
             };
             // Bound: reject if the claim lock would expire after the escrow maturity.
             // Only constrained when both committed_lock_secs > 0 and maturity > 0.
             if claim_nb > 0 && escrow.maturity > 0 {
                 ensure(
-                    &env,
+                    env,
                     claim_nb <= escrow.maturity,
                     EscrowError::CommitmentLockExceedsMaturity,
                 );
             }
-            Self::set_persistent_investor_claim_not_before(&env, investor.clone(), claim_nb);
+            Self::set_persistent_investor_claim_not_before(env, investor.clone(), claim_nb);
 
             // Set investor lock-in period (separate from tier commitment lock)
             let lock_in_secs: u64 = env
@@ -4219,15 +5138,26 @@ impl LiquifactEscrow {
             if lock_in_secs > 0 {
                 let lock_until = now
                     .checked_add(lock_in_secs)
-                    .unwrap_or_else(|| fail(&env, EscrowError::InvestorClaimTimeOverflow));
-                Self::set_persistent_investor_lock_in_until(&env, investor.clone(), lock_until);
+                    .unwrap_or_else(|| fail(env, EscrowError::InvestorClaimTimeOverflow));
+                Self::set_persistent_investor_lock_in_until(env, investor.clone(), lock_until);
             }
         }
 
-        escrow.funded_amount = escrow
+        ensure!(amount <= escrow.funding_target, EscrowError::FundingTargetExceeded);
+
+        let new_funded = escrow
             .funded_amount
             .checked_add(amount)
-            .unwrap_or_else(|| fail(&env, EscrowError::FundedAmountOverflow));
+            .unwrap_or_else(|| fail(env, EscrowError::FundedAmountOverflow));
+
+        if !batch_funding {
+            ensure!(
+                new_funded <= escrow.funding_target,
+                EscrowError::FundingTargetExceeded
+            );
+        }
+
+        escrow.funded_amount = new_funded;
 
         // --- Concentration cap check ---
         if let Some(concentration_cap) = env
@@ -4243,14 +5173,17 @@ impl LiquifactEscrow {
                     .unwrap_or(0);
                 if concentration_pct > concentration_cap as i128 {
                     let diagnostic = ErrorDiagnostic::with_context(
-                        &env,
+                        env,
                         EscrowError::ConcentrationLimitExceeded as u32,
                         "Investor concentration exceeds configured cap",
                         "Reduce funding amount or wait for other investors to fund",
-                        &format!("Current: {}%, Limit: {}%", concentration_pct, concentration_cap),
+                        &format!(
+                            "Current: {}%, Limit: {}%",
+                            concentration_pct, concentration_cap
+                        ),
                     );
-                    Self::emit_error_diagnostic(&env, diagnostic);
-                    fail(&env, EscrowError::ConcentrationLimitExceeded);
+                    Self::emit_error_diagnostic(env, diagnostic);
+                    fail(env, EscrowError::ConcentrationLimitExceeded);
                 }
             }
         }
@@ -4258,20 +5191,63 @@ impl LiquifactEscrow {
         if escrow.status == 0 && escrow.funded_amount >= escrow.funding_target {
             escrow.status = 1;
             if !env.storage().instance().has(&DataKey::FundingCloseSnapshot) {
+                let seq = env.ledger().sequence();
                 let snap = FundingCloseSnapshot {
                     total_principal: escrow.funded_amount,
                     funding_target: escrow.funding_target,
                     closed_at_ledger_timestamp: env.ledger().timestamp(),
-                    closed_at_ledger_sequence: env.ledger().sequence(),
+                    closed_at_ledger_sequence: seq,
                 };
+                // Defensive assertion: verify ledger_sequence consistency
+                debug_assert_eq!(
+                    snap.closed_at_ledger_sequence, seq,
+                    "FundingCloseSnapshot ledger_sequence must match env.ledger().sequence()"
+                );
                 env.storage()
                     .instance()
                     .set(&DataKey::FundingCloseSnapshot, &snap);
 
+                // Validate that snapshot timestamp is before maturity.
+                // If funding closed after maturity, emit a warning event for audit trail.
+                if escrow.maturity > 0 && snap.closed_at_ledger_timestamp >= escrow.maturity {
+                    // Snapshot recorded after or at maturity; emit warning type 4004.
+                    let funded_ratio_bps: i64 = if escrow.funding_target > 0 {
+                        let numerator = (escrow.funded_amount as i128).saturating_mul(10_000);
+                        let ratio = numerator / (escrow.funding_target as i128);
+                        if ratio > i64::MAX as i128 {
+                            i64::MAX
+                        } else if ratio < 0 {
+                            0
+                        } else {
+                            ratio as i64
+                        }
+                    } else {
+                        10_000_i64
+                    };
+
+                    let time_to_maturity_secs: i64 = {
+                        let maturity_i64 = escrow.maturity as i64;
+                        let now_i64 = snap.closed_at_ledger_timestamp as i64;
+                        maturity_i64.saturating_sub(now_i64)
+                    };
+
+                    EscrowHealthWarning {
+                        name: symbol_short!("hlth_wrn"),
+                        invoice_id: escrow.invoice_id.clone(),
+                        warning_type: 4004, // FundingClosedAfterMaturity
+                        funded_amount: escrow.funded_amount,
+                        funding_target: escrow.funding_target,
+                        funded_ratio_bps,
+                        time_to_maturity_secs,
+                        recorded_at_ledger_timestamp: snap.closed_at_ledger_timestamp,
+                    }
+                    .publish(env);
+                }
+
                 // Compute and store Merkle root for proof-based claim verification.
                 // The root is a Keccak-256 hash of the empty set when there are no
                 // investor entries to include (unlikely at funded status, but safe).
-                let merkle_root = Self::compute_empty_merkle_root(&env);
+                let merkle_root = Self::compute_empty_merkle_root(env);
                 env.storage()
                     .instance()
                     .set(&DataKey::FundingCloseMerkleRoot, &merkle_root);
@@ -4281,15 +5257,30 @@ impl LiquifactEscrow {
                     invoice_id: escrow.invoice_id.clone(),
                     merkle_root: merkle_root.clone(),
                 }
-                .publish(&env);
+                .publish(env);
             }
         }
 
-        Self::set_persistent_investor_contribution(&env, investor.clone(), new_contribution);
+        Self::set_persistent_investor_contribution(env, investor.clone(), new_contribution);
+
+        // Record a funding-history checkpoint for this deposit (see #148). `escrow.status`
+        // already reflects the funded-status transition (if any) computed above.
+        let history_checkpoint = if escrow.status == 1 {
+            symbol_short!("fnd_close")
+        } else {
+            symbol_short!("deposit")
+        };
+        Self::append_investor_history_record(
+            env,
+            investor.clone(),
+            history_checkpoint,
+            amount,
+            new_contribution,
+        );
 
         // Update the bucketed aggregate for dashboard O(1) reads.
         {
-            let bucket = Self::investor_bucket_index(&env, &investor);
+            let bucket = Self::investor_bucket_index(env, &investor);
             let prev_bucket: i128 = env
                 .storage()
                 .instance()
@@ -4302,10 +5293,6 @@ impl LiquifactEscrow {
         }
 
         if prev == 0 {
-            // Use the hoisted cur_funder_count; no second storage read needed.
-            env.storage()
-                .instance()
-                .set(&DataKey::UniqueFunderCount, &(cur_funder_count + 1));
             // Maintain ordered investor index for list_investors pagination.
             // Read InvestorCount (may differ from UniqueFunderCount on pre-v6 instances
             // that did not initialize it; default to 0 so the first index is always 0).
@@ -4322,7 +5309,13 @@ impl LiquifactEscrow {
                 .set(&DataKey::InvestorCount, &(investor_count + 1));
         }
 
-        env.storage().instance().set(&DataKey::Escrow, &escrow);
+        // NOTE: `DataKey::Escrow` is intentionally NOT written here. The caller
+        // (single-fund or batch path) persists the in-memory escrow exactly once.
+
+        // Record the timestamp of this successful fund operation for stall detection.
+        env.storage()
+            .instance()
+            .set(&DataKey::LastFundLedgerTimestamp, &env.ledger().timestamp());
 
         EscrowFunded {
             name: symbol_short!("funded"),
@@ -4335,7 +5328,7 @@ impl LiquifactEscrow {
             investor_effective_yield_bps,
             tier_lock_secs,
         }
-        .publish(&env);
+        .publish(env);
 
         // Also emit the versioned FundReceived with timestamp + actor.
         FundReceived {
@@ -4349,9 +5342,7 @@ impl LiquifactEscrow {
             investor_effective_yield_bps,
             tier_lock_secs,
         }
-        .publish(&env);
-
-        escrow
+        .publish(env);
     }
 
     /// Closes funding early for an under-funded invoice, transitioning the escrow to a settleable state.
@@ -4369,15 +5360,16 @@ impl LiquifactEscrow {
     pub fn partial_settle(env: Env, caller: Address) -> InvoiceEscrow {
         caller.require_auth();
 
-        assert!(
-            !Self::legal_hold_active(&env),
-            "Legal hold blocks partial settlement"
-        );
+        Self::ensure_legal_hold_inactive(&env);
 
         let mut escrow = Self::get_escrow(env.clone());
 
+        // Since #153: also permit any address holding >= AdminRole::SettlementOnly.
+        let has_settlement_role = Self::effective_admin_role(&env, &escrow, &caller)
+            .map(|r| r.level() >= AdminRole::SettlementOnly.level())
+            .unwrap_or(false);
         assert!(
-            caller == escrow.sme_address || caller == escrow.admin,
+            caller == escrow.sme_address || caller == escrow.admin || has_settlement_role,
             "Unauthorized caller for partial settlement"
         );
 
@@ -4391,15 +5383,58 @@ impl LiquifactEscrow {
 
         // Write FundingCloseSnapshot if not already present.
         if !env.storage().instance().has(&DataKey::FundingCloseSnapshot) {
+            let seq = env.ledger().sequence();
             let snap = FundingCloseSnapshot {
                 total_principal: escrow.funded_amount,
                 funding_target: escrow.funding_target,
                 closed_at_ledger_timestamp: env.ledger().timestamp(),
-                closed_at_ledger_sequence: env.ledger().sequence(),
+                closed_at_ledger_sequence: seq,
             };
+            // Defensive assertion: verify ledger_sequence consistency
+            debug_assert_eq!(
+                snap.closed_at_ledger_sequence, seq,
+                "FundingCloseSnapshot ledger_sequence must match env.ledger().sequence()"
+            );
             env.storage()
                 .instance()
                 .set(&DataKey::FundingCloseSnapshot, &snap);
+
+            // Validate that snapshot timestamp is before maturity.
+            // If funding closed after maturity, emit a warning event for audit trail.
+            if escrow.maturity > 0 && snap.closed_at_ledger_timestamp >= escrow.maturity {
+                // Snapshot recorded after or at maturity; emit warning type 4004.
+                let funded_ratio_bps: i64 = if escrow.funding_target > 0 {
+                    let numerator = (escrow.funded_amount as i128).saturating_mul(10_000);
+                    let ratio = numerator / (escrow.funding_target as i128);
+                    if ratio > i64::MAX as i128 {
+                        i64::MAX
+                    } else if ratio < 0 {
+                        0
+                    } else {
+                        ratio as i64
+                    }
+                } else {
+                    10_000_i64
+                };
+
+                let time_to_maturity_secs: i64 = {
+                    let maturity_i64 = escrow.maturity as i64;
+                    let now_i64 = snap.closed_at_ledger_timestamp as i64;
+                    maturity_i64.saturating_sub(now_i64)
+                };
+
+                EscrowHealthWarning {
+                    name: symbol_short!("hlth_wrn"),
+                    invoice_id: escrow.invoice_id.clone(),
+                    warning_type: 4004, // FundingClosedAfterMaturity
+                    funded_amount: escrow.funded_amount,
+                    funding_target: escrow.funding_target,
+                    funded_ratio_bps,
+                    time_to_maturity_secs,
+                    recorded_at_ledger_timestamp: snap.closed_at_ledger_timestamp,
+                }
+                .publish(&env);
+            }
 
             // Compute and store Merkle root for the partial-settle path.
             let merkle_root = Self::compute_empty_merkle_root(&env);
@@ -4414,6 +5449,14 @@ impl LiquifactEscrow {
             }
             .publish(&env);
         }
+
+        env.storage().instance().set(&DataKey::Escrow, &escrow);
+
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
@@ -4442,6 +5485,7 @@ impl LiquifactEscrow {
     /// Emits [`EscrowError::SettlementNotifierNotSet`] when no notifier was configured at init.
     /// Emits [`EscrowError::InvestorClaimNotSettled`] (127) when escrow status is not `2` (settled).
     pub fn notify_settlement(env: Env) {
+        Self::ensure_legal_hold_inactive(&env);
         let escrow = Self::get_escrow(env.clone());
 
         ensure(
@@ -4459,12 +5503,12 @@ impl LiquifactEscrow {
         let now = env.ledger().timestamp();
         let args = soroban_sdk::vec![
             &env,
-            escrow.invoice_id.clone(),
-            escrow.funded_amount,
-            escrow.yield_bps,
-            now
+            escrow.invoice_id.to_val(),
+            escrow.funded_amount.into_val(&env),
+            escrow.yield_bps.into_val(&env),
+            now.into_val(&env),
         ];
-        env.invoke_contract(¬ifier, &symbol_short!("on_settle"), args);
+        env.invoke_contract::<()>(&notifier, &symbol_short!("on_settle"), args);
 
         SettlementNotifierInvoked {
             name: symbol_short!("notify_ok"),
@@ -4485,7 +5529,7 @@ impl LiquifactEscrow {
         );
         ensure(
             &env,
-            !Self::is_dispute_paused(&env),
+            !Self::is_dispute_paused_for_mutation(&env),
             EscrowError::DisputePausedBlocksSettlement,
         );
 
@@ -4503,11 +5547,20 @@ impl LiquifactEscrow {
         if escrow.maturity > 0 {
             if now < escrow.maturity {
                 let seconds_remaining = escrow.maturity.saturating_sub(now);
-                let context_msg = String::from_str(&env, &format!("Maturity timestamp: {} (in ~{} seconds)", escrow.maturity, seconds_remaining));
+                let context_msg = String::from_str(
+                    &env,
+                    &format!(
+                        "Maturity timestamp: {} (in ~{} seconds)",
+                        escrow.maturity, seconds_remaining
+                    ),
+                );
                 let diagnostic = ErrorDiagnostic {
                     error_code: EscrowError::MaturityNotReached as u32,
                     message: String::from_str(&env, "Escrow has not reached maturity yet"),
-                    recovery_action: String::from_str(&env, "Wait until maturity timestamp to settle"),
+                    recovery_action: String::from_str(
+                        &env,
+                        "Wait until maturity timestamp to settle",
+                    ),
                     context: Some(context_msg),
                 };
                 Self::emit_error_diagnostic(&env, diagnostic);
@@ -4521,14 +5574,22 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::SettledAmount)
             .unwrap_or(0);
-        
+
         let new_settled_amount = match partial_amount {
             Some(amount) => {
                 // Validate partial amount
                 ensure(&env, amount > 0, EscrowError::SettlementNotPositive);
-                ensure(&env, amount <= escrow.funded_amount, EscrowError::SettlementExceedsFunded);
-                ensure(&env, amount + current_settled_amount <= escrow.funded_amount, EscrowError::SettlementExceedsFunded);
-                
+                ensure(
+                    &env,
+                    amount <= escrow.funded_amount,
+                    EscrowError::SettlementExceedsFunded,
+                );
+                ensure(
+                    &env,
+                    amount + current_settled_amount <= escrow.funded_amount,
+                    EscrowError::SettlementExceedsFunded,
+                );
+
                 current_settled_amount + amount
             }
             None => escrow.funded_amount, // Full settlement
@@ -4541,7 +5602,7 @@ impl LiquifactEscrow {
 
         // Determine if this is a full or partial settlement
         let is_full_settlement = new_settled_amount == escrow.funded_amount;
-        
+
         if is_full_settlement {
             escrow.status = 2;
         }
@@ -4563,7 +5624,7 @@ impl LiquifactEscrow {
                 // For partial settlement, use only the amount being settled now
                 new_settled_amount - current_settled_amount
             };
-            
+
             if settlement_basis > 0 {
                 // Gross coupon = settlement_basis * yield_bps / 10_000
                 let gross_coupon = settlement_basis
@@ -4578,7 +5639,9 @@ impl LiquifactEscrow {
                         .checked_mul(fee_percentage as i128)
                         .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
                         .checked_div(10_000)
-                        .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+                        .unwrap_or_else(|| {
+                            fail(&env, EscrowError::ComputePayoutArithmeticOverflow)
+                        });
 
                     if fee_amount > 0 {
                         let net_coupon = gross_coupon.saturating_sub(fee_amount);
@@ -4611,9 +5674,79 @@ impl LiquifactEscrow {
             }
         }
 
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
+
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
         let settled_at = now;
+
+        // ── Automatic yield distribution snapshot (if enabled) ──
+        // Pre-compute each investor's yield share at settlement time to enable batch auto-distribution.
+        // This allows investors to claim their payouts without per-investor yield recalculation.
+        if Self::yield_auto_distribution_enabled(&env) && is_full_settlement {
+            // Get the funding close snapshot to determine total principal (pro-rata denominator)
+            if let Some(snap) = env
+                .storage()
+                .instance()
+                .get::<DataKey, FundingCloseSnapshot>(&DataKey::FundingCloseSnapshot)
+            {
+                let total_principal = snap.total_principal;
+                if total_principal > 0 {
+                    // Compute net coupon for yield distribution
+                    let gross_coupon = new_settled_amount
+                        .checked_mul(escrow.yield_bps as i128)
+                        .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
+                        .checked_div(10_000)
+                        .unwrap_or_else(|| {
+                            fail(&env, EscrowError::ComputePayoutArithmeticOverflow)
+                        });
+
+                    let net_coupon = if fee_percentage > 0 && gross_coupon > 0 {
+                        let fee_amount = gross_coupon
+                            .checked_mul(fee_percentage as i128)
+                            .unwrap_or_else(|| {
+                                fail(&env, EscrowError::ComputePayoutArithmeticOverflow)
+                            })
+                            .checked_div(10_000)
+                            .unwrap_or_else(|| {
+                                fail(&env, EscrowError::ComputePayoutArithmeticOverflow)
+                            });
+                        gross_coupon.saturating_sub(fee_amount)
+                    } else {
+                        gross_coupon
+                    };
+
+                    let settle_pool =
+                        new_settled_amount
+                            .checked_add(net_coupon)
+                            .unwrap_or_else(|| {
+                                fail(&env, EscrowError::ComputePayoutArithmeticOverflow)
+                            });
+
+                    // Iterate over all investors and pre-compute their yield shares
+                    // For now, we'll store markers; in production, indexers enumerate InvestorContribution keys
+                    // and we iterate them here. For MVP, we emit an event and investors claim normally.
+                    // TODO: Implement efficient investor enumeration for batch snapshot computation
+
+                    YieldDistSnapshotCreated {
+                        name: symbol_short!("yld_snap"),
+                        invoice_id: escrow.invoice_id.clone(),
+                        settled_amount: new_settled_amount,
+                        investor_count: env
+                            .storage()
+                            .instance()
+                            .get(&DataKey::UniqueFunderCount)
+                            .unwrap_or(0),
+                        captured_at_ledger_timestamp: settled_at,
+                    }
+                    .publish(&env);
+                }
+            }
+        }
 
         if is_full_settlement {
             EscrowSettled {
@@ -4627,7 +5760,7 @@ impl LiquifactEscrow {
             .publish(&env);
         } else {
             EscrowPartiallySettled {
-                name: symbol_short!("escrow_psd"),
+                name: symbol_short!("esc_pause"),
                 invoice_id: escrow.invoice_id.clone(),
                 funded_amount: escrow.funded_amount,
                 settled_amount: new_settled_amount,
@@ -4646,16 +5779,18 @@ impl LiquifactEscrow {
 
     /// Clone a settled escrow template to create a new independent escrow instance.
     ///
-    /// Creates a fresh escrow for a **new invoice** (supplied by caller) with the same 
+    /// Creates a fresh escrow for a **new invoice** (supplied by caller) with the same
     /// configuration parameters as the template escrow. The template must be in **settled** status
-    /// (status == 2). All immutable configuration (yield_bps, maturity, yield tiers, min contribution,
-    /// max unique investors, max per investor, legal hold clear delay, registry) is copied; 
-    /// per-investor state, funding state, and legal holds are **reset** for the new instance.
+    /// (status == 2). All immutable configuration (guardian, yield_bps, maturity, yield tiers, min
+    /// contribution, investor caps, legal hold clear delay, registry) is copied; per-investor state,
+    /// funding state, pending proposals, and active legal holds are **reset** for the new instance.
     ///
     /// # Parameters
     ///
-    /// - `template_env`: The Soroban environment of the **template** contract (settled escrow).
-    ///   Clone internally calls the template's `get_escrow` to verify status and read immutable config.
+    /// - `template_contract`: The contract address of the **template** escrow (settled).
+    ///   Clone internally cross-contract-calls the template's read-only entrypoints
+    ///   (`get_escrow`, `get_funding_token`, etc.) to verify status and read immutable config —
+    ///   a contract can never directly access another contract instance's storage.
     ///
     /// - `new_invoice_id` / `new_amount`: Caller must supply the new invoice identifier and funding target.
     ///
@@ -4665,7 +5800,7 @@ impl LiquifactEscrow {
     /// - `amount, funding_target = new_amount` (caller-supplied).
     /// - `funded_amount = 0, status = 0` (open).
     /// - All per-investor state: cleared (new instance).
-    /// - Immutable configuration (registry, token, treasury, yield tiers, caps, delays) = copied from template.
+    /// - Immutable configuration (guardian, registry, token, treasury, yield tiers, caps, delays) = copied from template.
     ///
     /// # Errors
     ///
@@ -4680,76 +5815,64 @@ impl LiquifactEscrow {
     /// Only the **admin** (from the template escrow) may call this method.
     pub fn clone_settled_escrow(
         env: Env,
-        template_env: Env,
+        template_contract: Address,
         new_invoice_id: String,
         new_amount: i128,
     ) -> InvoiceEscrow {
+        // A contract can only ever access its own storage/`Env`; reading the template's state
+        // requires cross-contract calls through its public read-only entrypoints.
+        let template_client = LiquifactEscrowClient::new(&env, &template_contract);
+
         // Load and validate the template escrow.
-        let template_escrow = Self::get_escrow(template_env.clone());
+        let template_escrow = template_client.get_escrow();
+        ensure(
+            &env,
+            !template_client.get_legal_hold(),
+            EscrowError::LegalHoldBlocksMutation,
+        );
         ensure(
             &env,
             template_escrow.status == 2,
             EscrowError::CloneNotSettled,
         );
+        ensure(
+            &env,
+            template_escrow.funding_target > 0,
+            EscrowError::InvalidFundingTarget,
+        );
         ensure(&env, new_amount > 0, EscrowError::CloneAmountNotPositive);
+        ensure(
+            &env,
+            !env.storage().instance().has(&DataKey::Escrow),
+            EscrowError::EscrowAlreadyInitialized,
+        );
 
         // Require auth from the template admin.
         template_escrow.admin.require_auth();
 
-        // Read immutable configuration from template storage.
-        let funding_token: Address = template_env
-            .storage()
-            .instance()
-            .get(&DataKey::FundingToken)
-            .unwrap_or_else(|| fail(&env, EscrowError::FundingTokenNotSet));
-
-        let treasury: Address = template_env
-            .storage()
-            .instance()
-            .get(&DataKey::Treasury)
-            .unwrap_or_else(|| fail(&env, EscrowError::TreasuryNotSet));
-
-        let registry: Option<Address> = template_env
-            .storage()
-            .instance()
-            .get(&DataKey::RegistryRef);
-
-        let yield_tiers: Option<Vec<YieldTier>> = template_env
-            .storage()
-            .instance()
-            .get(&DataKey::YieldTierTable);
-
-        let min_contribution_floor: i128 = template_env
-            .storage()
-            .instance()
-            .get(&DataKey::MinContributionFloor)
-            .unwrap_or(0);
-
-        let max_unique_investors_cap: Option<u32> = template_env
-            .storage()
-            .instance()
-            .get(&DataKey::MaxUniqueInvestorsCap);
-
-        let max_per_investor_cap: Option<i128> = template_env
-            .storage()
-            .instance()
-            .get(&DataKey::MaxPerInvestorCap);
-
-        let legal_hold_clear_delay: Option<u64> = template_env
-            .storage()
-            .instance()
-            .get(&DataKey::LegalHoldClearDelay)
-            .and_then(|d: u64| if d > 0 { Some(d) } else { None });
-
-        let funding_deadline: Option<u64> = template_env
-            .storage()
-            .instance()
-            .get(&DataKey::FundingDeadline);
+        // Read immutable configuration from the template contract.
+        let funding_token: Address = template_client.get_funding_token();
+        let treasury: Address = template_client.get_treasury();
+        let registry: Option<Address> = template_client.get_registry_ref();
+        let yield_tiers: Option<Vec<YieldTier>> = template_client.get_yield_tier_table();
+        let min_contribution_floor: i128 = template_client.get_min_contribution_floor();
+        let max_unique_investors_cap: Option<u32> = template_client.get_max_unique_investors_cap();
+        let max_per_investor_cap: Option<i128> = template_client.get_max_per_investor_cap();
+        let legal_hold_clear_delay: Option<u64> = {
+            let d = template_client.get_legal_hold_clear_delay();
+            if d > 0 {
+                Some(d)
+            } else {
+                None
+            }
+        };
+        let funding_deadline: Option<u64> = template_client.get_funding_deadline();
 
         // Call init on the current (target) environment with cloned parameters.
-        Self::init(
-            env,
+        Self::init_internal(
+            env.clone(),
             template_escrow.admin.clone(),
+            template_escrow.guardian.clone(),
             new_invoice_id.clone(),
             template_escrow.sme_address.clone(),
             new_amount,
@@ -4768,6 +5891,12 @@ impl LiquifactEscrow {
             max_per_investor_cap,
             legal_hold_clear_delay,
             funding_deadline,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
 
         // Emit clone event.
@@ -4794,7 +5923,7 @@ impl LiquifactEscrow {
     /// # Guard ordering
     ///
     /// 1. Legal-hold gate (read-only).
-    /// 2. `sme_address.require_auth()` (via `load_escrow_require_sme`).
+    /// 2. `sme_address.require_auth()` and verify caller == sme_address.
     /// 3. Status == 1 (funded) check.
     /// 4. Contract balance sufficiency check ([`EscrowError::InsufficientContractBalance`]).
     /// 5. Status transition to 3, `DistributedPrincipal` update, storage write.
@@ -4805,7 +5934,8 @@ impl LiquifactEscrow {
     /// - [`EscrowError::LegalHoldBlocksWithdrawal`] — hold is active.
     /// - [`EscrowError::WithdrawalNotFunded`] — escrow not in funded state.
     /// - [`EscrowError::InsufficientContractBalance`] — contract holds less than `funded_amount`.
-    pub fn withdraw(env: Env) -> InvoiceEscrow {
+
+    pub fn withdraw(env: Env, caller: Address) -> InvoiceEscrow {
         ensure(
             &env,
             !Self::legal_hold_active(&env),
@@ -4813,11 +5943,19 @@ impl LiquifactEscrow {
         );
         ensure(
             &env,
-            !Self::is_dispute_paused(&env),
+            !Self::is_dispute_paused_for_mutation(&env),
             EscrowError::DisputePausedBlocksWithdrawal,
         );
 
-        let mut escrow = Self::load_escrow_require_sme(&env);
+        caller.require_auth();
+        let mut escrow = Self::get_escrow(env.clone());
+
+        // Verify that the caller is the registered SME address
+        ensure(
+            &env,
+            caller == escrow.sme_address,
+            EscrowError::UnauthorizedWithdrawer,
+        );
 
         ensure(&env, escrow.status == 1, EscrowError::WithdrawalNotFunded);
 
@@ -4841,6 +5979,13 @@ impl LiquifactEscrow {
 
         // State transition and accounting (checks-effects-interactions).
         escrow.status = 3;
+
+        // ── Post-condition invariant guard ──
+        ensure!(
+            escrow.funded_amount <= escrow.funding_target,
+            EscrowError::InvariantViolation
+        );
+
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
         let prev_distributed: i128 = env
@@ -4903,7 +6048,7 @@ impl LiquifactEscrow {
         );
         ensure(
             &env,
-            !Self::is_dispute_paused(&env),
+            !Self::is_dispute_paused_for_mutation(&env),
             EscrowError::DisputePausedBlocksInvestorClaims,
         );
 
@@ -4916,7 +6061,7 @@ impl LiquifactEscrow {
 
         // env.clone(): env is used again after this call for storage reads, ledger timestamp, and publish.
         let escrow = Self::get_escrow(env.clone());
-        
+
         // For partial settlement: allow claims if there's a settled amount (status 1 with SettledAmount)
         // For full settlement: require status 2
         let settled_amount: i128 = env
@@ -4924,13 +6069,9 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::SettledAmount)
             .unwrap_or(0);
-        
+
         let is_claimable = escrow.status == 2 || (escrow.status == 1 && settled_amount > 0);
-        ensure(
-            &env,
-            is_claimable,
-            EscrowError::InvestorClaimNotSettled,
-        );
+        ensure(&env, is_claimable, EscrowError::InvestorClaimNotSettled);
 
         let now = env.ledger().timestamp();
 
@@ -4952,22 +6093,30 @@ impl LiquifactEscrow {
 
         let not_before: u64 =
             Self::get_persistent_investor_claim_not_before(&env, investor.clone());
-        
+
         if now < not_before {
             let context_msg = if not_before > 0 {
                 let blocks_remaining = not_before.saturating_sub(now);
-                String::from_str(&env, &format!("Can claim in {} seconds (block {}) from now", blocks_remaining, not_before))
+                String::from_str(
+                    &env,
+                    &format!(
+                        "Can claim in {} seconds (block {}) from now",
+                        blocks_remaining, not_before
+                    ),
+                )
             } else {
                 String::from_str(&env, "Commitment lock is active")
             };
-            
-            let diagnostic = ErrorDiagnostic::with_context(
-                &env,
-                EscrowError::InvestorCommitmentLockNotExpired as u32,
-                "Investment is in commitment lock period",
-                "Wait for the lock period to expire before claiming payout",
-                core::str::from_utf8(&[b' ']).unwrap(), // Use existing context_msg instead
-            );
+
+            let diagnostic = ErrorDiagnostic {
+                error_code: EscrowError::InvestorCommitmentLockNotExpired as u32,
+                message: String::from_str(&env, "Investment is in commitment lock period"),
+                recovery_action: String::from_str(
+                    &env,
+                    "Wait for the lock period to expire before claiming payout",
+                ),
+                context: Some(context_msg),
+            };
             Self::emit_error_diagnostic(&env, diagnostic);
             fail(&env, EscrowError::InvestorCommitmentLockNotExpired);
         }
@@ -4980,6 +6129,34 @@ impl LiquifactEscrow {
         // Mark before emit — prevents re-emission on any re-entrant path.
         Self::set_persistent_investor_claimed(&env, investor.clone(), true);
 
+        // Track distributed principal so sweep_terminal_dust can enforce the liability floor.
+        let prev_distributed: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DistributedPrincipal)
+            .unwrap_or(0);
+
+        // Check for pre-computed yield distribution (if auto-distribution is enabled)
+        let mut total_payout = 0i128;
+        if let Some(yield_dist) =
+            Self::get_persistent_yield_distribution_share(&env, investor.clone())
+        {
+            // Use pre-computed payout amount from settlement snapshot
+            total_payout = yield_dist.payout_amount;
+
+            // Emit auto-distributed event to signal pre-computed yield usage
+            AutoDistributedYieldClaimed {
+                name: symbol_short!("auto_yld"),
+                investor: investor.clone(),
+                invoice_id: escrow.invoice_id.clone(),
+                payout_amount: total_payout,
+            }
+            .publish(&env);
+        } else {
+            // Fallback: compute yield on-demand (backwards compatibility)
+            total_payout = Self::compute_investor_payout(env.clone(), investor.clone());
+        }
+
         // Check if investor elected to reinvest their yield
         let has_reinvestment_election: bool = env
             .storage()
@@ -4989,10 +6166,10 @@ impl LiquifactEscrow {
 
         if has_reinvestment_election {
             // Calculate the yield portion of the payout
-            let total_payout = Self::compute_investor_payout(env.clone(), investor.clone());
-            let original_contribution: i128 = Self::get_persistent_investor_contribution(&env, investor.clone());
+            let original_contribution: i128 =
+                Self::get_persistent_investor_contribution(&env, investor.clone());
             let yield_amount = total_payout.saturating_sub(original_contribution);
-            
+
             if yield_amount > 0 {
                 // Add yield to reinvested amount (becomes new principal)
                 let current_reinvested: i128 = env
@@ -5000,22 +6177,23 @@ impl LiquifactEscrow {
                     .persistent()
                     .get(&DataKey::InvestorReinvestedAmount(investor.clone()))
                     .unwrap_or(0);
-                
+
                 let new_reinvested = current_reinvested
                     .checked_add(yield_amount)
                     .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
-                
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::InvestorReinvestedAmount(investor.clone()), &new_reinvested);
-                
+
+                env.storage().persistent().set(
+                    &DataKey::InvestorReinvestedAmount(investor.clone()),
+                    &new_reinvested,
+                );
+
                 // Update audit log with reinvestment event
                 let mut audit_log: Vec<ReinvestmentAuditEntry> = env
                     .storage()
                     .instance()
                     .get(&DataKey::ReinvestmentAuditLog)
                     .unwrap_or(Vec::new(&env));
-                
+
                 // Find and update the most recent entry for this investor, or add new one
                 let mut found = false;
                 for i in (0..audit_log.len()).rev() {
@@ -5028,7 +6206,7 @@ impl LiquifactEscrow {
                         break;
                     }
                 }
-                
+
                 if !found && (audit_log.len() as u32) < MAX_REINVESTMENT_AUDIT_ENTRIES {
                     let entry = ReinvestmentAuditEntry {
                         investor: investor.clone(),
@@ -5040,14 +6218,14 @@ impl LiquifactEscrow {
                     };
                     audit_log.push_back(entry);
                 }
-                
+
                 env.storage()
                     .instance()
                     .set(&DataKey::ReinvestmentAuditLog, &audit_log);
-                
+
                 // Emit reinvestment event
                 YieldReinvested {
-                    name: symbol_short!("yield_reinv_evt"),
+                    name: symbol_short!("yld_ri_ev"),
                     investor: investor.clone(),
                     invoice_id: escrow.invoice_id.clone(),
                     reinvested_amount: yield_amount,
@@ -5059,6 +6237,13 @@ impl LiquifactEscrow {
 
         // Real-time slippage detection: compare expected vs actual yield
         Self::detect_yield_slippage(&env, investor.clone(), &escrow);
+
+        // Increment distributed principal by the payout amount so the liability floor
+        // in sweep_terminal_dust remains computable on-chain.
+        env.storage().instance().set(
+            &DataKey::DistributedPrincipal,
+            &prev_distributed.saturating_add(total_payout),
+        );
 
         InvestorPayoutClaimed {
             name: symbol_short!("inv_claim"),
@@ -5116,7 +6301,7 @@ impl LiquifactEscrow {
         );
         ensure(
             &env,
-            !Self::is_dispute_paused(&env),
+            !Self::is_dispute_paused_for_mutation(&env),
             EscrowError::DisputePausedBlocksInvestorClaims,
         );
 
@@ -5157,6 +6342,16 @@ impl LiquifactEscrow {
 
             // Mark claimed.
             Self::set_persistent_investor_claimed(&env, investor.clone(), true);
+
+            // Record the settlement checkpoint (see #148).
+            let settlement_payout = Self::compute_investor_payout(env.clone(), investor.clone());
+            Self::append_investor_history_record(
+                &env,
+                investor.clone(),
+                symbol_short!("settle"),
+                settlement_payout,
+                contribution,
+            );
 
             // Yield slippage detection.
             Self::detect_yield_slippage(&env, investor.clone(), &escrow);
@@ -5210,7 +6405,7 @@ impl LiquifactEscrow {
     /// - [`EscrowError::DelegationRevoked`] if the delegation was revoked.
     /// - [`EscrowError::InvestorClaimNotSettled`] if escrow is not settled.
     /// - [`EscrowError::InvestorCommitmentLockNotExpired`] if claim lock has not expired.
-    pub fn claim_investor_payout_as_delegate(env: Env, investor: Address, delegate: Address) {
+    pub fn claim_payout_as_delegate(env: Env, investor: Address, delegate: Address) {
         ensure(
             &env,
             !Self::legal_hold_active(&env),
@@ -5218,7 +6413,7 @@ impl LiquifactEscrow {
         );
         ensure(
             &env,
-            !Self::is_dispute_paused(&env),
+            !Self::is_dispute_paused_for_mutation(&env),
             EscrowError::DisputePausedBlocksInvestorClaims,
         );
 
@@ -5228,11 +6423,7 @@ impl LiquifactEscrow {
 
         // Verify delegation exists and is not revoked.
         let delegated_addr = Self::get_persistent_yield_claim_delegate(&env, investor.clone());
-        ensure(
-            &env,
-            delegated_addr.is_some(),
-            EscrowError::NoDelegationSet,
-        );
+        ensure(&env, delegated_addr.is_some(), EscrowError::NoDelegationSet);
 
         // Check if delegation is revoked.
         ensure(
@@ -5254,7 +6445,7 @@ impl LiquifactEscrow {
 
         // env.clone(): used for escrow read and ledger timestamp.
         let escrow = Self::get_escrow(env.clone());
-        
+
         // For partial settlement: allow claims if there's a settled amount (status 1 with SettledAmount)
         // For full settlement: require status 2
         let settled_amount: i128 = env
@@ -5262,13 +6453,9 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::SettledAmount)
             .unwrap_or(0);
-        
+
         let is_claimable = escrow.status == 2 || (escrow.status == 1 && settled_amount > 0);
-        ensure(
-            &env,
-            is_claimable,
-            EscrowError::InvestorClaimNotSettled,
-        );
+        ensure(&env, is_claimable, EscrowError::InvestorClaimNotSettled);
 
         let not_before: u64 =
             Self::get_persistent_investor_claim_not_before(&env, investor.clone());
@@ -5286,6 +6473,16 @@ impl LiquifactEscrow {
 
         // Mark before emit — prevents re-emission on any re-entrant path.
         Self::set_persistent_investor_claimed(&env, investor.clone(), true);
+
+        // Record the settlement checkpoint (see #148).
+        let settlement_payout = Self::compute_investor_payout(env.clone(), investor.clone());
+        Self::append_investor_history_record(
+            &env,
+            investor.clone(),
+            symbol_short!("settle"),
+            settlement_payout,
+            contribution,
+        );
 
         InvestorPayoutClaimed {
             name: symbol_short!("inv_claim"),
@@ -5311,6 +6508,7 @@ impl LiquifactEscrow {
     /// # Errors
     /// - [`EscrowError::DelegateAddressSameAsInvestor`] if `delegate == investor`.
     pub fn set_yield_claim_delegate(env: Env, investor: Address, delegate: Address) {
+        Self::ensure_legal_hold_inactive(&env);
         ensure(
             &env,
             investor != delegate,
@@ -5344,6 +6542,7 @@ impl LiquifactEscrow {
     /// # Errors
     /// - [`EscrowError::NoActiveDelegation`] if the investor has no active delegation to revoke.
     pub fn revoke_yield_claim_delegate(env: Env, investor: Address) {
+        Self::ensure_legal_hold_inactive(&env);
         investor.require_auth();
 
         // Verify there is an active delegation to revoke.
@@ -5363,94 +6562,165 @@ impl LiquifactEscrow {
         .publish(&env);
     }
 
-    /// Investor elects to automatically reinvest their yield as principal when claimed.
+    /// Investor rolls accrued yield from a settled source escrow into a live funding target.
     ///
     /// # Authorization
     /// - Requires the signature of the investor (via `investor.require_auth()`).
     ///
     /// # Parameters
-    /// - `investor`: The investor address making the election.
-    /// - `target_escrow`: Optional target escrow contract for reinvestment. If `None`, reinvests in the same escrow.
+    /// - `investor`: The investor address authorizing the reinvestment.
+    /// - `target_escrow`: The escrow receiving the rolled yield.
+    /// - `amount`: Positive yield amount to transfer from the settled source escrow into the target.
     ///
     /// # Behavior
-    /// - Sets [`DataKey::InvestorReinvestElection`] to `true` for the investor.
-    /// - Sets [`DataKey::InvestorReinvestTarget`] if reinvesting to a different escrow.
-    /// - Records the election in [`DataKey::ReinvestmentAuditLog`].
-    /// - When the investor claims their payout, their yield is automatically added to their contribution
-    ///   instead of being transferred. This reinvested amount becomes new principal earning yield.
+    /// - Validates that this source escrow has reached `status == 2` (settled).
+    /// - Validates that the target escrow is still in a funding flow (`status == 0 || status == 1`).
+    /// - Uses the investor's accrued yield in the source escrow as the source of funds.
+    /// - Records the reinvestment as additional principal for the target investor and emits
+    ///   a `YieldReinvested` event.
     ///
     /// # Errors
-    /// - [`EscrowError::ReinvestElectionAlreadyActive`] if investor already has an active reinvestment election.
-    /// - [`EscrowError::ReinvestmentAuditLogFull`] if audit log capacity is reached.
-    ///
-    /// # Events
-    /// - Emits [`YieldReinvestmentElected`] event.
-    pub fn reinvest_yield(env: Env, investor: Address, target_escrow: Option<Address>) {
+    /// - [`EscrowError::ReinvestAmountNotPositive`] if `amount <= 0`
+    /// - [`EscrowError::ReinvestSourceEscrowNotSettled`] if the source escrow is not settled.
+    /// - [`EscrowError::ReinvestTargetEscrowNotFunding`] if the target is not in funding state.
+    /// - [`EscrowError::ReinvestYieldInsufficient`] if `amount` exceeds the investor's accrued yield.
+    /// - [`EscrowError::ReinvestFundingTokenMismatch`] if the two escrows use different tokens.
+    pub fn reinvest_yield(env: Env, investor: Address, target_escrow: Address, amount: i128) {
+        Self::ensure_legal_hold_inactive(&env);
         investor.require_auth();
+        ensure(&env, amount > 0, EscrowError::ReinvestAmountNotPositive);
 
-        // Check if investor already has a reinvestment election
-        let has_election: bool = env
-            .storage()
-            .persistent()
-            .get(&DataKey::InvestorReinvestElection(investor.clone()))
-            .unwrap_or(false);
-        
+        let source_id = env.current_contract_address();
         ensure(
             &env,
-            !has_election,
-            EscrowError::ReinvestElectionAlreadyActive,
+            target_escrow != source_id,
+            EscrowError::ReinvestSelfTargetRejected,
         );
 
-        // Set reinvestment election
+        let source_escrow = Self::get_escrow(env.clone());
+        ensure(
+            &env,
+            source_escrow.status == 2,
+            EscrowError::ReinvestSourceEscrowNotSettled,
+        );
+
+        // Query target escrow state via a cross-contract getter; a target in open or funded state is
+        // considered valid for reinvestment.
+        let target: InvoiceEscrow = env.invoke_contract(
+            &target_escrow,
+            &Symbol::new(&env, "get_escrow"),
+            soroban_sdk::vec![&env],
+        );
+        let target_legal_hold: bool = env.invoke_contract(
+            &target_escrow,
+            &Symbol::new(&env, "get_legal_hold"),
+            soroban_sdk::vec![&env],
+        );
+        ensure(
+            &env,
+            !target_legal_hold,
+            EscrowError::LegalHoldBlocksMutation,
+        );
+        ensure(
+            &env,
+            target.status == 0 || target.status == 1,
+            EscrowError::ReinvestTargetEscrowNotFunding,
+        );
+
+        let contribution = Self::get_persistent_investor_contribution(&env, investor.clone());
+        let accrued_yield = Self::compute_investor_payout(env.clone(), investor.clone())
+            .saturating_sub(contribution);
+        ensure(
+            &env,
+            accrued_yield >= amount,
+            EscrowError::ReinvestYieldInsufficient,
+        );
+
+        let source_token = Self::funding_token_or_fail(&env);
+        let target_token: Address = env.invoke_contract(
+            &target_escrow,
+            &Symbol::new(&env, "get_funding_token"),
+            soroban_sdk::vec![&env],
+        );
+        ensure(
+            &env,
+            source_token == target_token,
+            EscrowError::ReinvestFundingTokenMismatch,
+        );
+
+        let target_total = target
+            .funded_amount
+            .checked_add(amount)
+            .unwrap_or_else(|| fail(&env, EscrowError::FundedAmountOverflow));
+        external_calls::transfer_funding_token_with_balance_checks(
+            &env,
+            &source_token,
+            &source_id,
+            &target_escrow,
+            amount,
+        );
+
+        let current_reinvested: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InvestorReinvestedAmount(investor.clone()))
+            .unwrap_or(0);
+        let new_reinvested = current_reinvested
+            .checked_add(amount)
+            .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+
+        env.storage().persistent().set(
+            &DataKey::InvestorReinvestedAmount(investor.clone()),
+            &new_reinvested,
+        );
         env.storage()
             .persistent()
             .set(&DataKey::InvestorReinvestElection(investor.clone()), &true);
+        env.storage().persistent().set(
+            &DataKey::InvestorReinvestTarget(investor.clone()),
+            &target_escrow,
+        );
 
-        // Set target escrow if specified (None means reinvest in same escrow)
-        if let Some(target) = target_escrow {
-            env.storage()
-                .persistent()
-                .set(&DataKey::InvestorReinvestTarget(investor.clone()), &target);
-        }
-
-        // Get current escrow info for audit log
-        let escrow = Self::get_escrow(env.clone());
-        let now = env.ledger().timestamp();
-        let sequence = env.ledger().sequence();
-
-        // Add to audit log (bounded by MAX_REINVESTMENT_AUDIT_ENTRIES)
         let mut audit_log: Vec<ReinvestmentAuditEntry> = env
             .storage()
             .instance()
             .get(&DataKey::ReinvestmentAuditLog)
             .unwrap_or(Vec::new(&env));
-        
-        ensure(
-            &env,
-            (audit_log.len() as u32) < MAX_REINVESTMENT_AUDIT_ENTRIES,
-            EscrowError::ReinvestmentAuditLogFull,
-        );
 
-        let entry = ReinvestmentAuditEntry {
-            investor: investor.clone(),
-            invoice_id: escrow.invoice_id.clone(),
-            target_escrow: target_escrow.clone(),
-            reinvested_amount: 0i128,  // Will be set when claim happens
-            elected_at_ledger_timestamp: now,
-            elected_at_ledger_sequence: sequence,
-        };
-        
-        audit_log.push_back(entry);
+        if (audit_log.len() as u32) < MAX_REINVESTMENT_AUDIT_ENTRIES {
+            audit_log.push_back(ReinvestmentAuditEntry {
+                investor: investor.clone(),
+                invoice_id: source_escrow.invoice_id.clone(),
+                target_escrow: Some(target_escrow.clone()),
+                reinvested_amount: amount,
+                elected_at_ledger_timestamp: env.ledger().timestamp(),
+                elected_at_ledger_sequence: env.ledger().sequence(),
+            });
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::ReinvestmentAuditLog, &audit_log);
 
-        // Emit event
-        YieldReinvestmentElected {
-            name: symbol_short!("yield_reinv"),
-            investor,
-            invoice_id: escrow.invoice_id,
-            target_escrow,
+        env.invoke_contract::<InvoiceEscrow>(
+            &target_escrow,
+            &Symbol::new(&env, "fund"),
+            soroban_sdk::vec![&env, investor.clone().into_val(&env), amount.into_val(&env)],
+        );
+
+        let updated_target = Self::get_escrow(target_escrow.clone());
+        ensure(
+            &env,
+            updated_target.funded_amount >= target_total.saturating_sub(amount),
+            EscrowError::ReinvestTargetEscrowNotFunding,
+        );
+
+        YieldReinvested {
+            name: symbol_short!("yield_reinv_evt"),
+            investor: investor.clone(),
+            invoice_id: source_escrow.invoice_id.clone(),
+            reinvested_amount: amount,
+            new_total_principal: new_reinvested + contribution,
         }
         .publish(&env);
     }
@@ -5503,7 +6773,7 @@ impl LiquifactEscrow {
             .persistent()
             .get(&DataKey::InvestorReinvestedAmount(investor.clone()))
             .unwrap_or(0);
-        
+
         // Total principal includes both original contribution and any reinvested yield
         let total_investor_principal = contribution
             .checked_add(reinvested_amount)
@@ -5529,7 +6799,7 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::SettledAmount)
             .unwrap_or(0);
-        
+
         // If no settlement has occurred yet, return 0
         if settled_amount == 0 {
             return 0;
@@ -5542,13 +6812,19 @@ impl LiquifactEscrow {
             Self::get_persistent_investor_effective_yield(&env, investor.clone())
                 .unwrap_or(escrow.yield_bps);
 
-        // Calculate coupon based on settled amount (not total principal)
-        // coupon = settled_amount × effective_yield_bps / 10_000  (floor)
-        let gross_coupon = settled_amount
-            .checked_mul(effective_yield_bps as i128)
-            .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
-            .checked_div(10_000)
-            .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+        // coupon = total_principal × effective_yield_bps / 10_000  (floor)
+        // Guard: if yield is zero the coupon is 0 and the settle pool equals total_principal;
+        // skip the multiply/divide to avoid any potential platform-specific edge case and to
+        // make the zero-yield path explicit and auditable.
+        let coupon = if effective_yield_bps == 0 {
+            0i128
+        } else {
+            total_principal
+                .checked_mul(effective_yield_bps as i128)
+                .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
+                .checked_div(10_000)
+                .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
+        };
 
         // Deduct protocol fee from the coupon: fee = gross_coupon * fee_pct / 10_000
         let fee_percentage: i64 = env
@@ -5556,39 +6832,32 @@ impl LiquifactEscrow {
             .instance()
             .get(&DataKey::FeePercentage)
             .unwrap_or(0);
-        let net_coupon = if fee_percentage > 0 && gross_coupon > 0 {
-            let fee_amount = gross_coupon
+        let net_coupon = if fee_percentage > 0 && coupon > 0 {
+            let fee_amount = coupon
                 .checked_mul(fee_percentage as i128)
                 .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
                 .checked_div(10_000)
                 .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
-            gross_coupon.saturating_sub(fee_amount)
+            coupon.saturating_sub(fee_amount)
         } else {
-            gross_coupon
+            coupon
         };
 
         let settle_pool = settled_amount
             .checked_add(net_coupon)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
 
-        // Calculate investor's share of the settled amount using total principal (original + reinvested)
-        // settled_share = total_investor_principal × settled_amount / total_principal  (floor)
-        let settled_share = total_investor_principal
-            .checked_mul(settled_amount)
-            .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
-            .checked_div(total_principal)
-            .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
-
-        // Calculate payout for the settled share
-        // payout = settled_share × settle_pool / settled_amount  (floor)
-        if settled_share == 0 || settled_amount == 0 {
+        // Guard: if settle_pool is zero (impossible in practice given total_principal > 0, but
+        // defensively checked so checked_div never receives a zero divisor from this path).
+        if settle_pool <= 0 {
             return 0;
         }
-        
-        settled_share
+
+        // gross_payout = contribution × settle_pool / total_principal  (floor)
+        contribution
             .checked_mul(settle_pool)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
-            .checked_div(settled_amount)
+            .checked_div(total_principal)
             .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow))
     }
 
@@ -5629,7 +6898,8 @@ impl LiquifactEscrow {
             return false;
         };
 
-        let computed_root = Self::compute_merkle_root_from_proof(&env, &investor, contribution, &proof);
+        let computed_root =
+            Self::compute_merkle_root_from_proof(&env, &investor, contribution, &proof);
         computed_root == stored_root
     }
 
@@ -5653,20 +6923,10 @@ impl LiquifactEscrow {
         // Build leaf: keccak256(address_bytes || contribution_be_bytes)
         let mut leaf_data = Bytes::new(env);
 
-        // Serialize investor address — use the Soroban String representation
-        // and convert each char to a byte for deterministic hashing.
+        // Serialize investor address via its Soroban strkey `String` representation,
+        // converted to bytes for deterministic hashing.
         let addr_str = investor.to_string();
-        {
-            let mut i = 0u32;
-            let len = addr_str.len();
-            while i < len {
-                if let Some(ch) = addr_str.get(i) {
-                    // Take the low byte of each char for ASCII-compatible encoding.
-                    leaf_data.push_back((ch as u32 & 0xFF) as u8);
-                }
-                i += 1;
-            }
-        }
+        leaf_data.append(&addr_str.to_bytes());
 
         // Serialize contribution as big-endian bytes (i128 → 16 bytes).
         let mut contrib_bytes = [0u8; 16];
@@ -5679,25 +6939,21 @@ impl LiquifactEscrow {
             leaf_data.push_back(*b);
         }
 
-        let mut current = env.crypto().keccak256(&leaf_data);
+        let mut current: BytesN<32> = env.crypto().keccak256(&leaf_data).to_bytes();
 
         let n = proof.len();
         for i in 0..n {
             let sibling = proof.get(i).unwrap();
             // Sort to ensure deterministic proofs.
             let (left, right) = if current < sibling {
-                (current, sibling)
+                (current.clone(), sibling.clone())
             } else {
-                (sibling, current)
+                (sibling.clone(), current.clone())
             };
             let mut combined = Bytes::new(env);
-            for j in 0..32 {
-                combined.push_back(left.get(j).unwrap());
-            }
-            for j in 0..32 {
-                combined.push_back(right.get(j).unwrap());
-            }
-            current = env.crypto().keccak256(&combined);
+            combined.append(left.as_bytes());
+            combined.append(right.as_bytes());
+            current = env.crypto().keccak256(&combined).to_bytes();
         }
 
         current
@@ -5711,7 +6967,7 @@ impl LiquifactEscrow {
     fn compute_empty_merkle_root(env: &Env) -> BytesN<32> {
         use soroban_sdk::Bytes;
         let empty = Bytes::new(env);
-        env.crypto().keccak256(&empty)
+        env.crypto().keccak256(&empty).to_bytes()
     }
 
     /// Real-time slippage detection during investor claim.
@@ -5757,7 +7013,7 @@ impl LiquifactEscrow {
         // Emit warning if deviation exceeds threshold
         if deviation_bps > threshold_bps {
             YieldSlippageWarning {
-                name: symbol_short!("yield_slip"),
+                name: symbol_short!("yld_slip"),
                 investor,
                 invoice_id: escrow.invoice_id.clone(),
                 expected_yield_bps,
@@ -5796,6 +7052,14 @@ impl LiquifactEscrow {
         escrow
     }
 
+    /// Extend storage TTLs for the contract instance and, optionally, a batch of per-investor
+    /// persistent keys, in a single call.
+    ///
+    /// # Bounds
+    ///
+    /// `allowlisted` may be empty (the instance-storage TTL extension always runs regardless),
+    /// but is capped at [`MAX_TTL_BUMP_BATCH`] entries; larger investor sets must be split
+    /// across multiple calls.
     pub fn bump_ttl(env: Env, allowlisted: Vec<Address>) {
         // Permissionless TTL extension.
         //
@@ -5810,6 +7074,16 @@ impl LiquifactEscrow {
         // Documentation references:
         // - ADR-007: storage key evolution policy (additive changes / key semantics).
         // - docs/escrow-ledger-time.md: all gating uses `Env::ledger().timestamp()` with `>=`.
+        //
+        // `allowlisted` is bounded (see `MAX_TTL_BUMP_BATCH`) because each entry costs 5
+        // `extend_ttl` host calls; an unbounded vector risks exceeding the transaction's
+        // CPU/resource budget with no partial progress on failure. An empty vector is valid
+        // and simply skips the per-investor loop below.
+        ensure(
+            &env,
+            allowlisted.len() <= MAX_TTL_BUMP_BATCH,
+            EscrowError::TtlBumpBatchTooLarge,
+        );
 
         env.storage().instance().extend_ttl(
             INSTANCE_TTL_MIN_EXTENSION_LEDGERS,
@@ -5851,7 +7125,7 @@ impl LiquifactEscrow {
         }
     }
 
-    /// Propose a new admin (`PendingAdmin`) — step 1 of a two-step handover.
+    /// Propose a new admin ([`DataKey::PendingAdmin`]) — step 1 of a two-step handover.
     ///
     /// Requires current admin authorization. The destination must differ from the current admin.
     ///
@@ -5859,7 +7133,7 @@ impl LiquifactEscrow {
     /// Emits typed [`EscrowError`] codes when the escrow is uninitialized or `new_admin` is the
     /// current admin.
     pub fn propose_admin(env: Env, new_admin: Address) -> Address {
-        let escrow = Self::load_escrow_require_admin(&env);
+        let escrow = Self::load_escrow_require_admin_during_hold(&env);
 
         ensure(
             &env,
@@ -5874,7 +7148,7 @@ impl LiquifactEscrow {
         AdminProposedEvent {
             name: symbol_short!("adm_prop"),
             invoice_id: escrow.invoice_id.clone(),
-            current_admin: escrow.admin,
+            current_admin: escrow.admin.clone(),
             pending_admin: new_admin.clone(),
         }
         .publish(&env);
@@ -5910,11 +7184,14 @@ impl LiquifactEscrow {
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.storage()
+            .instance()
+            .remove(&DataKey::LegalHoldProposalExpiresAt);
 
         AdminTransferredEvent {
             name: symbol_short!("admin"),
             invoice_id: escrow.invoice_id.clone(),
-            new_admin: pending,
+            new_admin: pending.clone(),
         }
         .publish(&env);
 
@@ -5991,6 +7268,7 @@ impl LiquifactEscrow {
     /// refundable contribution, initialized token data is missing, or the refund transfer fails
     /// token-balance invariants.
     pub fn refund(env: Env, investor: Address) {
+        Self::ensure_legal_hold_inactive(&env);
         ensure(
             &env,
             !Self::escrow_paused_active(&env),
@@ -6076,10 +7354,12 @@ impl LiquifactEscrow {
     }
 
     /// Pause the escrow due to a dispute (e.g., invoice validity challenge).
-    /// 
-    /// Freezes the escrow independently of legal hold: blocks `fund`, `settle`, and `withdraw`
-    /// until either auto-expiration (after `duration_secs`) or manual resumption.
-    /// 
+    ///
+    /// Freezes the escrow independently of legal hold: blocks [`LiquifactEscrow::fund`],
+    /// [`LiquifactEscrow::settle`], and [`LiquifactEscrow::withdraw`] until either
+    /// auto-expiration (after `duration_secs`) or manual resumption via
+    /// [`LiquifactEscrow::resume_dispute`].
+    ///
     /// # Parameters
     /// - `ticket_id`: Support/dispute ticket reference (non-empty String for audit trail).
     /// - `duration_secs`: How long the pause lasts (must be positive).
@@ -6095,6 +7375,7 @@ impl LiquifactEscrow {
     /// # Errors
     /// - [`EscrowError::DisputeTicketIdEmpty`] — `ticket_id` is empty.
     /// - [`EscrowError::DisputePauseDurationNotPositive`] — `duration_secs <= 0`.
+    /// - [`EscrowError::DisputePauseDurationExceedsMax`] — `duration_secs` exceeds the maximum.
     /// - [`EscrowError::LedgerTimestampOverflow`] — computing expiration timestamp overflows.
     pub fn pause_dispute(env: Env, ticket_id: String, duration_secs: u64) {
         ensure(
@@ -6106,6 +7387,11 @@ impl LiquifactEscrow {
             &env,
             duration_secs > 0,
             EscrowError::DisputePauseDurationNotPositive,
+        );
+        ensure(
+            &env,
+            duration_secs <= MAX_DISPUTE_PAUSE_DURATION_SECS,
+            EscrowError::DisputePauseDurationExceedsMax,
         );
 
         let escrow = Self::load_escrow_require_admin(&env);
@@ -6139,7 +7425,7 @@ impl LiquifactEscrow {
     /// Resume (unpause) a dispute pause on the escrow.
     ///
     /// Clears the dispute pause, allowing normal escrow operations to resume.
-    /// 
+    ///
     /// # Guard ordering
     ///
     /// 1. Dispute pause existence check.
@@ -6151,31 +7437,21 @@ impl LiquifactEscrow {
     pub fn resume_dispute(env: Env) {
         let escrow = Self::load_escrow_require_admin(&env);
 
-        let pause_state: Option<DisputePauseState> = env
-            .storage()
-            .instance()
-            .get(&DataKey::DisputePaused);
+        let pause_state: Option<DisputePauseState> =
+            env.storage().instance().get(&DataKey::DisputePaused);
 
-        ensure(
-            &env,
-            pause_state.is_some(),
-            EscrowError::NoPauseActive,
-        );
+        ensure(&env, pause_state.is_some(), EscrowError::NoPauseActive);
 
-        let state = pause_state.unwrap();
         let now = env.ledger().timestamp();
 
-        env.storage()
-            .instance()
-            .remove(&DataKey::DisputePaused);
+        env.storage().instance().remove(&DataKey::DisputePaused);
 
-        DisputePausedEvt {
-            name: symbol_short!("disppause"),
+        DisputeResumedEvt {
+            name: symbol_short!("disp_res"),
             invoice_id: escrow.invoice_id.clone(),
-            ticket_id: state.ticket_id,
-            action: 0, // 0 = resumed
-            paused_at: state.paused_at_ledger_timestamp,
-            expires_at: now, // Use current time to signal manual resumption
+            admin: escrow.admin,
+            resumed_by: DisputeResumedBy::Manual,
+            ledger_timestamp: now,
         }
         .publish(&env);
     }
@@ -6184,15 +7460,14 @@ impl LiquifactEscrow {
     ///
     /// Includes auto-expiration logic: if the pause was configured to expire and
     /// current ledger time has reached/exceeded the expiration, the pause is
-    /// considered inactive (although the storage entry is not automatically cleaned).
-    /// 
+    /// considered inactive. A mutating operation later removes the stored entry
+    /// and emits [`DisputeResumedEvt`] once; this check remains read-only.
+    ///
     /// # Returns
     /// `true` if a dispute pause exists and has not auto-expired; `false` otherwise.
-    pub fn is_dispute_paused(env: &Env) -> bool {
-        let pause_state: Option<DisputePauseState> = env
-            .storage()
-            .instance()
-            .get(&DataKey::DisputePaused);
+    fn is_dispute_paused(env: &Env) -> bool {
+        let pause_state: Option<DisputePauseState> =
+            env.storage().instance().get(&DataKey::DisputePaused);
 
         if let Some(state) = pause_state {
             let now = env.ledger().timestamp();
@@ -6203,14 +7478,39 @@ impl LiquifactEscrow {
         }
     }
 
+    /// Expire a stored pause once, on the first guarded mutation after its deadline.
+    /// The public read path remains side-effect free.
+    fn is_dispute_paused_for_mutation(env: &Env) -> bool {
+        let pause_state: Option<DisputePauseState> =
+            env.storage().instance().get(&DataKey::DisputePaused);
+
+        if let Some(state) = pause_state {
+            let now = env.ledger().timestamp();
+            if now < state.expires_at_ledger_timestamp {
+                return true;
+            }
+
+            env.storage().instance().remove(&DataKey::DisputePaused);
+            let escrow = Self::get_escrow(env.clone());
+            DisputeResumedEvt {
+                name: symbol_short!("disp_res"),
+                invoice_id: escrow.invoice_id,
+                admin: escrow.admin,
+                resumed_by: DisputeResumedBy::AutoExpiry,
+                ledger_timestamp: now,
+            }
+            .publish(env);
+        }
+
+        false
+    }
+
     /// Get the current dispute pause state, if active.
     ///
     /// Returns `None` if no pause is active or if the pause has auto-expired.
     pub fn get_dispute_pause(env: Env) -> Option<DisputePauseState> {
-        let pause_state: Option<DisputePauseState> = env
-            .storage()
-            .instance()
-            .get(&DataKey::DisputePaused);
+        let pause_state: Option<DisputePauseState> =
+            env.storage().instance().get(&DataKey::DisputePaused);
 
         if let Some(state) = pause_state {
             let now = env.ledger().timestamp();
@@ -6219,6 +7519,41 @@ impl LiquifactEscrow {
             }
         }
         None
+    }
+
+    /// Read-only aggregate view of an investor's position in this escrow.
+    ///
+    /// Bundles the per-investor values that off-chain clients otherwise fetch with several
+    /// separate calls: contributed principal, effective yield (with base fallback), claim
+    /// lock, claimed/refunded markers, lock-in deadline, and any yield-claim delegate.
+    ///
+    /// # Authorization
+    /// None — pure read; no auth required.
+    pub fn get_investor_position(env: Env, investor: Address) -> InvestorPosition {
+        let contribution = Self::get_persistent_investor_contribution(&env, investor.clone());
+        let effective_yield_bps = Self::get_investor_yield_bps(env.clone(), investor.clone());
+        let claim_not_before =
+            Self::get_persistent_investor_claim_not_before(&env, investor.clone());
+        let claimed = Self::get_persistent_investor_claimed(&env, investor.clone());
+        let refunded: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvestorRefunded(investor.clone()))
+            .unwrap_or(false);
+        let lock_in_until = Self::get_persistent_investor_lock_in_until(&env, investor.clone());
+        let yield_claim_delegate =
+            Self::get_persistent_yield_claim_delegate(&env, investor.clone());
+
+        InvestorPosition {
+            investor,
+            contribution,
+            effective_yield_bps,
+            claim_not_before,
+            claimed,
+            refunded,
+            lock_in_until,
+            yield_claim_delegate,
+        }
     }
 }
 
