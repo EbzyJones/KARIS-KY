@@ -70,6 +70,21 @@ Returns the current schema version (`SCHEMA_VERSION`). Returns `0` before `init`
 
 Returns `true` when a compliance hold is active. Defaults to `false` when the key is absent.
 
+## Frontend freeze-status response
+
+The frontend requests `GET /api/escrow-status` from the backend. The response
+must include boolean `legal_hold_active` and `dispute_paused` fields, sourced
+from the escrow's `get_legal_hold()` and `is_dispute_paused()` read entrypoints.
+The frontend displays an explicit unavailable state if the endpoint or either
+field is missing; it does not infer that the escrow is unfrozen.
+
+An active legal hold message says that funding (including committed funding),
+settlement, SME withdrawal, investor payout claims, and terminal dust sweep are
+blocked. An active dispute pause message says that funding, settlement, SME
+withdrawal, and investor payout claims are blocked. Both messages may appear
+when both states are active. The UI is informational only and does not provide
+admin freeze controls or edit freeze reasons.
+
 ---
 
 ## `has_maturity_lock() → bool`
