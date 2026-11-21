@@ -1179,3 +1179,312 @@ fn test_clone_emits_escrow_cloned_event() {
         "EscrowCloned event must be emitted with correct fields"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEST-008c: clone_settled_escrow — non-admin authorization rejection
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Verifies that clone_settled_escrow requires the template escrow's admin to authorize.
+// A non-admin caller (or caller with insufficient role) must be rejected with InsufficientAdminRole (174).
+
+/// Non-admin cannot clone a settled escrow; caller must be the template's admin.
+#[test]
+fn test_clone_settled_escrow_non_admin_rejected() {
+    let env = Env::default();
+
+    let admin = Address::generate(&env);
+    let non_admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let template_id = env.register(LiquifactEscrow, ());
+    let template = super::LiquifactEscrowClient::new(&env, &template_id);
+
+    template.init(
+        &admin,
+        &String::from_str(&env, "AUTHTEST1"),
+        &sme,
+        &100_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor = Address::generate(&env);
+    template.fund(&investor, &100_000i128);
+    template.settle();
+
+    // Deploy target contract
+    let clone_id = env.register(LiquifactEscrow, ());
+    let clone_client = super::LiquifactEscrowClient::new(&env, &clone_id);
+
+    // Attempt to clone as non-admin. We expect this to fail because
+    // the template's admin is required to authorize the clone operation.
+    let result = clone_client.try_clone_settled_escrow(
+        &template_id,
+        &non_admin,
+        &String::from_str(&env, "SHOULDFAIL"),
+        &50_000i128,
+    );
+
+    // Clone must fail because non_admin is not the template's admin.
+    assert!(result.is_err(), "clone should fail with non-admin caller");
+}
+
+/// Clone inherits the template's token, treasury, and yield tier configuration.
+#[test]
+fn test_clone_settled_escrow_inherits_config() {
+    use crate::YieldTier;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    // Create template with yield tiers
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(YieldTier {
+        min_lock_secs: 30 * 86400,
+        yield_bps: 950,
+    });
+
+    let template_id = env.register(LiquifactEscrow, ());
+    let template = super::LiquifactEscrowClient::new(&env, &template_id);
+
+    template.init(
+        &admin,
+        &String::from_str(&env, "TMPLTIER2"),
+        &sme,
+        &80_000i128,
+        &700i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &Some(tiers),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor = Address::generate(&env);
+    template.fund(&investor, &80_000i128);
+    template.settle();
+
+    let clone_id = env.register(LiquifactEscrow, ());
+    let clone = super::LiquifactEscrowClient::new(&env, &clone_id);
+
+    clone.clone_settled_escrow(&env, &String::from_str(&env, "CLONECFG1"), &40_000i128);
+
+    // Verify token is inherited
+    assert_eq!(
+        clone.get_funding_token(),
+        template.get_funding_token(),
+        "funding token must be inherited"
+    );
+
+    // Verify treasury is inherited
+    assert_eq!(
+        clone.get_treasury(),
+        template.get_treasury(),
+        "treasury must be inherited"
+    );
+
+    // Verify yield tiers are inherited by checking an investor with commitment lock
+    let investor2 = Address::generate(&env);
+    clone.fund_with_commitment(&investor2, &40_000i128, &(30 * 86400u64));
+    
+    let yield_bps = clone.get_investor_yield_bps(&investor2);
+    assert_eq!(
+        yield_bps, 950i64,
+        "yield bps from tier table must be inherited"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEST-009: clone_settled_escrow — storage isolation and independence
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Verifies that cloned escrows maintain complete storage independence from the template.
+// Funding a clone does not affect the template, and per-investor records in the clone
+// are distinct from those in the template.
+
+/// Funding the clone does not affect the template's funded_amount.
+#[test]
+fn test_clone_settled_escrow_funding_isolation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    // Setup and settle template
+    let template_id = env.register(LiquifactEscrow, ());
+    let template = super::LiquifactEscrowClient::new(&env, &template_id);
+
+    template.init(
+        &admin,
+        &String::from_str(&env, "TMPL_FUND1"),
+        &sme,
+        &100_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor1 = Address::generate(&env);
+    template.fund(&investor1, &100_000i128);
+    template.settle();
+
+    let template_state_before = template.get_escrow_summary();
+    assert_eq!(
+        template_state_before.escrow.funded_amount, 100_000i128,
+        "template funded_amount before clone"
+    );
+
+    // Clone the settled template
+    let clone_id = env.register(LiquifactEscrow, ());
+    let clone = super::LiquifactEscrowClient::new(&env, &clone_id);
+
+    clone.clone_settled_escrow(&env, &String::from_str(&env, "CLONE_FUND1"), &80_000i128);
+
+    let clone_state_after_init = clone.get_escrow_summary();
+    assert_eq!(
+        clone_state_after_init.escrow.funded_amount, 0,
+        "clone funded_amount must start at 0"
+    );
+
+    // Fund the clone with a different investor
+    let investor2 = Address::generate(&env);
+    clone.fund(&investor2, &80_000i128);
+
+    let clone_state_after_fund = clone.get_escrow_summary();
+    assert_eq!(
+        clone_state_after_fund.escrow.funded_amount, 80_000i128,
+        "clone funded_amount after funding"
+    );
+
+    // Verify template state is unchanged
+    let template_state_after = template.get_escrow_summary();
+    assert_eq!(
+        template_state_after.escrow.funded_amount, 100_000i128,
+        "template funded_amount must remain unchanged after clone funding"
+    );
+    assert_eq!(
+        template_state_after.unique_funder_count, 1,
+        "template unique_funder_count must remain 1 (only investor1)"
+    );
+}
+
+/// Clone's per-investor storage keys are distinct from the template's.
+/// An investor appearing in the template does not automatically appear in the clone.
+#[test]
+fn test_clone_settled_escrow_per_investor_storage_isolation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    // Setup template with one investor
+    let template_id = env.register(LiquifactEscrow, ());
+    let template = super::LiquifactEscrowClient::new(&env, &template_id);
+
+    template.init(
+        &admin,
+        &String::from_str(&env, "TMPL_INV1"),
+        &sme,
+        &100_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor_a = Address::generate(&env);
+    template.fund(&investor_a, &100_000i128);
+    template.settle();
+
+    // Verify template investor has a claim
+    let template_investor_a_pos = template.get_investor_position(&investor_a);
+    assert!(
+        template_investor_a_pos.contribution > "0",
+        "template investor_a must have a contribution"
+    );
+
+    // Clone the template
+    let clone_id = env.register(LiquifactEscrow, ());
+    let clone = super::LiquifactEscrowClient::new(&env, &clone_id);
+
+    clone.clone_settled_escrow(&env, &String::from_str(&env, "CLONE_INV1"), &80_000i128);
+
+    // Attempt to get investor_a's position in the clone.
+    // The clone has zero investors, so investor_a should have zero contribution in the clone.
+    let clone_investor_a_pos = clone.try_get_investor_position(&investor_a);
+    
+    // The position should either be not found, or show zero contribution.
+    // In Soroban, querying a non-existent per-address key returns a "not found" or default error.
+    assert!(
+        clone_investor_a_pos.is_err() || clone_investor_a_pos.as_ref().unwrap().contribution == "0",
+        "clone should not have investor_a's contribution (or it should be 0)"
+    );
+
+    // Now fund the clone with investor_a (same address)
+    clone.fund(&investor_a, &40_000i128);
+
+    // Verify clone investor_a has a new contribution (not inherited from template)
+    let clone_investor_a_pos_after = clone.get_investor_position(&investor_a);
+    assert_eq!(
+        clone_investor_a_pos_after.contribution, "40000",
+        "clone investor_a must have 40000 contribution (fresh, not template's 100000)"
+    );
+
+    // Verify template investor_a contribution is unchanged
+    let template_investor_a_pos_after = template.get_investor_position(&investor_a);
+    assert!(
+        template_investor_a_pos_after.contribution.starts_with("100000"),
+        "template investor_a contribution must remain unchanged"
+    );
+}
+

@@ -977,6 +977,37 @@ impl LiquifactEscrow {
         Self::migrate_impl(env, from_version)
     }
 
+    /// Preview the effect of a schema migration without mutating escrow state.
+    ///
+    /// Operators can call this read-only endpoint before committing a schema upgrade
+    /// to see which migration path would be applied and verify the target version.
+    /// No storage writes occur.
+    ///
+    /// # Authorization
+    ///
+    /// Only the **admin** (from the stored escrow) may call this method.
+    ///
+    /// # Parameters
+    ///
+    /// - `from_version` — the version tag currently stored in the escrow's persistent storage.
+    ///
+    /// # Returns
+    ///
+    /// A pair `(target_version, changelog)`:
+    /// - `target_version` — the schema version the migration would reach.
+    /// - `changelog` — human-readable summary of applied transformations (or reason no migration exists).
+    ///
+    /// # Errors
+    ///
+    /// | Condition | Error |
+    /// | --- | --- |
+    /// | `from_version` not found in escrow | [`EscrowError::MigrationVersionMismatch`] |
+    /// | `from_version >= SCHEMA_VERSION` | [`EscrowError::AlreadyCurrentSchemaVersion`] |
+    /// | No migration path from version to [`SCHEMA_VERSION`] | [`EscrowError::NoMigrationPath`] |
+    pub fn dry_run_migrate(env: Env, from_version: u32) -> (u32, String) {
+        Self::dry_run_migrate_impl(env, from_version)
+    }
+
     /// Query the attestation append log with optional filters and pagination.
     ///
     /// Returns a paginated page of [`AttestationLogEntry`] entries matching the given
