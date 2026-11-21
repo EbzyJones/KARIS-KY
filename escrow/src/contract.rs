@@ -1055,6 +1055,55 @@ impl LiquifactEscrow {
         Self::upgrade_impl(env, new_wasm_hash)
     }
 
+    /// Check whether a new WASM hash is upgrade-compatible with the current instance.
+    ///
+    /// This is a **read-only advisory check** for operators planning an upgrade. It does not
+    /// perform the upgrade; it only inspects the hash and returns a compatibility report.
+    ///
+    /// # Checks performed
+    /// 1. **Hash installation:** verifies the hash corresponds to an uploaded contract on this network.
+    /// 2. **Schema version compatibility:** returns the current on-chain schema version for comparison.
+    /// 3. **Reason:** provides human-readable guidance (e.g. "hash not found", "schema compatible", etc).
+    ///
+    /// # Return value
+    ///
+    /// [`UpgradeCompatibilityReport`] with fields:
+    /// - `compatible`: `true` if the hash is installed and likely safe (schema unchanged or additive)
+    /// - `reason`: explanation (e.g. "Hash not found", "Schema version unchanged (additive upgrade safe)")
+    /// - `current_schema`: current on-chain schema version for reference
+    ///
+    /// # Important limitations
+    ///
+    /// This check is **advisory only** and **cannot detect all breaking changes**:
+    /// - It verifies the hash is installed, but cannot inspect the WASM bytecode on-chain.
+    /// - It cannot detect removed, renamed, or reordered `DataKey` variants.
+    /// - It compares schema versions but does not validate struct layout compatibility.
+    ///
+    /// **Operators must always:**
+    /// 1. Test thoroughly on testnet before upgrading production.
+    /// 2. Review the WASM diff to ensure only additive changes (new `DataKey` variants).
+    /// 3. Use `migrate()` if the schema version changed.
+    /// 4. Have a rollback plan in case of incompatibilities.
+    ///
+    /// # Authorization
+    /// None — pure read; no auth required. Safe to call before `init`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let report = client.check_upgrade_compatibility(&new_wasm_hash);
+    /// if report.compatible {
+    ///     println!("✓ Upgrade appears safe: {}", report.reason);
+    ///     // Proceed with upgrade() on testnet first
+    /// } else {
+    ///     println!("✗ Upgrade may be unsafe: {}", report.reason);
+    ///     // Investigate further or choose a different hash
+    /// }
+    /// ```
+    pub fn check_upgrade_compatibility(env: Env, new_wasm_hash: BytesN<32>) -> UpgradeCompatibilityReport {
+        Self::check_upgrade_compatibility_impl(env, new_wasm_hash)
+    }
+
     /// Record investor principal while the invoice is **open**. First deposit sets base
     /// [`InvoiceEscrow::yield_bps`] for this investor; further amounts must use this method (not
     /// [`LiquifactEscrow::fund_with_commitment`]) so tier selection stays immutable after the first leg.

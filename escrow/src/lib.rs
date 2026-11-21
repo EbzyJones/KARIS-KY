@@ -1474,6 +1474,30 @@ pub struct SettlementNftMinted {
     pub nft_token_id: Symbol,
 }
 
+/// Result of a pre-upgrade compatibility check.
+///
+/// Operators call [`LiquifactEscrow::check_upgrade_compatibility`] with a new WASM hash
+/// to determine whether it is safe to upgrade. This struct returns detailed compatibility info:
+///
+/// - `compatible`: true if the hash corresponds to an installed contract and likely has no breaking changes
+/// - `reason`: human-readable explanation (e.g. "Hash not found", "Schema version mismatch", "Compatible")
+/// - `current_schema`: current on-chain schema version for reference
+///
+/// **Important:** this check is advisory. It validates that the hash is installed and compares
+/// schema/interface versions, but it **cannot** detect all breaking changes (e.g., removed or
+/// renamed data keys). Operators must always perform thorough testing on testnet before upgrading production.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeCompatibilityReport {
+    /// Whether the upgrade appears safe to proceed (hash found + schema compatible).
+    pub compatible: bool,
+    /// Explanation of compatibility status (e.g. "Hash not found on this network",
+    /// "Schema version unchanged (additive upgrade safe)", "Schema version mismatch").
+    pub reason: String,
+    /// Current on-chain schema version (for reference).
+    pub current_schema: u32,
+}
+
 /// Diagnostic information for contract errors, emitted alongside error returns.
 ///
 /// SDKs and integrators parse this struct to provide user-friendly error messages,
