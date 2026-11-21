@@ -159,6 +159,8 @@ Events to monitor (see docs/EVENT_SCHEMA.md and escrow-events.md):
 - Filter events by contract address.
 - Send alerts to Slack, PagerDuty, or your on-call system.
 - Retain logs for at least 90 days.
+- For `EscrowHealthWarning` ingestion and backend webhook configuration, see
+  [Escrow Health Warning Alerts](escrow-health-alerting.md).
 
 ### 3.2 Storage audit (periodic)
 
