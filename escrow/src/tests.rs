@@ -44,6 +44,7 @@ pub(crate) fn assert_contract_error<T, E>(
 // Focused test tree for escrow behavior. Shared helpers live here so feature
 // modules stay assertion-focused and each test still owns a fresh Env.
 mod admin;
+mod allowlist_ttl_extension;
 mod attestations;
 mod batch_claim;
 mod cap_validation;
@@ -55,14 +56,17 @@ mod external_calls_mocked;
 mod funding;
 mod get_limits;
 mod health_and_events;
+mod health_warning_priority;
 mod history_pagination;
 mod init;
 mod integration;
 mod legal_hold;
 mod properties;
 mod properties_funding;
+mod read_only_invariant;
 mod secure_rng;
 mod settlement;
+mod sharding_aggregate_benchmark;
 mod tier_base_yield;
 mod tokenomics;
 mod upgrade_compat;
