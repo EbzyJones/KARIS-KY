@@ -8,6 +8,21 @@ const ENTRYPOINTS = contractSpec.entrypoints.map((entrypoint) => entrypoint.name
 const DEFAULT_ALLOWED_ORIGINS = ['http://127.0.0.1:5500', 'http://localhost:5500'];
 const CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
 
+function writeStructuredLog(record) {
+  console.info(JSON.stringify(record));
+}
+
+function logEscrowSummary(logger, contractId, status) {
+  const level = status >= 500 ? 'error' : status >= 400 ? 'warn' : 'info';
+  logger({
+    timestamp: new Date().toISOString(),
+    level,
+    event: 'escrow.summary',
+    escrow_id: contractId,
+    status
+  });
+}
+
 function parseAllowedOrigins(value = process.env.ALLOWED_ORIGINS) {
   if (value === undefined) return DEFAULT_ALLOWED_ORIGINS;
   return value.split(',').map((origin) => origin.trim()).filter(Boolean);
@@ -59,7 +74,8 @@ function isUnknownContractError(error) {
 
 function createBackendServer({
   summaryReader = fetchEscrowSummary,
-  allowedOrigins = parseAllowedOrigins()
+  allowedOrigins = parseAllowedOrigins(),
+  logger = writeStructuredLog
 } = {}) {
   return http.createServer(async (req, res) => {
     const origin = req.headers.origin;
@@ -103,16 +119,19 @@ function createBackendServer({
     if (summaryMatch) {
       const contractId = summaryMatch[1];
       if (!CONTRACT_ID_PATTERN.test(contractId) || !StrKey.isValidContract(contractId)) {
+        logEscrowSummary(logger, contractId, 400);
         res.writeHead(400, headers);
         res.end(JSON.stringify({ error: 'invalid contract ID' }));
         return;
       }
       try {
         const summary = await summaryReader(contractId);
+        logEscrowSummary(logger, contractId, 200);
         res.writeHead(200, headers);
         res.end(JSON.stringify({ contractId, summary }));
       } catch (error) {
         const status = isUnknownContractError(error) ? 404 : 502;
+        logEscrowSummary(logger, contractId, status);
         res.writeHead(status, headers);
         res.end(JSON.stringify({ error: status === 404 ? 'contract not found' : 'Soroban RPC request failed' }));
       }
