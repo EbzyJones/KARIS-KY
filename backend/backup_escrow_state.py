@@ -40,6 +40,17 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
+try:
+    from .contract_version import (
+        UnsupportedContractVersionError,
+        check_contract_version,
+    )
+except ImportError:
+    from contract_version import (
+        UnsupportedContractVersionError,
+        check_contract_version,
+    )
+
 # ---------------------------------------------------------------------------
 # Optional stellar-sdk import — fail with a clear message if missing.
 # ---------------------------------------------------------------------------
@@ -123,11 +134,22 @@ def build_snapshot(
         server, contract_id, fn, args, network_passphrase
     )
 
+    # Contract startup safety gate: do not interpret state until get_version()
+    # proves this backend understands the deployed storage schema.
+    version = inv("get_version")
+    if isinstance(version, dict) and "__error" in version:
+        raise RuntimeError(
+            f"Could not read escrow contract version: {version['__error']}"
+        )
+    try:
+        check_contract_version(lambda: version)
+    except UnsupportedContractVersionError:
+        raise
+
     # ------------------------------------------------------------------
     # Core escrow state
     # ------------------------------------------------------------------
     escrow = inv("get_escrow")
-    version = inv("get_version")
     legal_hold = inv("get_legal_hold")
     snapshot = inv("get_funding_close_snapshot")
     unique_funder_count = inv("get_unique_funder_count")
