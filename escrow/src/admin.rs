@@ -983,6 +983,43 @@ impl LiquifactEscrow {
         }
     }
 
+    /// Dry-run preview of a migration without mutating state.
+    /// 
+    /// Mirrors `migrate_impl` validation but returns the target version and changelog
+    /// without writing to storage. Idempotent and safe to call multiple times.
+    pub(crate) fn dry_run_migrate_impl(env: Env, from_version: u32) -> (u32, String) {
+        let escrow = Self::load_escrow_require_admin(&env);
+        let stored: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(0);
+
+        // Emit same diagnostic event so operators can correlate dry-run with live migrate calls.
+        MigrationDiagnosticEmitted {
+            name: symbol_short!("dry_run"),
+            invoice_id: escrow.invoice_id.clone(),
+            stored_version: stored,
+            from_version,
+            target_version: SCHEMA_VERSION,
+        }
+        .publish(&env);
+
+        // Validate that the supplied from_version matches the stored version.
+        ensure(
+            &env,
+            stored == from_version,
+            EscrowError::MigrationVersionMismatch,
+        );
+
+        if from_version >= SCHEMA_VERSION {
+            // Already at or beyond the target schema version.
+            fail(&env, EscrowError::AlreadyCurrentSchemaVersion)
+        } else {
+            // No migration path is implemented for any version below SCHEMA_VERSION.
+            // To add one: implement the transformation in `migrate_impl`,  then update
+            // this function to return the target version and a changelog before reaching
+            // the error.
+            fail(&env, EscrowError::NoMigrationPath)
+        }
+    }
+
     /// Export the complete escrow state as a structured snapshot for archival, analysis,
     /// compliance, and audit reporting.
     ///
