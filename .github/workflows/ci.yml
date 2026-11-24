@@ -158,6 +158,19 @@ jobs:
             --script scripts/pre-flight-checklist.sh \
             --lib escrow/src/lib.rs
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Install frontend test dependencies
+        run: npm ci --prefix docs
+
+      - name: Run frontend accessibility checks
+        run: npm run test:a11y --prefix docs
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@671164c891d3e20f5b8ece04798d0154d1262d65 # cargo-llvm-cov
 

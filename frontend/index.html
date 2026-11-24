@@ -27,7 +27,7 @@
         box-shadow: 0 20px 45px rgba(0,0,0,0.3);
       }
       h1 { margin-top: 0; }
-      .pill { display: inline-block; padding: 0.35rem 0.75rem; border-radius: 999px; background: #1aa981; color: white; font-size: 0.9rem; }
+      .pill { display: inline-block; padding: 0.35rem 0.75rem; border-radius: 999px; background: #1aa981; color: #07111f; font-size: 0.9rem; }
       #status { margin-top: 1rem; padding: 1rem; border-radius: 12px; background: rgba(255,255,255,0.06); }
       #freeze-status { margin-top: 1rem; }
       .freeze-alert, .freeze-clear { padding: 1rem; border-radius: 12px; }
@@ -43,8 +43,7 @@
       <span class="pill">karis-ky frontend</span>
       <h1>karis-ky frontend connected to backend</h1>
       <p>This page is served from the frontend layer while the contract intelligence lives in a separate backend API.</p>
-      <div id="status">Loading backend status…</div>
-      <section id="freeze-status" aria-live="polite">Loading escrow freeze status…</section>
+      <div id="status" role="status" aria-live="polite" aria-atomic="true">Loading backend status…</div>
     </main>
     <script src="./app.js"></script>
   </body>
