@@ -43,15 +43,19 @@ START: You have a new WASM release ready for mainnet
 ```
 You're about to upgrade or redeploy.
 
-  1. Did you implement a new migration branch in migrate()?
+  1. Did you implement a new migration branch in migrate_impl()?
      │
-     ├─ YES
+     ├─ YES (how to verify: check escrow/src/admin.rs:947+)
+     │  │  If migrate_impl() has logic beyond error returns,
+     │  │  you have a migration path.
      │  │
      │  2. Is the migration tested with all edge cases?
      │     │
      │     ├─ YES
      │     │  └─ → Call migrate(from_version: N) after upgrade
      │     │       Check: contract panics on mismatch → expected
+     │     │       See ADR-007 (docs/adr/ADR-007-storage-key-evolution.md)
+     │     │       for persistent-storage migration rules.
      │     │
      │     └─ NO
      │        └─ → DO NOT call migrate()
@@ -62,12 +66,21 @@ You're about to upgrade or redeploy.
         2. Is this an additive WASM upgrade?
            │
            ├─ YES
-           │  └─ → DO NOT call migrate()
-           │       Reason: No storage rewrite; additive keys default to None
+           │  │
+           │  3. Verify: will get_version_history() show exactly one entry?
+           │     │
+           │     ├─ YES (init writes one entry; no migrate called)
+           │     │  └─ → DO NOT call migrate()
+           │     │       Reason: No storage rewrite; additive keys default to None
+           │     │       See ADR-007 for additive-key policy
+           │     │
+           │     └─ NO / UNSURE
+           │        └─ → Consult ADR-007; you may need a migration path
            │
            ├─ NO (redeploy)
            │  └─ → DO NOT call migrate()
            │       Reason: New instances start fresh; old instances are archived
+           │       See docs/REDEPLOY_v7_to_v8_RUNBOOK.md for v8+ redeploy procedures
            │
            └─ UNSURE
               └─ → Contact security team before calling migrate()
@@ -158,10 +171,14 @@ You called upgrade/deploy/init and got a contract error (typed code or panic).
 - Do NOT call `migrate()` for additive upgrades
 - New keys default to `None` when read — no explicit rewrite needed
 - Only call `migrate()` when you implement a real transformation branch
+- **Version history verification:** After upgrade, call `get_version_history()`
+  - Should return exactly **one** entry (from init)
+  - If two entries: you accidentally called migrate()
 
 **Prevention:**
 - Review: Does `migrate()` have branches for your version change? If not, skip calling it.
 - Test on testnet: Verify `get_version` returns expected schema **without** calling `migrate()`
+- Query `get_version_history()` to confirm single entry post-upgrade
 
 ---
 
@@ -345,7 +362,9 @@ You called upgrade/deploy/init and got a contract error (typed code or panic).
 ### Additive upgrade success = all boxes checked
 
 - [ ] All instances upgraded without errors
-- [ ] `get_version` returns same schema before and after
+- [ ] `get_version()` returns same schema before and after
+- [ ] `get_version_history()` returns exactly **one** entry (init write only)
+  - If two or more entries: you accidentally called migrate()
 - [ ] `get_escrow` reads successfully (spot-check 3+ instances)
 - [ ] Investor funding resumes without errors
 - [ ] Settlement/payout transactions (if any) execute successfully
@@ -357,7 +376,10 @@ You called upgrade/deploy/init and got a contract error (typed code or panic).
 - [ ] New instances deployed and initialized
 - [ ] Investor data restored to new instances (if previously funded)
 - [ ] Old instances archived with legal hold active
-- [ ] All integrators updated with new contract IDs
+- [ ] All integrators **notified 24h before** redeploy
+  - [ ] Indexer team updated with new contract IDs
+  - [ ] API team has new IDs mapped in discovery endpoints
+  - [ ] UI team cleared cache and deployed new client
 - [ ] API/indexer serving new IDs in discovery
 - [ ] UI shows new contract IDs (old IDs cleared from cache)
 - [ ] Investors notified (if required) of new address

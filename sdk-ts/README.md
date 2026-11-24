@@ -126,7 +126,7 @@ All contract errors are typed. See the [Error Handling Guide](docs/error-handlin
 - Error code reference tables for all 40+ error codes
 - Common error patterns by method (fund, settle, claim)
 - Three complete try/catch examples with recovery logic
-- Error recovery strategies
+- Error recovery strategies, including atomic funding batch reconciliation
 
 ### Quick Example
 
@@ -165,6 +165,7 @@ try {
 | [Client Implementation](src/client.ts) | EscrowClient class with all entrypoints |
 | [Example Usage](examples/basic-usage.ts) | Complete workflow demonstration |
 | [Full Lifecycle Example](examples/full-lifecycle.ts) | End-to-end script covering init, funding, settlement, and investor claims |
+| [Yield Claim Delegation Example](examples/yield-claim-delegation.ts) | Set a delegate, claim as that delegate, and revoke the delegation |
 | [Contract Spec](spec.json) | Machine-readable ABI (auto-generated from Rust) |
 | [Event Schema Reference](../docs/EVENT_SCHEMA.md) | Authoritative topic/data layout for all 24 contract events |
 
@@ -178,9 +179,13 @@ try {
 | `fund()` | Record investor principal | investor |
 | `fundWithCommitment()` | First deposit with tiered yield | investor |
 | `fundBatch()` | Batch fund multiple investors | per-investor |
+| `batchFund()` | Atomically fund multiple investors | per-investor |
 | `settle()` | Mark escrow as settled | sme_address |
 | `withdraw()` | SME withdraws liquidity | sme_address |
 | `claimInvestorPayout()` | Investor claims payout after settlement | investor |
+| `setYieldClaimDelegate()` | Investor sets or replaces their claim delegate | investor |
+| `claimPayoutAsDelegate()` | Delegate claims an investor payout | delegate |
+| `revokeYieldClaimDelegate()` | Investor revokes their claim delegate | investor |
 | `cancelFunding()` | Cancel funding round | admin |
 | `refund()` | Refund principal after cancellation | investor |
 | `sweepTerminalDust()` | Treasury sweeps dust from terminal escrow | treasury |
@@ -312,6 +317,17 @@ npm run full-lifecycle
 
 > **Warning:** Secret keys (`ADMIN_SECRET`, `SME_SECRET`, `INVESTOR_SECRET`) must **never** be committed to version control or written to logs. Load them from a secure secret manager or an untracked `.env` file, and use dedicated testnet-only keys when running the example.
 
+## Yield Claim Delegation Example
+
+The `examples/yield-claim-delegation.ts` script demonstrates setting a delegate,
+claiming a payout as that delegate, and revoking the delegation. Its stub RPC
+adapter prints the contract calls; replace it with an adapter that signs set
+and revoke calls as the investor and claim calls as the delegate.
+
+```bash
+npm run delegate-example
+```
+
 ## Schema Versioning
 
 The SDK is versioned in lockstep with the Soroban contract schema. Each release targets a specific `SCHEMA_VERSION`:
@@ -322,15 +338,21 @@ The SDK is versioned in lockstep with the Soroban contract schema. Each release 
 Before deploying, verify your contract schema matches the SDK target:
 
 ```typescript
-const schemaVersion = await client.getVersion();
-const sdkTarget = SCHEMA_VERSION;
+const preflight = await client.preflightMigration();
+console.log(preflight.recommendation);
 
-if (schemaVersion !== sdkTarget) {
-  throw new Error(
-    `Schema mismatch: contract v${schemaVersion}, SDK targets v${sdkTarget}`,
-  );
+if (preflight.recommendation === "migration_recommended") {
+  const fromVersion = 7; // Set this explicitly for the planned migration.
+  await client.dryRunMigrate(fromVersion);
+  await client.migrate(fromVersion);
 }
 ```
+
+`preflightMigration(targetVersion?)` compares `getVersion()` with the supplied target
+(defaulting to `SCHEMA_VERSION`) and returns `migration_recommended`,
+`already_at_target`, or `sdk_behind_contract`. `dryRunMigrate(fromVersion)` simulates
+the migration without submitting it. Both migration methods preserve contract errors
+90–93 for callers to handle; see the [error handling guide](docs/error-handling.md).
 
 ## Building from Source
 

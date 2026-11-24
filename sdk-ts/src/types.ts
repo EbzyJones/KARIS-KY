@@ -145,6 +145,18 @@ export interface InvestorPosition {
   yield_claim_delegate: string | null;
 }
 
+/** One checkpoint entry in an investor's funding history. */
+export interface InvestorFundingRecord {
+  /** Kind of checkpoint: "deposit", "funding_close", or "settlement". */
+  checkpoint: string;
+  /** Ledger timestamp when this checkpoint was recorded. */
+  timestamp: string;
+  /** Amount associated with this checkpoint (deposit amount or payout at settlement). */
+  amount: string;
+  /** Investor's cumulative principal contribution as of this checkpoint. */
+  cumulative_total: string;
+}
+
 /** Snapshot payload returned by `export_state` and accepted by `import_state`. */
 export interface EscrowSnapshot {
   escrow: InvoiceEscrow;
@@ -171,6 +183,14 @@ export interface EscrowSnapshot {
   checksum: string;
 }
 
+/** Investor capacity snapshot returned by `get_investor_cap_status`. */
+export interface InvestorCapStatus {
+  max: number;
+  current: number;
+  remaining: number;
+  is_full: boolean;
+}
+
 /** Structured error diagnostic emitted alongside contract errors. */
 export interface ErrorDiagnostic {
   error_code: number;
@@ -187,6 +207,66 @@ export interface EscrowTemplate {
   min_contribution: string | null;
   max_unique_investors: number | null;
   funding_deadline_days: number | null;
+}
+
+/** Operational limits returned by `get_limits`. */
+export interface ContractLimits {
+  /** Upper bound on `append_attestation_digest` entries. */
+  max_attestation_append_entries: number;
+  /** Upper bound on reinvestment audit log entries. */
+  max_reinvestment_audit_entries: number;
+  /** Upper bound on `DataKey::InvestorFundingHistory` entries per investor. */
+  max_investor_history_entries: number;
+  /** Upper bound on admin role assignments. */
+  max_admin_roles: number;
+  /** Upper bound on multisig policy signer entries. */
+  max_multisig_signers: number;
+  /** Upper bound on multisig policy operation entries. */
+  max_multisig_operations: number;
+  /** Upper bound on batch allowlist mutation entries per call. */
+  max_investor_allowlist_batch: number;
+  /** Upper bound on `fund_batch` entries per call. */
+  max_fund_batch: number;
+  /** Upper bound on batch payout claim entries. */
+  max_batch_claim: number;
+}
+
+/** Read-only dashboard metrics returned by `get_escrow_health_metrics`. */
+export interface EscrowHealthMetrics {
+  /** `(funded_amount * 100) / funding_target`, floored, capped at 100 when overfunded. */
+  funding_progress_percent: number;
+  /** Days until maturity (negative once maturity has passed); 0 when no maturity is set. */
+  days_to_maturity: string; // i64 → bigint string
+  /** Number of unique investors that have contributed. */
+  unique_investor_count: number;
+  /** `funded_amount / unique_investor_count`, or 0 when there are no investors yet. */
+  average_contribution_size: string; // i128 → bigint string
+  /** Flat coupon on the whole funded_amount; does not account for tiered per-investor yield. */
+  estimated_yield_payout: string; // i128 → bigint string
+}
+
+/** State invariant report returned by `detect_state_inconsistencies`. */
+export interface StateInconsistencyReport {
+  /** Funded amount exceeds target without status advancing from Open. */
+  funded_exceeds_target_stale: boolean;
+  /** Funded amount is positive but status is still Open. */
+  funded_positive_status_open: boolean;
+  /** Funded amount is zero but status has advanced beyond Open. */
+  funded_zero_status_advanced: boolean;
+  /** Funders exist but status is still Open and funding deadline not passed. */
+  funders_exist_status_open: boolean;
+  /** No funders recorded but status has advanced beyond Open. */
+  no_funders_advanced_status: boolean;
+  /** Funding close snapshot exists but status is not Funded or later. */
+  snapshot_exists_not_funded: boolean;
+  /** Funding close snapshot is missing but status is Funded or later. */
+  snapshot_missing_post_funded: boolean;
+  /** Escrow settled before maturity lock expiry. */
+  settled_before_maturity_lock: boolean;
+  /** Invalid funding amounts detected in investor history. */
+  invalid_funding_amounts: boolean;
+  /** Invalid or unrecognized status value. */
+  invalid_status_value: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +326,22 @@ export const MAX_INVOICE_ID_STRING_LEN = 32;
 export const MAX_ATTESTATION_APPEND_ENTRIES = 32;
 export const MAX_INVESTOR_ALLOWLIST_BATCH = 32;
 export const MAX_FUND_BATCH = 50;
+export const MAX_INVESTOR_HISTORY_ENTRIES = 128;
+export const MAX_HISTORY_PAGE_SIZE = 50;
 export const MAX_DUST_SWEEP_AMOUNT = "100000000";
+
+/** Recommendation from comparing an escrow's stored schema with the SDK target. */
+export type MigrationRecommendation =
+  | "migration_recommended"
+  | "already_at_target"
+  | "sdk_behind_contract";
+
+/** Result of checking the stored schema version before a migration. */
+export interface MigrationPreflight {
+  currentVersion: number;
+  targetVersion: number;
+  recommendation: MigrationRecommendation;
+}
 
 // ---------------------------------------------------------------------------
 // Typed error codes (mirrors EscrowError in lib.rs)
@@ -292,12 +387,14 @@ export enum EscrowErrorCode {
   // Attestation (50–53)
   PrimaryAttestationAlreadyBound = 50,
   AttestationAppendLogCapacityReached = 51,
+  InvalidAttestationHashLength = 52,
   AttestationHashAlreadyBound = 53,
 
-  // SME collateral (60–62)
+  // SME collateral (60–63)
   CollateralAmountNotPositive = 60,
   CollateralAssetEmpty = 61,
   CollateralTimestampBackwards = 62,
+  CollateralUpdateAfterSettlement = 63,
 
   // Admin validation (70–83)
   InvestorBatchEmpty = 70,
@@ -314,10 +411,11 @@ export enum EscrowErrorCode {
   FundingBatchEmpty = 82,
   FundingBatchTooLarge = 83,
 
-  // Schema migration (90–92)
+  // Schema migration (90–93)
   MigrationVersionMismatch = 90,
   AlreadyCurrentSchemaVersion = 91,
   NoMigrationPath = 92,
+  MigrationAlreadyApplied = 93,
 
   // Funding (100–111)
   FundingAmountNotPositive = 100,
@@ -355,6 +453,45 @@ export enum EscrowErrorCode {
   LegalHoldClearRequestMissing = 150,
   LegalHoldClearNotReady = 151,
   LegalHoldClearDelayOverflow = 152,
+  FundingDeadlinePassed = 153,
+  LegalHoldSetOnTerminalEscrow = 154,
+
+  // Beneficiary rotation + admin handover + funding deadline (160–163)
+  LegalHoldBlocksBeneficiaryRotation = 160,
+  RotationNotOpen = 161,
+  YieldSlippageDetected = 162,
+  YieldSlippageThresholdOutOfRange = 163,
+
+  // Dispute pause + governance / role checks (165–180)
+  DisputePausedBlocksFunding = 165,
+  DisputePausedBlocksSettlement = 166,
+  DisputePausedBlocksWithdrawal = 167,
+  DisputePausedBlocksInvestorClaims = 168,
+  DisputePauseDurationNotPositive = 169,
+  DisputeTicketIdEmpty = 170,
+  NoPauseActive = 171,
+  LedgerTimestampOverflow = 172,
+  InvestorNotVerified = 173,
+  InsufficientAdminRole = 174,
+  InvalidAdminRoleList = 175,
+  MultisigThresholdInvalid = 176,
+  MultisigSignerListInvalid = 177,
+  MultisigOperationsListEmpty = 178,
+  MultisigInsufficientSigners = 179,
+  MultisigSignerNotAuthorized = 180,
+
+  // Reinvestment + SME withdrawal (181–185)
+  NewSmeSameAsCurrent = 181,
+  NoPendingAdmin = 182,
+  InsufficientContractBalance = 183,
+  ReinvestAmountNotPositive = 184,
+  UnauthorizedWithdrawer = 185,
+
+  // Compliance and rate limiting (205–206)
+  SanctionsScreeningFailed = 205,
+  DisputePauseDurationExceedsMax = 206,
+
+  // Legal hold governance (207–213)
   LegalHoldRequiresGuardianConfirmation = 207,
   LegalHoldProposalMissing = 208,
   LegalHoldProposalExpired = 209,
@@ -362,13 +499,6 @@ export enum EscrowErrorCode {
   LegalHoldGuardianNotConfigured = 211,
   LegalHoldAlreadyActive = 212,
   LegalHoldGuardianSameAsAdmin = 213,
-
-  // Beneficiary rotation + admin handover + funding deadline (160–164)
-  LegalHoldBlocksBeneficiaryRotation = 160,
-  RotationNotOpen = 161,
-  NewSmeSameAsCurrent = 162,
-  NoPendingAdmin = 163,
-  FundingDeadlinePassed = 164,
 }
 
 /** Human-readable error descriptions keyed by error code. */
@@ -404,9 +534,12 @@ export const ESCROW_ERROR_LABELS: Record<number, string> = {
   42: "Sweep would exceed liability floor",
   50: "Primary attestation already bound",
   51: "Attestation append log capacity reached",
+  52: "Attestation hash must be exactly 32 bytes",
+  53: "Attestation hash already bound",
   60: "Collateral amount must be positive",
   61: "Collateral asset symbol must not be empty",
   62: "Collateral timestamp must not go backward",
+  63: "Collateral updates are blocked after settlement",
   70: "Investor batch must be non-empty",
   71: "Investor batch too large",
   72: "Target must be strictly positive",
@@ -423,6 +556,7 @@ export const ESCROW_ERROR_LABELS: Record<number, string> = {
   90: "Migration version mismatch",
   91: "Already at current schema version",
   92: "No migration path",
+  93: "Migration already applied",
   100: "Funding amount must be positive",
   101: "Funding amount below min contribution floor",
   102: "Legal hold blocks new funding",
@@ -452,6 +586,35 @@ export const ESCROW_ERROR_LABELS: Record<number, string> = {
   150: "Legal hold clear request missing",
   151: "Legal hold clear delay not elapsed",
   152: "Legal hold clear delay overflow",
+  153: "Funding deadline has passed, new deposits are rejected",
+  154: "Legal hold cannot be set on terminal escrow",
+  160: "Legal hold blocks beneficiary rotation",
+  161: "Beneficiary rotation not permitted in current state",
+  162: "Yield slippage detected and exceeds threshold",
+  163: "Yield slippage threshold is out of valid range (0..=10,000 bps)",
+  165: "Dispute pause blocks new funding",
+  166: "Dispute pause blocks settlement",
+  167: "Dispute pause blocks withdrawal",
+  168: "Dispute pause blocks investor claims",
+  169: "Dispute pause duration must be positive",
+  170: "Dispute ticket ID must not be empty",
+  171: "No dispute pause is active",
+  172: "Ledger timestamp overflow",
+  173: "Investor is not verified by the KYC provider",
+  174: "Caller does not have the required admin role",
+  175: "Admin role list is empty, oversized, or contains duplicates",
+  176: "Multisig threshold is invalid",
+  177: "Multisig signer list is invalid",
+  178: "Multisig operations list must not be empty",
+  179: "Multisig signers do not meet the threshold",
+  180: "Signer is not authorized for this multisig policy",
+  181: "New SME must differ from current beneficiary",
+  182: "No pending admin",
+  183: "Contract funding token balance is below funded amount",
+  184: "Reinvestment amount must be strictly positive",
+  185: "Caller is not the registered SME address",
+  205: "Address failed sanctions screening check",
+  206: "Dispute pause duration exceeds maximum allowed window",
   207: "Guardian confirmation required to activate legal hold",
   208: "No pending legal-hold proposal",
   209: "Legal-hold proposal expired",
@@ -459,11 +622,6 @@ export const ESCROW_ERROR_LABELS: Record<number, string> = {
   211: "No legal-hold guardian configured",
   212: "Legal hold is already active",
   213: "Legal-hold guardian must differ from admin",
-  160: "Legal hold blocks beneficiary rotation",
-  161: "Beneficiary rotation not permitted in current state",
-  162: "New SME must differ from current beneficiary",
-  163: "No pending admin",
-  164: "Funding deadline has passed",
 };
 
 /** Category groupings for error codes to help SDK consumers branch on categories. */
@@ -471,16 +629,20 @@ export const ESCROW_ERROR_CATEGORIES: Record<string, { range: [number, number]; 
   init: { range: [1, 13], label: "Init / pricing configuration" },
   uninitialized: { range: [20, 22], label: "Uninitialized escrow metadata" },
   dustSweep: { range: [30, 42], label: "Dust sweep / token safety" },
-  attestation: { range: [50, 51], label: "Attestation failure" },
-  collateral: { range: [60, 62], label: "Collateral metadata failure" },
+  attestation: { range: [50, 53], label: "Attestation failure" },
+  collateral: { range: [60, 63], label: "Collateral metadata failure" },
   adminValidation: { range: [70, 83], label: "Administrative validation" },
-  migration: { range: [90, 92], label: "Schema migration failure" },
+  migration: { range: [90, 93], label: "Schema migration failure" },
   funding: { range: [100, 111], label: "Funding failure" },
   settlement: { range: [120, 129], label: "Settlement / payout failure" },
   cancelRefund: { range: [140, 143], label: "Cancel / refund failure" },
-  legalHoldClear: { range: [150, 152], label: "Legal hold clear workflow failure" },
+  legalHoldClear: { range: [150, 154], label: "Legal hold clear and terminal workflow failure" },
+  beneficiary: { range: [160, 163], label: "Beneficiary / slippage / deadline failure" },
+  dispute: { range: [165, 172], label: "Dispute pause / ledger safety failure" },
+  governance: { range: [173, 180], label: "KYC / role / multisig governance failure" },
+  reinvestment: { range: [181, 185], label: "Reinvestment and withdrawal authorization failure" },
+  compliance: { range: [205, 206], label: "Compliance and rate limiting failure" },
   legalHoldActivation: { range: [207, 213], label: "Legal hold activation failure" },
-  beneficiary: { range: [160, 164], label: "Beneficiary / admin / deadline failure" },
 };
 
 /**

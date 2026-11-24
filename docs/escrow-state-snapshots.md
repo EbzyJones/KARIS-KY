@@ -2,6 +2,27 @@
 
 **Purpose:** Emergency recovery and rollback procedures for the karis-ky escrow contract.
 
+## Off-chain Backup Integrity
+
+`backend/backup_escrow_state.py` writes JSON envelopes whose `_meta` section
+contains a SHA-256 checksum of the canonical snapshot `state`. Importing a
+backup recomputes that checksum and rejects malformed JSON or any modified
+state with a checksum-mismatch error before the backup can be used.
+
+Validate and round-trip a backup before relying on it:
+
+```python
+from backend.backup_escrow_state import export_snapshot, import_snapshot
+
+state = import_snapshot("/secure/backups/escrow_backup.json")
+re_exported = export_snapshot(state, contract_id, ledger_sequence)
+```
+
+The integrity check detects accidental byte flips and truncation. It is not
+encryption or a cryptographic signature: retain backups in access-controlled
+storage and treat the checksum as corruption detection, not authorization.
+Cross-version restore is out of scope.
+
 ## Quick Reference
 
 | Operation | Entrypoint | Auth | Returns |

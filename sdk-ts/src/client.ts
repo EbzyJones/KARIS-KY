@@ -19,8 +19,10 @@ import {
   type EscrowSummary,
   type InvestorCapStatus,
   type InvestorPosition,
+  type InvestorFundingRecord,
   type EscrowSnapshot,
   type ErrorDiagnostic,
+  type MigrationPreflight,
   type EscrowTemplate,
   type InitParams,
   type SorobanResult,
@@ -29,6 +31,9 @@ import {
   type EscrowEventSubscriptionOptions,
   type CheckEscrowHealth,
   type EscrowHealth,
+  type ContractLimits,
+  type EscrowHealthMetrics,
+  type StateInconsistencyReport,
   SCHEMA_VERSION,
   CONTRACT_INTERFACE_VERSION,
   MAX_INVOICE_ID_STRING_LEN,
@@ -316,6 +321,14 @@ export class EscrowClient {
     return this.simulate("get_contribution", [investor]);
   }
 
+  async computeInvestorPayout(investor: string): Promise<string> {
+    return this.simulate("compute_investor_payout", [investor]);
+  }
+
+  async getDistributedPrincipal(): Promise<string> {
+    return this.simulate("get_distributed_principal", []);
+  }
+
   async getUniqueFunderCount(): Promise<number> {
     return this.simulate("get_unique_funder_count", []);
   }
@@ -338,6 +351,18 @@ export class EscrowClient {
 
   async isInvestorRefunded(investor: string): Promise<boolean> {
     return this.simulate("is_investor_refunded", [investor]);
+  }
+
+  async getInvestorHistory(investor: string): Promise<InvestorFundingRecord[]> {
+    return this.simulate("get_investor_history", [investor]);
+  }
+
+  async getInvestorHistoryPage(
+    investor: string,
+    offset: number,
+    limit: number,
+  ): Promise<InvestorFundingRecord[]> {
+    return this.simulate("get_investor_history_page", [investor, offset, limit]);
   }
 
   async getMinContributionFloor(): Promise<string> {
@@ -432,6 +457,48 @@ export class EscrowClient {
 
   async getInvestorPosition(investor: string): Promise<InvestorPosition> {
     return this.simulate("get_investor_position", [investor]);
+  }
+
+  /**
+   * Get comprehensive escrow health metrics for dashboard displays.
+   *
+   * Returns operational metrics including funding progress percentage, days to maturity,
+   * unique investor count, average contribution size, and estimated yield payout.
+   * Suitable for monitoring dashboards and analytics.
+   *
+   * @returns EscrowHealthMetrics with funding_progress_percent, days_to_maturity,
+   *          unique_investor_count, average_contribution_size, and estimated_yield_payout.
+   */
+  async getEscrowHealthMetrics(): Promise<EscrowHealthMetrics> {
+    return this.simulate("get_escrow_health_metrics", []);
+  }
+
+  /**
+   * Detect state inconsistencies in the escrow storage.
+   *
+   * Runs a suite of invariant checks on the escrow state without modifying storage.
+   * Returns a report with boolean flags indicating any violations. All false indicates
+   * a valid state; any true flag signals a potential bug or corruption.
+   *
+   * Useful for health monitoring, audits, and debugging.
+   *
+   * @returns StateInconsistencyReport with boolean flags for each invariant violation.
+   */
+  async detectStateInconsistencies(): Promise<StateInconsistencyReport> {
+    return this.simulate("detect_state_inconsistencies", []);
+  }
+
+  /**
+   * Get the operational limits configured for this contract.
+   *
+   * Returns static limits on batch sizes, history entries, and other operational bounds.
+   * Consumers can use these to validate requests before sending (e.g., batch sizes,
+   * attestation append count, investor allowlist mutations).
+   *
+   * @returns ContractLimits with all operational limit constants.
+   */
+  async getLimits(): Promise<ContractLimits> {
+    return this.simulate("get_limits", []);
   }
 
   // ---- State-mutating entrypoints ----
@@ -568,6 +635,37 @@ export class EscrowClient {
     return this.invoke("claim_investor_payout", [investor], source);
   }
 
+  /** Claim an investor payout as the active delegate. Auth: delegate. */
+  async claimPayoutAsDelegate(
+    investor: string,
+    delegate: string,
+    source?: string,
+  ): Promise<void> {
+    return this.invoke("claim_payout_as_delegate", [investor, delegate], source);
+  }
+
+  /** Set or replace an investor's yield claim delegate. Auth: investor. */
+  async setYieldClaimDelegate(
+    investor: string,
+    delegate: string,
+    source?: string,
+  ): Promise<void> {
+    return this.invoke("set_yield_claim_delegate", [investor, delegate], source);
+  }
+
+  /** Revoke an investor's active yield claim delegate. Auth: investor. */
+  async revokeYieldClaimDelegate(investor: string, source?: string): Promise<void> {
+    return this.invoke("revoke_yield_claim_delegate", [investor], source);
+  }
+
+  /** Record payout claims for multiple investors. Auth: per-investor. */
+  async batchClaimInvestorPayouts(investors: string[], source?: string): Promise<number> {
+    if (investors.length === 0) {
+      throw new Error("investors must not be empty");
+    }
+    return this.invoke("batch_claim_investor_payouts", [investors], source);
+  }
+
   /** Cancel funding. Auth: admin. */
   async cancelFunding(source?: string): Promise<InvoiceEscrow> {
     return this.invoke("cancel_funding", [], source);
@@ -584,8 +682,11 @@ export class EscrowClient {
   }
 
   /** Set or clear legal hold. Auth: admin. */
-  async setLegalHold(active: boolean, source?: string): Promise<void> {
-    return this.invoke("set_legal_hold", [active], source);
+  async setLegalHold(active: boolean, reason: string, source?: string): Promise<void> {
+    if (active && reason.trim().length === 0) {
+      throw new Error("reason must be non-empty when legal hold is activated (active=true)");
+    }
+    return this.invoke("set_legal_hold", [active, reason], source);
   }
 
   /** Propose a legal hold for guardian confirmation. Auth: current admin. */
@@ -633,9 +734,30 @@ export class EscrowClient {
     return this.invoke("accept_admin", [], source);
   }
 
-  /** Migrate schema. Typed errors on all paths in current release. */
-  async migrate(fromVersion: number, source?: string): Promise<void> {
+  /**
+   * Compare the stored schema version with the target before deciding whether to migrate.
+   * A target defaults to this SDK's supported schema version.
+   */
+  async preflightMigration(targetVersion: number = SCHEMA_VERSION): Promise<MigrationPreflight> {
+    const currentVersion = await this.getVersion();
+    const recommendation =
+      currentVersion < targetVersion
+        ? "migration_recommended"
+        : currentVersion === targetVersion
+          ? "already_at_target"
+          : "sdk_behind_contract";
+
+    return { currentVersion, targetVersion, recommendation };
+  }
+
+  /** Migrate schema from the supplied version. Returns the resulting schema version. */
+  async migrate(fromVersion: number, source?: string): Promise<number> {
     return this.invoke("migrate", [fromVersion], source);
+  }
+
+  /** Simulate a schema migration without submitting a transaction. */
+  async dryRunMigrate(fromVersion: number): Promise<number> {
+    return this.simulate("dry_run_migrate", [fromVersion]);
   }
 
   /** Batch set investor allowlist. Auth: admin. Max 32 per call. */

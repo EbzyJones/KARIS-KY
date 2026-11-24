@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
+#
+# Pre-flight checklist for a Liquifact escrow deployment.
+#
+# CI validates that the references in this script are current: every
+# `stellar contract invoke` method used below must exist as a public
+# entrypoint in escrow/src/lib.rs, and the required commands (e.g. the
+# `stellar` CLI) must be available. See the "Pre-flight checklist
+# validation" section in the CI workflow / docs for details. If you add
+# or rename an entrypoint, update the `start_check` calls below so this
+# checklist does not go stale.
 
 set -u
 
-readonly SCRIPT_NAME="$(basename "$0")"
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
 readonly NETWORK="${STELLAR_NETWORK:-local}"
 readonly CONTRACT_ID="${CONTRACT_ID:-${LIQUIFACT_CONTRACT_ID:-}}"
 readonly CHECK_TIMEOUT_SECS="${CHECK_TIMEOUT_SECS:-30}"

@@ -8,22 +8,33 @@
  * All tests use a stub Stellar SDK to avoid live network connections.
  */
 
+import { EscrowClient, type SorobanRpcClient } from "./client";
 import {
-  EscrowClient,
   EscrowStatus,
+  ESCROW_STATUS_LABELS,
+  EscrowErrorCode,
+  ESCROW_ERROR_LABELS,
+  classifyError,
+  type InvoiceEscrow,
+  type YieldTier,
+  type FundingCloseSnapshot,
+  type SmeCollateralCommitment,
+  type EscrowSummary,
+  type EscrowSnapshot,
+  type ErrorDiagnostic,
+  type EscrowTemplate,
+  type InitParams,
+  type SorobanResult,
+  type EscrowEvent,
+  type SorobanEventPage,
+  type EscrowEventSubscriptionOptions,
   SCHEMA_VERSION,
   CONTRACT_INTERFACE_VERSION,
   MAX_INVOICE_ID_STRING_LEN,
-  toBaseUnits,
-  type InvoiceEscrow,
-  type EscrowSummary,
-  type FundingCloseSnapshot,
-  type InitParams,
-  type YieldTier,
-  type EscrowEvent,
-  type SorobanEventQuery,
-  type SorobanRpcClient,
+  MAX_DUST_SWEEP_AMOUNT,
+  MAX_FUND_BATCH,
   ValidationError,
+  toBaseUnits,
 } from "./index";
 
 const event = (name: string, ledger: number): EscrowEvent => ({
@@ -833,6 +844,84 @@ describe("EscrowClient Integration Tests", () => {
     });
   });
 
+  describe("migration helpers", () => {
+    it("migrates from the supplied version and returns the resulting version", async () => {
+      stub.clearInvocationLog();
+      stub.setResponse("migrate", SCHEMA_VERSION);
+
+      await expect(client.migrate(SCHEMA_VERSION, ADMIN)).resolves.toBe(SCHEMA_VERSION);
+      expect(stub.getInvocationLog()).toEqual([
+        {
+          method: "invoke",
+          functionName: "migrate",
+          args: [SCHEMA_VERSION],
+          source: ADMIN,
+        },
+      ]);
+    });
+
+    it("dry-runs migration through a read-only simulation", async () => {
+      stub.clearInvocationLog();
+      stub.setResponse("dry_run_migrate", SCHEMA_VERSION);
+
+      await expect(client.dryRunMigrate(SCHEMA_VERSION)).resolves.toBe(SCHEMA_VERSION);
+      expect(stub.getInvocationLog()).toEqual([
+        {
+          method: "simulate",
+          functionName: "dry_run_migrate",
+          args: [SCHEMA_VERSION],
+        },
+      ]);
+    });
+
+    it.each([
+      [SCHEMA_VERSION - 1, SCHEMA_VERSION, "migration_recommended"],
+      [SCHEMA_VERSION, SCHEMA_VERSION, "already_at_target"],
+      [SCHEMA_VERSION + 1, SCHEMA_VERSION, "sdk_behind_contract"],
+    ] as const)(
+      "for current version %s and target %s returns %s",
+      async (currentVersion, targetVersion, recommendation) => {
+        stub.clearInvocationLog();
+        stub.setResponse("get_version", currentVersion);
+
+        await expect(client.preflightMigration(targetVersion)).resolves.toEqual({
+          currentVersion,
+          targetVersion,
+          recommendation,
+        });
+        expect(stub.getInvocationLog()).toEqual([
+          { method: "simulate", functionName: "get_version", args: [] },
+        ]);
+      },
+    );
+
+    it("uses the SDK schema version as the default pre-flight target", async () => {
+      stub.setResponse("get_version", SCHEMA_VERSION);
+
+      await expect(client.preflightMigration()).resolves.toEqual({
+        currentVersion: SCHEMA_VERSION,
+        targetVersion: SCHEMA_VERSION,
+        recommendation: "already_at_target",
+      });
+    });
+
+    it.each([
+      EscrowErrorCode.MigrationVersionMismatch,
+      EscrowErrorCode.AlreadyCurrentSchemaVersion,
+      EscrowErrorCode.NoMigrationPath,
+      EscrowErrorCode.MigrationAlreadyApplied,
+    ])("preserves typed migration error %i from migrate and dry-run", async (code) => {
+      const contractError = Object.assign(new Error(`Contract error ${code}`), { code });
+      jest.spyOn(stub, "invoke").mockRejectedValueOnce(contractError);
+      jest.spyOn(stub, "simulate").mockRejectedValueOnce(contractError);
+
+      await expect(client.migrate(SCHEMA_VERSION)).rejects.toBe(contractError);
+      await expect(client.dryRunMigrate(SCHEMA_VERSION)).rejects.toBe(contractError);
+      expect(classifyError(code)).toBe("migration");
+      expect(ESCROW_ERROR_LABELS[code]).toBeDefined();
+    });
+  });
+
   // =========================================================================
   // Test: Investor-Specific Queries
   // =========================================================================
@@ -847,6 +936,34 @@ describe("EscrowClient Integration Tests", () => {
       expect(log[0].functionName).toBe("get_contribution");
       expect(log[0].args[0]).toBe(INVESTOR_1);
       expect(typeof contribution).toBe("string");
+    });
+
+    it("should compute investor payout preview as a string i128", async () => {
+      stub.clearInvocationLog();
+      stub.setResponse("compute_investor_payout", "1250000000");
+
+      const payout = await client.computeInvestorPayout(INVESTOR_1);
+
+      const log = stub.getInvocationLog();
+      expect(log).toHaveLength(1);
+      expect(log[0].functionName).toBe("compute_investor_payout");
+      expect(log[0].args[0]).toBe(INVESTOR_1);
+      expect(typeof payout).toBe("string");
+      expect(payout).toBe("1250000000");
+    });
+
+    it("should retrieve distributed principal as a string i128", async () => {
+      stub.clearInvocationLog();
+      stub.setResponse("get_distributed_principal", "987654321");
+
+      const distributed = await client.getDistributedPrincipal();
+
+      const log = stub.getInvocationLog();
+      expect(log).toHaveLength(1);
+      expect(log[0].functionName).toBe("get_distributed_principal");
+      expect(log[0].args).toHaveLength(0);
+      expect(typeof distributed).toBe("string");
+      expect(distributed).toBe("987654321");
     });
 
     it("should retrieve investor yield basis points", async () => {
@@ -1488,4 +1605,60 @@ describe("health check methods", () => {
       expect(log[1].functionName).toBe("get_escrow_health");
     });
   });
+});
+
+test("setLegalHold passes both active and reason arguments", async () => {
+  const mockInvoke = jest.fn().mockResolvedValue(undefined);
+  const rpc: SorobanRpcClient = {
+    invoke: mockInvoke,
+    simulate: jest.fn(),
+    getLedger: jest.fn(),
+  };
+  const client = new EscrowClient({ rpcUrl: "http://localhost", networkPassphrase: "test" }, rpc);
+  client.setContractId("CTEST123");
+
+  // Test activating legal hold with reason
+  await client.setLegalHold(true, "Compliance investigation", "source123");
+  expect(mockInvoke).toHaveBeenCalledWith(
+    "CTEST123",
+    "set_legal_hold",
+    [true, "Compliance investigation"],
+    "source123"
+  );
+
+  // Test deactivating legal hold with empty reason
+  mockInvoke.mockClear();
+  await client.setLegalHold(false, "", "source456");
+  expect(mockInvoke).toHaveBeenCalledWith(
+    "CTEST123",
+    "set_legal_hold",
+    [false, ""],
+    "source456"
+  );
+});
+
+test("setLegalHold rejects empty reason when active=true", async () => {
+  const rpc: SorobanRpcClient = {
+    invoke: jest.fn(),
+    simulate: jest.fn(),
+    getLedger: jest.fn(),
+  };
+  const client = new EscrowClient({ rpcUrl: "http://localhost", networkPassphrase: "test" }, rpc);
+
+  // Should throw when activating with empty reason
+  await expect(client.setLegalHold(true, "")).rejects.toThrow(
+    "reason must be non-empty when legal hold is activated"
+  );
+
+  // Should throw when activating with whitespace-only reason
+  await expect(client.setLegalHold(true, "   ")).rejects.toThrow(
+    "reason must be non-empty when legal hold is activated"
+  );
+
+  // Should not throw when deactivating with empty reason
+  const mockInvoke = jest.fn().mockResolvedValue(undefined);
+  rpc.invoke = mockInvoke;
+  client.setContractId("CTEST123");
+  await client.setLegalHold(false, "");
+  expect(mockInvoke).toHaveBeenCalled();
 });
