@@ -41,6 +41,18 @@ pub struct MaxUniqueInvestorsCapLowered {
     pub new_cap: u32,
 }
 
+/// Emitted when a funding deadline is set or cleared at initialization.
+/// Indexers use this to track deadline changes without polling.
+#[contractevent]
+pub struct FundingDeadlineSet {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// The funding deadline timestamp (in ledger seconds), or None if cleared.
+    pub deadline: Option<u64>,
+}
+
 #[contractevent]
 pub struct EscrowFunded {
     #[topic]

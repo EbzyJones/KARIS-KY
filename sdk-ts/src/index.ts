@@ -35,6 +35,8 @@ export {
   type ErrorDiagnostic,
   type EscrowTemplate,
   type InitParams,
+  type MigrationPreflight,
+  type MigrationRecommendation,
   type AdminRole,
   type SorobanResult,
   type AttestationBoundEvt,

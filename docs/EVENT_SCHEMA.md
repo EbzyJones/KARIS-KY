@@ -33,11 +33,12 @@ short routing symbol passed with `symbol_short!(...)`, such as `funded` or
 
 ## Event Catalog
 
-The event catalog below lists 24 event structs.
+The event catalog below lists 25 event structs.
 
 | Rust event | `name` symbol | Entrypoint(s) |
 |---|---:|---|
 | `EscrowInitialized` | `escrow_ii` | `init` |
+| `FundingDeadlineSet` | `fund_dl` | `init` |
 | `MaxUniqueInvestorsCapLowered` | `inv_cap` | `lower_max_unique_investors` |
 | `EscrowFunded` | `funded` | `fund`, `fund_with_commitment` |
 | `EscrowSettled` | `escrow_sd` | `settle` |
@@ -103,6 +104,29 @@ Data:
 |---|---|
 | `old_cap` | `u32` |
 | `new_cap` | `u32` |
+
+### `FundingDeadlineSet`
+
+Emitted during `init` to capture the funding deadline (or absence thereof). Indexers
+use this to track deadline changes without polling, enabling alerts on deadline updates.
+
+Topics:
+
+| Index | Field | Type | Value |
+|---:|---|---|---|
+| 0 | fixed event topic | `Symbol` | `funding_deadline_set` |
+| 1 | `name` | `Symbol` | `fund_dl` |
+| 2 | `invoice_id` | `Symbol` | Escrow invoice id |
+
+Data:
+
+| Field | Type |
+|---|---|
+| `deadline` | `Option<u64>` |
+
+**Semantics:** `deadline` is a ledger timestamp (Unix seconds). `None` indicates no funding deadline
+was configured (funding remains open indefinitely). When `Some(ts)`, `ts` is the exclusive upper bound
+for funding calls; attempting to `fund` after ledger timestamp `ts` fails with `EscrowError::FundingDeadlinePassed`.
 
 ### `EscrowFunded`
 

@@ -140,7 +140,26 @@ Do not treat `RegistryRef` as a trust anchor in risk engines without independent
 
 ---
 
-## 7) Security notes for indexers
+## 7) Contract schema-version guard
+
+The backend must call `get_version()` at startup and refuse to index the contract
+unless the returned schema version is within the supported range.
+
+- **Supported schema range:** `7` through `7` (inclusive)
+- **Default configuration:** `ESCROW_SUPPORTED_SCHEMA_MIN=7`
+- **Maximum configuration:** `ESCROW_SUPPORTED_SCHEMA_MAX=7`
+
+The supported range is intentionally narrow until every indexer read and state
+projection is verified against a newer storage layout. Operators must not widen
+the range to index an unknown schema. The guard fails before event subscription
+or snapshot reads begin.
+
+The offline snapshot tool applies the same guard in
+[`backend/backup_escrow_state.py`](/workspaces/KARIS-KY/backend/backup_escrow_state.py).
+
+---
+
+## 8) Security notes for indexers
 
 - Unsupported token economics (fee-on-transfer/rebasing/hook tokens) are out of scope for escrow
   accounting and are expected to fail closed at transfer balance checks in

@@ -6,6 +6,24 @@ Fillable checklist for canary deployments. Print and use for each staged rollout
 
 ## Phase 1: Pre-Canary Planning (Day -3 to -1)
 
+### Automated precondition validation
+
+Before proceeding with manual checks, run the automated validator:
+
+```bash
+bash scripts/validate_canary_preconditions.sh
+```
+
+This script checks:
+- ✓ WASM has been built
+- ✓ All CI gates pass (format, lint, tests, coverage ≥95%)
+- ✓ Build metadata matches source constants (schema version, interface version)
+- ✓ Git commit hash is resolvable
+
+**Exit code:** `0` = all preconditions met; proceed to manual checklist. Non-zero = fix errors before continuing.
+
+---
+
 ### Code preparation
 - [ ] New WASM built: `cargo build --target wasm32v1-none --release`
 - [ ] All CI gates pass:

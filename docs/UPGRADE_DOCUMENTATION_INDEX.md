@@ -271,6 +271,40 @@ OPERATOR_RUNBOOK.md ◄──┐
 
 ---
 
+## Build metadata and CI validation (architecture note for contributors)
+
+The WASM build process and CI validation are tightly coupled to prevent version mismatches:
+
+1. **Compile time** (`escrow/build.rs`):
+   - Reads `SCHEMA_VERSION` and `CONTRACT_INTERFACE_VERSION` constants from `escrow/src/lib.rs`
+   - Embeds them into two outputs:
+     - `${OUT_DIR}/build_info.rs` — Rust source file (consumed by WASM bytecode)
+     - `${CARGO_TARGET_DIR}/build_metadata.json` — JSON sidecar (consumed by CI)
+
+2. **CI gate** (`scripts/validate_build_metadata.py`):
+   - Runs after every build to verify the metadata
+   - Reads `build_metadata.json` (produced by build.rs)
+   - Re-extracts `SCHEMA_VERSION` and `CONTRACT_INTERFACE_VERSION` from `escrow/src/lib.rs`
+   - Fails the build if they do not match
+   - Also validates git commit hash and timestamp for traceability
+
+**Why this coupling matters:**
+- If `SCHEMA_VERSION` is changed in `lib.rs` but build.rs is not re-run, the embedded value diverges from source.
+- The validator catches this drift before the WASM is deployed.
+- This prevents a developer from accidentally shipping a WASM with incorrect schema version.
+
+**For contributors:**
+- When changing `SCHEMA_VERSION` or `CONTRACT_INTERFACE_VERSION` in `escrow/src/lib.rs`, always run a full build (`cargo build`) to trigger build.rs.
+- CI will validate the metadata; if validation fails, the build halts.
+- The validator output shows the expected and actual values (helpful for debugging).
+
+**See also:**
+- `escrow/build.rs` — Metadata capture logic and embed points
+- `scripts/validate_build_metadata.py` — Validation logic and acceptance criteria
+- `escrow/src/lib.rs` — Constants that drive the schema version
+
+---
+
 ## Glossary of key terms (from documents)
 
 | Term | Definition | Docs |
