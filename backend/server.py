@@ -1,6 +1,8 @@
 import json
+import logging
 import os
 import re
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -19,6 +21,27 @@ CONTRACT_ID_PATTERN = re.compile(r"^C[A-Z2-7]{55}$")
 SPEC_PATH = Path(__file__).resolve().parent.parent / "sdk-ts" / "spec.json"
 with SPEC_PATH.open(encoding="utf-8") as spec_file:
     ENTRYPOINTS = [entrypoint["name"] for entrypoint in json.load(spec_file)["entrypoints"]]
+
+
+def _log_escrow_summary(contract_id, status):
+    level = "error" if status >= 500 else "warn" if status >= 400 else "info"
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "level": level,
+        "event": "escrow.summary",
+        "escrow_id": contract_id,
+        "status": status,
+    }
+    log_level = (
+        logging.ERROR
+        if status >= 500
+        else logging.WARNING
+        if status >= 400
+        else logging.INFO
+    )
+    logging.getLogger("karis_ky.backend").log(
+        log_level, json.dumps(record, separators=(",", ":"))
+    )
 
 
 def _read_escrow_summary(contract_id):
@@ -53,6 +76,11 @@ def _is_valid_contract_id(contract_id):
 
 class Handler(BaseHTTPRequestHandler):
     def _send_json(self, status, payload):
+        summary_match = re.fullmatch(
+            r"/api/contracts/([^/]+)/summary", urlsplit(self.path).path
+        )
+        if summary_match:
+            _log_escrow_summary(summary_match.group(1), status)
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -111,6 +139,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     server = HTTPServer((HOST, PORT), Handler)
     print(f"Backend listening on http://{HOST}:{PORT}")
     server.serve_forever()

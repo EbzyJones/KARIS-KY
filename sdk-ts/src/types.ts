@@ -270,6 +270,19 @@ export const MAX_INVESTOR_HISTORY_ENTRIES = 128;
 export const MAX_HISTORY_PAGE_SIZE = 50;
 export const MAX_DUST_SWEEP_AMOUNT = "100000000";
 
+/** Recommendation from comparing an escrow's stored schema with the SDK target. */
+export type MigrationRecommendation =
+  | "migration_recommended"
+  | "already_at_target"
+  | "sdk_behind_contract";
+
+/** Result of checking the stored schema version before a migration. */
+export interface MigrationPreflight {
+  currentVersion: number;
+  targetVersion: number;
+  recommendation: MigrationRecommendation;
+}
+
 // ---------------------------------------------------------------------------
 // Typed error codes (mirrors EscrowError in lib.rs)
 // ---------------------------------------------------------------------------
@@ -337,10 +350,11 @@ export enum EscrowErrorCode {
   FundingBatchEmpty = 82,
   FundingBatchTooLarge = 83,
 
-  // Schema migration (90–92)
+  // Schema migration (90–93)
   MigrationVersionMismatch = 90,
   AlreadyCurrentSchemaVersion = 91,
   NoMigrationPath = 92,
+  MigrationAlreadyApplied = 93,
 
   // Funding (100–111)
   FundingAmountNotPositive = 100,
@@ -466,6 +480,7 @@ export const ESCROW_ERROR_LABELS: Record<number, string> = {
   90: "Migration version mismatch",
   91: "Already at current schema version",
   92: "No migration path",
+  93: "Migration already applied",
   100: "Funding amount must be positive",
   101: "Funding amount below min contribution floor",
   102: "Legal hold blocks new funding",
@@ -533,7 +548,7 @@ export const ESCROW_ERROR_CATEGORIES: Record<string, { range: [number, number]; 
   attestation: { range: [50, 51], label: "Attestation failure" },
   collateral: { range: [60, 62], label: "Collateral metadata failure" },
   adminValidation: { range: [70, 83], label: "Administrative validation" },
-  migration: { range: [90, 92], label: "Schema migration failure" },
+  migration: { range: [90, 93], label: "Schema migration failure" },
   funding: { range: [100, 111], label: "Funding failure" },
   settlement: { range: [120, 129], label: "Settlement / payout failure" },
   cancelRefund: { range: [140, 143], label: "Cancel / refund failure" },
