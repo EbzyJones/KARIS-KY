@@ -72,6 +72,7 @@ mod sharding_aggregate_benchmark;
 mod tier_base_yield;
 mod tokenomics;
 mod upgrade_compat;
+mod trace_mode;
 mod validation;
 mod yield_distribution;
 mod yield_tier_table_read;
