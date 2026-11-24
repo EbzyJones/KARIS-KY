@@ -5,6 +5,7 @@ Typed client wrapper for the karis-ky LiquifactEscrow Soroban contract.
 ## Features
 
 - **Typed client** — All contract entrypoints exposed as async methods with full TypeScript support.
+- **Typed event parser** — `parseEvent` maps raw Soroban events to a typed discriminated union covering all 24 event types in `docs/EVENT_SCHEMA.md`.
 - **Error codes** — Stable, append-only error codes with human-readable labels and category helpers.
 - **Contract spec** — Machine-readable ABI bundled for validation and discovery.
 - **Examples** — Complete workflow demonstrations for funding, settlement, and investor claims.
@@ -50,6 +51,73 @@ await client.settle();
 await client.claimInvestorPayout("GINVESTOR...");
 ```
 
+## Typed Event Parser
+
+`parseEvent` turns a raw `EscrowEvent` (as returned by `subscribeEscrowEvents` or any Soroban RPC adapter) into a typed discriminated union. All 24 event types from `docs/EVENT_SCHEMA.md` are covered.
+
+```typescript
+import { parseEvent } from "@karis-ky/escrow-sdk";
+import type { EscrowFundedEvent, EscrowSettledEvent } from "@karis-ky/escrow-sdk";
+
+// Inside a subscribeEscrowEvents loop:
+for await (const rawEvent of client.subscribeEscrowEvents({ start_ledger: 1000 })) {
+  const parsed = parseEvent(rawEvent);
+
+  switch (parsed.type) {
+    case "EscrowFunded": {
+      const e = parsed as EscrowFundedEvent;
+      console.log(`${e.invoice_id} funded: +${e.data.amount} by ${e.investor}`);
+      break;
+    }
+    case "EscrowSettled": {
+      const e = parsed as EscrowSettledEvent;
+      console.log(`${e.invoice_id} settled at ledger ${e.data.settled_at_ledger_timestamp}`);
+      break;
+    }
+    case "Unknown":
+      // Forward-compatible: new events do not throw, they fall here.
+      break;
+  }
+}
+```
+
+### Routing
+
+`parseEvent` routes on `topics[1]`, the karis-ky short event symbol (e.g. `"funded"`, `"escrow_sd"`). The function never throws: unrecognised symbols return `{ type: "Unknown", name, raw }` so callers remain forward-compatible with new contract events.
+
+### Data field access
+
+Numeric `i128`/`i64`/`u64` values are returned as `string` to preserve precision. `u32` counts and flags (e.g. `active`, `allowed`) are returned as `number`. Both plain-object and `{ _map: [...] }` envelope formats are supported, covering all Soroban RPC adapter variants.
+
+### Supported events
+
+| `type` discriminant | Symbol | Entrypoint |
+| --- | --- | --- |
+| `EscrowInitialized` | `escrow_ii` | `init` |
+| `MaxUniqueInvestorsCapLowered` | `inv_cap` | `lower_max_unique_investors` |
+| `EscrowFunded` | `funded` | `fund`, `fund_with_commitment` |
+| `EscrowSettled` | `escrow_sd` | `settle` |
+| `MaturityUpdated` | `maturity` | `update_maturity` |
+| `AdminTransferred` | `admin` | `accept_admin` |
+| `AdminProposed` | `adm_prop` | `propose_admin` |
+| `BeneficiaryRotated` | `ben_rot` | `rotate_beneficiary` |
+| `FundingTargetUpdated` | `fund_tgt` | `update_funding_target` |
+| `LegalHoldChanged` | `legalhld` | `set_legal_hold`, `clear_legal_hold` |
+| `DisputePaused` | `disppause` | `pause_dispute` |
+| `DisputeResumed` | `disp_res` | `resume_dispute` |
+| `LegalHoldProposed` | `lh_prop` | `propose_legal_hold` |
+| `CollateralRecorded` | `coll_rec` | `record_sme_collateral_commitment` |
+| `SmeWithdrew` | `sme_wd` | `withdraw` |
+| `InvestorPayoutClaimed` | `inv_claim` | `claim_investor_payout` |
+| `FundingCancelled` | `fund_can` | `cancel_funding` |
+| `InvestorRefunded` | `refunded` | `refund` |
+| `TreasuryDustSwept` | `dust_sw` | `sweep_terminal_dust` |
+| `PrimaryAttestationBound` | `att_bind` | `bind_primary_attestation_hash` |
+| `AttestationBound` | `att_bound` | `bind_primary_attestation_hash` |
+| `AttestationDigestAppended` | `att_app` | `append_attestation_digest` |
+| `AllowlistEnabledChanged` | `al_ena` | `set_allowlist_active` |
+| `InvestorAllowlistChanged` | `al_set` | `set_investor_allowlisted` |
+
 ## Error Handling
 
 All contract errors are typed. See the [Error Handling Guide](docs/error-handling.md) for:
@@ -58,7 +126,7 @@ All contract errors are typed. See the [Error Handling Guide](docs/error-handlin
 - Error code reference tables for all 40+ error codes
 - Common error patterns by method (fund, settle, claim)
 - Three complete try/catch examples with recovery logic
-- Error recovery strategies
+- Error recovery strategies, including atomic funding batch reconciliation
 
 ### Quick Example
 
@@ -93,10 +161,13 @@ try {
 | --- | --- |
 | [Error Handling Guide](docs/error-handling.md) | How to detect, classify, and handle contract errors in your SDK integration |
 | [Type Definitions](src/types.ts) | All contract types, enums, and constants |
+| [Event Parser](src/events.ts) | `parseEvent` and all typed event structs |
 | [Client Implementation](src/client.ts) | EscrowClient class with all entrypoints |
 | [Example Usage](examples/basic-usage.ts) | Complete workflow demonstration |
 | [Full Lifecycle Example](examples/full-lifecycle.ts) | End-to-end script covering init, funding, settlement, and investor claims |
+| [Yield Claim Delegation Example](examples/yield-claim-delegation.ts) | Set a delegate, claim as that delegate, and revoke the delegation |
 | [Contract Spec](spec.json) | Machine-readable ABI (auto-generated from Rust) |
+| [Event Schema Reference](../docs/EVENT_SCHEMA.md) | Authoritative topic/data layout for all 24 contract events |
 
 ## Contract Entrypoints
 
@@ -108,9 +179,13 @@ try {
 | `fund()` | Record investor principal | investor |
 | `fundWithCommitment()` | First deposit with tiered yield | investor |
 | `fundBatch()` | Batch fund multiple investors | per-investor |
+| `batchFund()` | Atomically fund multiple investors | per-investor |
 | `settle()` | Mark escrow as settled | sme_address |
 | `withdraw()` | SME withdraws liquidity | sme_address |
 | `claimInvestorPayout()` | Investor claims payout after settlement | investor |
+| `setYieldClaimDelegate()` | Investor sets or replaces their claim delegate | investor |
+| `claimPayoutAsDelegate()` | Delegate claims an investor payout | delegate |
+| `revokeYieldClaimDelegate()` | Investor revokes their claim delegate | investor |
 | `cancelFunding()` | Cancel funding round | admin |
 | `refund()` | Refund principal after cancellation | investor |
 | `sweepTerminalDust()` | Treasury sweeps dust from terminal escrow | treasury |
@@ -242,6 +317,17 @@ npm run full-lifecycle
 
 > **Warning:** Secret keys (`ADMIN_SECRET`, `SME_SECRET`, `INVESTOR_SECRET`) must **never** be committed to version control or written to logs. Load them from a secure secret manager or an untracked `.env` file, and use dedicated testnet-only keys when running the example.
 
+## Yield Claim Delegation Example
+
+The `examples/yield-claim-delegation.ts` script demonstrates setting a delegate,
+claiming a payout as that delegate, and revoking the delegation. Its stub RPC
+adapter prints the contract calls; replace it with an adapter that signs set
+and revoke calls as the investor and claim calls as the delegate.
+
+```bash
+npm run delegate-example
+```
+
 ## Schema Versioning
 
 The SDK is versioned in lockstep with the Soroban contract schema. Each release targets a specific `SCHEMA_VERSION`:
@@ -252,15 +338,21 @@ The SDK is versioned in lockstep with the Soroban contract schema. Each release 
 Before deploying, verify your contract schema matches the SDK target:
 
 ```typescript
-const schemaVersion = await client.getVersion();
-const sdkTarget = SCHEMA_VERSION;
+const preflight = await client.preflightMigration();
+console.log(preflight.recommendation);
 
-if (schemaVersion !== sdkTarget) {
-  throw new Error(
-    `Schema mismatch: contract v${schemaVersion}, SDK targets v${sdkTarget}`,
-  );
+if (preflight.recommendation === "migration_recommended") {
+  const fromVersion = 7; // Set this explicitly for the planned migration.
+  await client.dryRunMigrate(fromVersion);
+  await client.migrate(fromVersion);
 }
 ```
+
+`preflightMigration(targetVersion?)` compares `getVersion()` with the supplied target
+(defaulting to `SCHEMA_VERSION`) and returns `migration_recommended`,
+`already_at_target`, or `sdk_behind_contract`. `dryRunMigrate(fromVersion)` simulates
+the migration without submitting it. Both migration methods preserve contract errors
+90–93 for callers to handle; see the [error handling guide](docs/error-handling.md).
 
 ## Building from Source
 

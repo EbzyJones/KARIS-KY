@@ -1,6 +1,6 @@
 // karis-ky Escrow SDK — Public API
 //
-// Re-exports all types, constants, and the client class.
+// Re-exports all types, constants, the client class, and the event parser.
 
 export {
   EscrowClient,
@@ -12,21 +12,18 @@ export {
 } from "./client";
 
 export {
+  filterFundingBatchForRetry,
+  type FundingBatchEntry,
+  type FundingBatchRetryState,
+} from "./batch-retry";
+
+export {
   EscrowStatus,
   ESCROW_STATUS_LABELS,
   EscrowErrorCode,
   ESCROW_ERROR_LABELS,
   ESCROW_ERROR_CATEGORIES,
   classifyError,
-  SCHEMA_VERSION,
-  CONTRACT_INTERFACE_VERSION,
-  MAX_INVOICE_ID_STRING_LEN,
-  MAX_ATTESTATION_APPEND_ENTRIES,
-  MAX_INVESTOR_ALLOWLIST_BATCH,
-  MAX_FUND_BATCH,
-  MAX_INVESTOR_HISTORY_ENTRIES,
-  MAX_HISTORY_PAGE_SIZE,
-  MAX_DUST_SWEEP_AMOUNT,
   toBaseUnits,
   fromBaseUnits,
   parseResult,
@@ -43,8 +40,9 @@ export {
   type EscrowSnapshot,
   type ErrorDiagnostic,
   type EscrowTemplate,
-  type InvestorCapStatus,
   type InitParams,
+  type MigrationPreflight,
+  type MigrationRecommendation,
   type AdminRole,
   type SorobanResult,
   type AttestationBoundEvt,
@@ -54,3 +52,33 @@ export {
   type CheckEscrowHealth,
   type EscrowHealth,
 } from "./types";
+
+export {
+  parseEvent,
+  type ParsedEscrowEvent,
+  type EscrowInitializedEvent,
+  type MaxUniqueInvestorsCapLoweredEvent,
+  type EscrowFundedEvent,
+  type EscrowSettledEvent,
+  type MaturityUpdatedEvent,
+  type AdminTransferredEvent,
+  type AdminProposedEvent,
+  type BeneficiaryRotatedEvent,
+  type FundingTargetUpdatedEvent,
+  type LegalHoldChangedEvent,
+  type DisputePausedEvent,
+  type DisputeResumedEvent,
+  type LegalHoldProposedEvent,
+  type CollateralRecordedEvent,
+  type SmeWithdrewEvent,
+  type InvestorPayoutClaimedEvent,
+  type FundingCancelledEvent,
+  type InvestorRefundedEvent,
+  type TreasuryDustSweptEvent,
+  type PrimaryAttestationBoundEvent,
+  type AttestationBoundEvent,
+  type AttestationDigestAppendedEvent,
+  type AllowlistEnabledChangedEvent,
+  type InvestorAllowlistChangedEvent,
+  type UnknownEvent,
+} from "./events";

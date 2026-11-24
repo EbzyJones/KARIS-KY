@@ -333,4 +333,185 @@ mod tests {
         // should be false
         assert_eq!(report.funded_exceeds_target_stale, false);
     }
+
+    #[test]
+    fn test_detect_inconsistencies_smoke_test_healthy_escrow() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        let (client, admin, sme) = setup(&env);
+        let (token, treasury) = free_addresses(&env);
+
+        // Initialize a simple, healthy escrow
+        client.init(
+            &admin,
+            &String::from_str(&env, "SMOKE_HEALTHY"),
+            &sme,
+            &1_000_000i128,
+            &800i64,
+            &86_400u64 * 30,
+            &token,
+            &None,
+            &treasury,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+        );
+
+        // Call detect_state_inconsistencies on a fresh, healthy escrow
+        let report = client.detect_state_inconsistencies();
+
+        // All flags should be false for a healthy escrow
+        assert_eq!(report.funded_exceeds_target_stale, false, "No funded > target");
+        assert_eq!(report.funded_positive_status_open, false, "No funded but open");
+        assert_eq!(report.funded_zero_status_advanced, false, "No zero funded with advanced status");
+        assert_eq!(report.funders_exist_status_open, false, "No funders with open status");
+        assert_eq!(report.no_funders_advanced_status, false, "Not missing funders");
+        assert_eq!(report.snapshot_exists_not_funded, false, "No snapshot mismatch");
+        assert_eq!(report.snapshot_missing_post_funded, false, "Snapshot state OK");
+        assert_eq!(report.settled_before_maturity_lock, false, "Maturity not violated");
+        assert_eq!(report.invalid_funding_amounts, false, "Funding amounts valid");
+        assert_eq!(report.invalid_status_value, false, "Status value valid");
+    }
+
+    #[test]
+    fn test_detect_inconsistencies_corrupted_funded_exceeds_target() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        let (client, admin, sme) = setup(&env);
+        let token = install_stellar_asset_token(&env);
+        let treasury = Address::generate(&env);
+
+        let investor = Address::generate(&env);
+        token.stellar.mint(&investor, &1_000_000_000i128);
+
+        // Initialize with low target
+        client.init(
+            &admin,
+            &String::from_str(&env, "CORRUPT_FUND_EXCEED"),
+            &sme,
+            &1000,  // amount
+            &400,   // funding_target = 400
+            &(365 * 24 * 60 * 60),
+            &token.id,
+            &None,
+            &treasury,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+        );
+
+        // Fund with 600 (exceeds the 400 target, creating an inconsistency)
+        client.fund(&investor, &600);
+
+        let report = client.detect_state_inconsistencies();
+
+        // This should flag the inconsistency
+        assert_eq!(
+            report.funded_exceeds_target_stale, true,
+            "Should detect funded_amount > funding_target"
+        );
+    }
+
+    #[test]
+    fn test_detect_inconsistencies_corrupted_funded_positive_open_status() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        let (client, admin, sme) = setup(&env);
+        let token = install_stellar_asset_token(&env);
+        let treasury = Address::generate(&env);
+
+        let investor = Address::generate(&env);
+        token.stellar.mint(&investor, &1_000_000_000i128);
+
+        // Initialize with high target
+        client.init(
+            &admin,
+            &String::from_str(&env, "CORRUPT_OPEN_FUNDED"),
+            &sme,
+            &1000,  // amount
+            &950,   // funding_target (high)
+            &(365 * 24 * 60 * 60),
+            &token.id,
+            &None,
+            &treasury,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+        );
+
+        // Fund with only a small amount (100), leaving status at 0 (open) but funded_amount > 0
+        client.fund(&investor, &100);
+
+        let report = client.detect_state_inconsistencies();
+
+        // This should flag the inconsistency: funded_positive but status_open
+        assert_eq!(
+            report.funded_positive_status_open, true,
+            "Should detect funded_amount > 0 with status 0 (open)"
+        );
+    }
+
+    #[test]
+    fn test_detect_inconsistencies_emits_event_when_inconsistencies_found() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        let (client, admin, sme) = setup(&env);
+        let token = install_stellar_asset_token(&env);
+        let treasury = Address::generate(&env);
+
+        let investor = Address::generate(&env);
+        token.stellar.mint(&investor, &1_000_000_000i128);
+
+        // Create an escrow with inconsistencies
+        client.init(
+            &admin,
+            &String::from_str(&env, "CORRUPT_EVENT_TEST"),
+            &sme,
+            &1000,
+            &400,
+            &(365 * 24 * 60 * 60),
+            &token.id,
+            &None,
+            &treasury,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+        );
+
+        // Fund to trigger inconsistency
+        client.fund(&investor, &600);
+
+        // Now call detect_state_inconsistencies and verify an event is emitted
+        let report = client.detect_state_inconsistencies();
+        assert_eq!(report.funded_exceeds_target_stale, true);
+
+        // Check for StateInconsistenciesDetected event
+        let all_events = env.events().all();
+        let inconsistency_events: Vec<_> = all_events
+            .events()
+            .iter()
+            .filter(|e| {
+                let event_str = format!("{:?}", e);
+                event_str.contains("state_inc") || event_str.contains("StateInconsistencies")
+            })
+            .collect();
+
+        assert!(
+            !inconsistency_events.is_empty(),
+            "StateInconsistenciesDetected event should be emitted when inconsistencies are found"
+        );
+    }
 }
+

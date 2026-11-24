@@ -158,6 +158,19 @@ jobs:
             --script scripts/pre-flight-checklist.sh \
             --lib escrow/src/lib.rs
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Install frontend test dependencies
+        run: npm ci --prefix docs
+
+      - name: Run frontend accessibility checks
+        run: npm run test:a11y --prefix docs
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@671164c891d3e20f5b8ece04798d0154d1262d65 # cargo-llvm-cov
 
@@ -379,6 +392,16 @@ jobs:
         env:
           SCHEMA_VERSION: "6"
           INTERFACE_VERSION: "1"
+
+      - name: Validate SDK method and type coverage
+        # Ensures all public contract methods and types from spec.json are
+        # represented in the TypeScript SDK. Fails CI if SDK is out of sync
+        # with the contract ABI, preventing silent SDK-contract drift.
+        run: |
+          python3 scripts/validate_sdk_coverage.py \
+            --spec sdk-ts/spec.json \
+            --client sdk-ts/src/client.ts \
+            --types sdk-ts/src/types.ts
 
       - name: Upload contract spec artifact
         if: always()
