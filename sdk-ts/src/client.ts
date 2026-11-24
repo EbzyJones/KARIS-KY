@@ -317,6 +317,10 @@ export class EscrowClient {
     return this.simulate("get_legal_hold_status", []);
   }
 
+  async isDisputePauseActive(): Promise<boolean> {
+    return this.simulate("is_dispute_pause_active", []);
+  }
+
   async getContribution(investor: string): Promise<string> {
     return this.simulate("get_contribution", [investor]);
   }
@@ -589,14 +593,6 @@ export class EscrowClient {
     source?: string,
   ): Promise<InvoiceEscrow> {
     return this.invoke("fund_with_commitment", [investor, amount, committedLockSecs], source);
-  }
-
-  /** Batch fund multiple investors. Auth: per-investor. Max 50 entries. */
-  async fundBatch(
-    entries: Array<[string, string]>,
-    source?: string,
-  ): Promise<InvoiceEscrow> {
-    return this.invoke("fund_batch", [entries], source);
   }
 
   /**
