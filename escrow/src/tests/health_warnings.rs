@@ -263,6 +263,57 @@ fn test_no_health_warning_no_maturity_constraint() {
 }
 
 #[test]
+fn test_low_funding_fund_call_succeeds_and_emits_4001() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = super::setup(&env);
+    let investor = Address::generate(&env);
+    let target = 1_000_000i128;
+
+    client.init(
+        &admin,
+        &SorobanString::from_str(&env, "INV_WARN_NONBLOCK"),
+        &sme,
+        &target,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Fund at 40% of target to trigger low-funding warning (4001)
+    let fund_amount = 400_000i128;
+    
+    // This call must NOT revert, even though it emits a warning
+    client.fund(&investor, &fund_amount);
+
+    // Verify the fund succeeded
+    let escrow = client.get_escrow();
+    assert_eq!(
+        escrow.funded_amount, fund_amount,
+        "Fund call should succeed despite 4001 warning"
+    );
+
+    // Verify the warning is emitted
+    let (warning_type, funded_ratio_bps, _) = client.check_escrow_health();
+    assert_eq!(
+        warning_type, 4001,
+        "Low funding should emit warning code 4001"
+    );
+    assert_eq!(
+        funded_ratio_bps, 4000,
+        "Funded ratio should be 40% = 4000 bps"
+    );
+}
+
+#[test]
 fn test_no_health_warning_settled_escrow() {
     let env = Env::default();
     let (client, admin, sme) = super::setup(&env);
