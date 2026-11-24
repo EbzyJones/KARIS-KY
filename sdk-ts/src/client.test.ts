@@ -8,13 +8,33 @@
  * All tests use a stub Stellar SDK to avoid live network connections.
  */
 
-import { EscrowClient, SorobanRpcClient } from "./client";
+import { EscrowClient, type SorobanRpcClient } from "./client";
 import {
-  EscrowClient,
+  EscrowStatus,
+  ESCROW_STATUS_LABELS,
+  EscrowErrorCode,
+  ESCROW_ERROR_LABELS,
+  classifyError,
+  type InvoiceEscrow,
+  type YieldTier,
+  type FundingCloseSnapshot,
+  type SmeCollateralCommitment,
+  type EscrowSummary,
+  type EscrowSnapshot,
+  type ErrorDiagnostic,
+  type EscrowTemplate,
+  type InitParams,
+  type SorobanResult,
   type EscrowEvent,
-  type SorobanEventQuery,
-  type SorobanRpcClient,
+  type SorobanEventPage,
+  type EscrowEventSubscriptionOptions,
+  SCHEMA_VERSION,
+  CONTRACT_INTERFACE_VERSION,
+  MAX_INVOICE_ID_STRING_LEN,
+  MAX_DUST_SWEEP_AMOUNT,
+  MAX_FUND_BATCH,
   ValidationError,
+  toBaseUnits,
 } from "./index";
 
 const event = (name: string, ledger: number): EscrowEvent => ({
@@ -63,6 +83,7 @@ class StubSorobanClient implements SorobanRpcClient {
     this.responses.set("get_funding_token", "C" + "A".repeat(55)); // Mock token address
     this.responses.set("get_treasury", "C" + "B".repeat(55)); // Mock treasury address
     this.responses.set("get_legal_hold", false);
+    this.responses.set("get_legal_hold_status", false);
     this.responses.set("get_unique_funder_count", 1);
     this.responses.set("get_min_contribution_floor", "100000000"); // 1 unit in base units
   }
@@ -110,6 +131,9 @@ class StubSorobanClient implements SorobanRpcClient {
     if (functionName === "get_funding_close_snapshot") {
       return this.createMockFundingCloseSnapshot();
     }
+    if (functionName === "get_investor_position") {
+      return this.createMockInvestorPosition();
+    }
 
     throw new Error(`Unexpected simulate call: ${functionName}`);
   }
@@ -131,7 +155,7 @@ class StubSorobanClient implements SorobanRpcClient {
     }
 
     // Default fallback responses
-    if (functionName === "init") {
+    if (functionName === "init" || functionName === "init_with_guardian") {
       return {
         ...this.createMockEscrow(),
         status: EscrowStatus.Open,
@@ -202,6 +226,7 @@ class StubSorobanClient implements SorobanRpcClient {
     return {
       invoice_id: "INV001",
       admin: "G" + "A".repeat(55),
+      guardian: null,
       sme_address: "G" + "B".repeat(55),
       amount: "100000000000",
       funding_target: "100000000000",
@@ -224,6 +249,9 @@ class StubSorobanClient implements SorobanRpcClient {
       sme_collateral_commitment: null,
       has_primary_attestation: false,
       attestation_log_length: 0,
+      dispute_pause_active: false,
+      dispute_pause_expiry: null,
+      allowlist_active: false,
     };
   }
 
@@ -233,6 +261,16 @@ class StubSorobanClient implements SorobanRpcClient {
       funding_target: "100000000000",
       closed_at_ledger_timestamp: "1700000000",
       closed_at_ledger_sequence: 123456,
+    };
+  }
+
+  private createMockInvestorPosition(): unknown {
+    return {
+      contribution: "500000000",
+      yield_bps: "800",
+      claim_not_before: "1700000000",
+      claimed: false,
+      refunded: false,
     };
   }
 }
@@ -321,7 +359,9 @@ describe("EscrowClient Integration Tests", () => {
       expect(args[12]).toBe(toBaseUnits("50000", 7)); // max_per_investor: i128
       expect(args[13]).toBe("604800"); // legal_hold_clear_delay: u64
       expect(args[14]).toBe("1700086400"); // funding_deadline: u64
-      expect(args[15]).toBe("50"); // yield_slippage_threshold: i64
+      expect(args[15]).toBeNull(); // max_funding_rate: Option<u64>
+      expect(args[16]).toBe("50"); // yield_slippage_threshold: i64
+      expect(args.slice(17)).toEqual([null, null, null, null]);
 
       // Verify return type
       expect(result).toBeDefined();
@@ -361,6 +401,77 @@ describe("EscrowClient Integration Tests", () => {
       expect(args[12]).toBeNull(); // max_per_investor is null
 
       expect(result).toBeDefined();
+    });
+
+    it("should reject invoice ids longer than the maximum before invoking the network", async () => {
+      const boundaryId = "A".repeat(MAX_INVOICE_ID_STRING_LEN);
+      const tooLongId = "A".repeat(MAX_INVOICE_ID_STRING_LEN + 1);
+
+      const validParams: InitParams = {
+        admin: ADMIN,
+        invoice_id: boundaryId,
+        sme_address: SME,
+        amount: toBaseUnits("1000", 7),
+        yield_bps: "800",
+        maturity: "0",
+        funding_token: FUNDING_TOKEN,
+        registry: null,
+        treasury: TREASURY,
+        yield_tiers: null,
+        min_contribution: null,
+        max_unique_investors: null,
+        max_per_investor: null,
+        legal_hold_clear_delay: null,
+        funding_deadline: null,
+        yield_slippage_threshold: null,
+      };
+
+      await expect(client.init(validParams)).resolves.toBeDefined();
+      expect(stub.getInvocationLog()).toHaveLength(1);
+
+      stub.clearInvocationLog();
+
+      const invalidParams: InitParams = {
+        ...validParams,
+        invoice_id: tooLongId,
+      };
+
+      await expect(client.init(invalidParams)).rejects.toThrow(
+        new ValidationError(
+          `invoice_id must be 1..=${MAX_INVOICE_ID_STRING_LEN} ASCII characters [A-Za-z0-9_] and cannot exceed ${MAX_INVOICE_ID_STRING_LEN} bytes`,
+        ).message,
+      );
+      expect(stub.getInvocationLog()).toHaveLength(0);
+    });
+
+    it("should place the guardian immediately after admin", async () => {
+      const params: InitParams = {
+        admin: ADMIN,
+        invoice_id: "INV003",
+        sme_address: SME,
+        amount: "500000000000",
+        yield_bps: "500",
+        maturity: "0",
+        funding_token: FUNDING_TOKEN,
+        registry: null,
+        treasury: TREASURY,
+        yield_tiers: null,
+        min_contribution: null,
+        max_unique_investors: null,
+        max_per_investor: null,
+        legal_hold_clear_delay: null,
+        funding_deadline: null,
+        yield_slippage_threshold: null,
+      };
+
+      await client.initWithGuardian(params, INVESTOR_1);
+
+      const initCall = stub.getInvocationLog()[0];
+      expect(initCall.functionName).toBe("init_with_guardian");
+      expect(initCall.args[0]).toBe(ADMIN);
+      expect(initCall.args[1]).toBe(INVESTOR_1);
+      expect(initCall.args[2]).toBe("INV003");
+      expect(initCall.args).toHaveLength(22);
     });
   });
 
@@ -626,6 +737,9 @@ describe("EscrowClient Integration Tests", () => {
       expect(summary.sme_collateral_commitment).toBeDefined();
       expect(summary.has_primary_attestation).toBeDefined();
       expect(summary.attestation_log_length).toBeDefined();
+      expect(summary.dispute_pause_active).toBeDefined();
+      expect(summary.dispute_pause_expiry).toBeDefined();
+      expect(summary.allowlist_active).toBeDefined();
 
       // Validate types
       expect(typeof summary.has_maturity_lock).toBe("boolean");
@@ -635,6 +749,9 @@ describe("EscrowClient Integration Tests", () => {
       expect(typeof summary.schema_version).toBe("number");
       expect(typeof summary.has_primary_attestation).toBe("boolean");
       expect(typeof summary.attestation_log_length).toBe("number");
+      expect(typeof summary.dispute_pause_active).toBe("boolean");
+      expect(summary.dispute_pause_expiry).toBeNull();
+      expect(typeof summary.allowlist_active).toBe("boolean");
     });
 
     it("should assert funding close snapshot structure", async () => {
@@ -705,6 +822,16 @@ describe("EscrowClient Integration Tests", () => {
       expect(typeof held).toBe("boolean");
     });
 
+    it("should retrieve legal hold status from the status entrypoint", async () => {
+      stub.clearInvocationLog();
+
+      const held = await client.getLegalHoldStatus();
+
+      const log = stub.getInvocationLog();
+      expect(log[0].functionName).toBe("get_legal_hold_status");
+      expect(typeof held).toBe("boolean");
+    });
+
     it("should retrieve unique funder count", async () => {
       stub.clearInvocationLog();
 
@@ -714,6 +841,84 @@ describe("EscrowClient Integration Tests", () => {
       expect(log[0].functionName).toBe("get_unique_funder_count");
       expect(typeof count).toBe("number");
       expect(count).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  describe("migration helpers", () => {
+    it("migrates from the supplied version and returns the resulting version", async () => {
+      stub.clearInvocationLog();
+      stub.setResponse("migrate", SCHEMA_VERSION);
+
+      await expect(client.migrate(SCHEMA_VERSION, ADMIN)).resolves.toBe(SCHEMA_VERSION);
+      expect(stub.getInvocationLog()).toEqual([
+        {
+          method: "invoke",
+          functionName: "migrate",
+          args: [SCHEMA_VERSION],
+          source: ADMIN,
+        },
+      ]);
+    });
+
+    it("dry-runs migration through a read-only simulation", async () => {
+      stub.clearInvocationLog();
+      stub.setResponse("dry_run_migrate", SCHEMA_VERSION);
+
+      await expect(client.dryRunMigrate(SCHEMA_VERSION)).resolves.toBe(SCHEMA_VERSION);
+      expect(stub.getInvocationLog()).toEqual([
+        {
+          method: "simulate",
+          functionName: "dry_run_migrate",
+          args: [SCHEMA_VERSION],
+        },
+      ]);
+    });
+
+    it.each([
+      [SCHEMA_VERSION - 1, SCHEMA_VERSION, "migration_recommended"],
+      [SCHEMA_VERSION, SCHEMA_VERSION, "already_at_target"],
+      [SCHEMA_VERSION + 1, SCHEMA_VERSION, "sdk_behind_contract"],
+    ] as const)(
+      "for current version %s and target %s returns %s",
+      async (currentVersion, targetVersion, recommendation) => {
+        stub.clearInvocationLog();
+        stub.setResponse("get_version", currentVersion);
+
+        await expect(client.preflightMigration(targetVersion)).resolves.toEqual({
+          currentVersion,
+          targetVersion,
+          recommendation,
+        });
+        expect(stub.getInvocationLog()).toEqual([
+          { method: "simulate", functionName: "get_version", args: [] },
+        ]);
+      },
+    );
+
+    it("uses the SDK schema version as the default pre-flight target", async () => {
+      stub.setResponse("get_version", SCHEMA_VERSION);
+
+      await expect(client.preflightMigration()).resolves.toEqual({
+        currentVersion: SCHEMA_VERSION,
+        targetVersion: SCHEMA_VERSION,
+        recommendation: "already_at_target",
+      });
+    });
+
+    it.each([
+      EscrowErrorCode.MigrationVersionMismatch,
+      EscrowErrorCode.AlreadyCurrentSchemaVersion,
+      EscrowErrorCode.NoMigrationPath,
+      EscrowErrorCode.MigrationAlreadyApplied,
+    ])("preserves typed migration error %i from migrate and dry-run", async (code) => {
+      const contractError = Object.assign(new Error(`Contract error ${code}`), { code });
+      jest.spyOn(stub, "invoke").mockRejectedValueOnce(contractError);
+      jest.spyOn(stub, "simulate").mockRejectedValueOnce(contractError);
+
+      await expect(client.migrate(SCHEMA_VERSION)).rejects.toBe(contractError);
+      await expect(client.dryRunMigrate(SCHEMA_VERSION)).rejects.toBe(contractError);
+      expect(classifyError(code)).toBe("migration");
+      expect(ESCROW_ERROR_LABELS[code]).toBeDefined();
     });
   });
 
@@ -731,6 +936,34 @@ describe("EscrowClient Integration Tests", () => {
       expect(log[0].functionName).toBe("get_contribution");
       expect(log[0].args[0]).toBe(INVESTOR_1);
       expect(typeof contribution).toBe("string");
+    });
+
+    it("should compute investor payout preview as a string i128", async () => {
+      stub.clearInvocationLog();
+      stub.setResponse("compute_investor_payout", "1250000000");
+
+      const payout = await client.computeInvestorPayout(INVESTOR_1);
+
+      const log = stub.getInvocationLog();
+      expect(log).toHaveLength(1);
+      expect(log[0].functionName).toBe("compute_investor_payout");
+      expect(log[0].args[0]).toBe(INVESTOR_1);
+      expect(typeof payout).toBe("string");
+      expect(payout).toBe("1250000000");
+    });
+
+    it("should retrieve distributed principal as a string i128", async () => {
+      stub.clearInvocationLog();
+      stub.setResponse("get_distributed_principal", "987654321");
+
+      const distributed = await client.getDistributedPrincipal();
+
+      const log = stub.getInvocationLog();
+      expect(log).toHaveLength(1);
+      expect(log[0].functionName).toBe("get_distributed_principal");
+      expect(log[0].args).toHaveLength(0);
+      expect(typeof distributed).toBe("string");
+      expect(distributed).toBe("987654321");
     });
 
     it("should retrieve investor yield basis points", async () => {
@@ -775,6 +1008,27 @@ describe("EscrowClient Integration Tests", () => {
       expect(log[0].functionName).toBe("is_investor_refunded");
       expect(log[0].args[0]).toBe(INVESTOR_1);
       expect(typeof refunded).toBe("boolean");
+    });
+
+    it("should retrieve the aggregated investor position", async () => {
+      stub.clearInvocationLog();
+
+      const position = await client.getInvestorPosition(INVESTOR_1);
+
+      const log = stub.getInvocationLog();
+      expect(log).toHaveLength(1);
+      const getCall = log[0];
+
+      expect(getCall.method).toBe("simulate");
+      expect(getCall.functionName).toBe("get_investor_position");
+      expect(getCall.args[0]).toBe(INVESTOR_1);
+
+      expect(position).toBeDefined();
+      expect(position.contribution).toBe("500000000");
+      expect(position.yield_bps).toBe("800");
+      expect(position.claim_not_before).toBe("1700000000");
+      expect(position.claimed).toBe(false);
+      expect(position.refunded).toBe(false);
     });
   });
 
@@ -1067,4 +1321,344 @@ test("appendAttestationDigest passes rate-limit errors through unchanged", async
   const client = new EscrowClient({ rpcUrl: "http://localhost", networkPassphrase: "test" }, rpc);
 
   await expect(client.appendAttestationDigest(new Uint8Array(32))).rejects.toBe(rateLimitError);
+});
+
+
+// =========================================================================
+// Test: Health Check Methods
+// =========================================================================
+
+describe("health check methods", () => {
+  let client: EscrowClient;
+  let stub: StubSorobanClient;
+
+  const CONTRACT_ID = "CBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+  beforeEach(() => {
+    stub = new StubSorobanClient();
+    client = new EscrowClient(
+      {
+        rpcUrl: "http://localhost:8000/soroban/rpc",
+        networkPassphrase: "Test SDF Network ; September 2015",
+        contractId: CONTRACT_ID,
+      },
+      stub,
+    );
+  });
+
+  describe("checkEscrowHealth", () => {
+    it("should retrieve quick health check with correct parameters for XDR", async () => {
+      stub.clearInvocationLog();
+
+      // Mock response for check_escrow_health
+      stub.setResponse("check_escrow_health", {
+        warning_type: "healthy",
+        funded_ratio_bps: "10000", // 100% funded
+        time_to_maturity_secs: "7776000", // 90 days remaining
+      });
+
+      const health = await client.checkEscrowHealth();
+
+      const log = stub.getInvocationLog();
+      expect(log).toHaveLength(1);
+      const healthCall = log[0];
+
+      expect(healthCall.method).toBe("simulate");
+      expect(healthCall.functionName).toBe("check_escrow_health");
+      expect(healthCall.args).toHaveLength(0); // No parameters
+
+      expect(health).toBeDefined();
+      expect(health.warning_type).toBe("healthy");
+      expect(health.funded_ratio_bps).toBe("10000");
+      expect(health.time_to_maturity_secs).toBe("7776000");
+    });
+
+    it("should validate checkEscrowHealth return type structure", async () => {
+      stub.setResponse("check_escrow_health", {
+        warning_type: "underfunded",
+        funded_ratio_bps: "5000", // 50% funded
+        time_to_maturity_secs: "2592000", // 30 days remaining
+      });
+
+      const health = await client.checkEscrowHealth();
+
+      // Validate all required fields exist and have correct types
+      expect(typeof health.warning_type).toBe("string");
+      expect(typeof health.funded_ratio_bps).toBe("string");
+      expect(typeof health.time_to_maturity_secs).toBe("string");
+
+      // Validate value ranges
+      expect(["healthy", "underfunded", "approaching_maturity", "maturity_passed", "legal_hold"]).toContain(health.warning_type);
+      // funded_ratio_bps should be 0-10000 (0-100%)
+      const ratio = parseInt(health.funded_ratio_bps);
+      expect(ratio).toBeGreaterThanOrEqual(0);
+      expect(ratio).toBeLessThanOrEqual(10000);
+    });
+
+    it("should handle underfunded warning", async () => {
+      stub.setResponse("check_escrow_health", {
+        warning_type: "underfunded",
+        funded_ratio_bps: "3000", // 30% funded
+        time_to_maturity_secs: "86400", // 1 day remaining
+      });
+
+      const health = await client.checkEscrowHealth();
+
+      expect(health.warning_type).toBe("underfunded");
+      expect(parseInt(health.funded_ratio_bps)).toBeLessThan(10000);
+    });
+
+    it("should handle maturity approaching warning", async () => {
+      stub.setResponse("check_escrow_health", {
+        warning_type: "approaching_maturity",
+        funded_ratio_bps: "8000", // 80% funded
+        time_to_maturity_secs: "259200", // 3 days remaining
+      });
+
+      const health = await client.checkEscrowHealth();
+
+      expect(health.warning_type).toBe("approaching_maturity");
+      const timeToMaturity = parseInt(health.time_to_maturity_secs);
+      expect(timeToMaturity).toBeLessThan(604800); // Less than 7 days
+    });
+
+    it("should handle maturity passed warning", async () => {
+      stub.setResponse("check_escrow_health", {
+        warning_type: "maturity_passed",
+        funded_ratio_bps: "10000",
+        time_to_maturity_secs: "-86400", // -1 day (overdue)
+      });
+
+      const health = await client.checkEscrowHealth();
+
+      expect(health.warning_type).toBe("maturity_passed");
+      expect(parseInt(health.time_to_maturity_secs)).toBeLessThan(0);
+    });
+
+    it("should handle legal hold warning", async () => {
+      stub.setResponse("check_escrow_health", {
+        warning_type: "legal_hold",
+        funded_ratio_bps: "10000",
+        time_to_maturity_secs: "2592000",
+      });
+
+      const health = await client.checkEscrowHealth();
+
+      expect(health.warning_type).toBe("legal_hold");
+    });
+  });
+
+  describe("getEscrowHealth", () => {
+    it("should retrieve full health diagnostic with correct parameters for XDR", async () => {
+      stub.clearInvocationLog();
+
+      // Mock response for get_escrow_health
+      stub.setResponse("get_escrow_health", {
+        warning_type: "healthy",
+        funded_ratio_bps: "10000",
+        time_to_maturity_secs: "7776000",
+        status_label: "Funded",
+        is_maturity_locked: false,
+        is_legal_held: false,
+        unique_funder_count: 5,
+      });
+
+      const fullHealth = await client.getEscrowHealth();
+
+      const log = stub.getInvocationLog();
+      expect(log).toHaveLength(1);
+      const healthCall = log[0];
+
+      expect(healthCall.method).toBe("simulate");
+      expect(healthCall.functionName).toBe("get_escrow_health");
+      expect(healthCall.args).toHaveLength(0);
+
+      expect(fullHealth).toBeDefined();
+      expect(fullHealth.warning_type).toBe("healthy");
+      expect(fullHealth.funded_ratio_bps).toBe("10000");
+      expect(fullHealth.time_to_maturity_secs).toBe("7776000");
+      expect(fullHealth.status_label).toBe("Funded");
+      expect(fullHealth.is_maturity_locked).toBe(false);
+      expect(fullHealth.is_legal_held).toBe(false);
+      expect(fullHealth.unique_funder_count).toBe(5);
+    });
+
+    it("should validate getEscrowHealth return type structure", async () => {
+      stub.setResponse("get_escrow_health", {
+        warning_type: "underfunded",
+        funded_ratio_bps: "4500",
+        time_to_maturity_secs: "1296000",
+        status_label: "Open",
+        is_maturity_locked: false,
+        is_legal_held: false,
+        unique_funder_count: 2,
+      });
+
+      const fullHealth = await client.getEscrowHealth();
+
+      // Validate all required fields exist with correct types
+      expect(typeof fullHealth.warning_type).toBe("string");
+      expect(typeof fullHealth.funded_ratio_bps).toBe("string");
+      expect(typeof fullHealth.time_to_maturity_secs).toBe("string");
+      expect(typeof fullHealth.status_label).toBe("string");
+      expect(typeof fullHealth.is_maturity_locked).toBe("boolean");
+      expect(typeof fullHealth.is_legal_held).toBe("boolean");
+      expect(typeof fullHealth.unique_funder_count).toBe("number");
+
+      // Validate status label is one of the expected values
+      expect(["Open", "Funded", "Settled", "Withdrawn", "Cancelled"]).toContain(fullHealth.status_label);
+    });
+
+    it("should handle full health diagnostic with legal hold", async () => {
+      stub.setResponse("get_escrow_health", {
+        warning_type: "legal_hold",
+        funded_ratio_bps: "7500",
+        time_to_maturity_secs: "5184000",
+        status_label: "Funded",
+        is_maturity_locked: true,
+        is_legal_held: true,
+        unique_funder_count: 10,
+      });
+
+      const fullHealth = await client.getEscrowHealth();
+
+      expect(fullHealth.warning_type).toBe("legal_hold");
+      expect(fullHealth.is_legal_held).toBe(true);
+      expect(fullHealth.is_maturity_locked).toBe(true);
+      expect(fullHealth.unique_funder_count).toBe(10);
+    });
+
+    it("should handle full health diagnostic in settled state", async () => {
+      stub.setResponse("get_escrow_health", {
+        warning_type: "healthy",
+        funded_ratio_bps: "10000",
+        time_to_maturity_secs: "0",
+        status_label: "Settled",
+        is_maturity_locked: false,
+        is_legal_held: false,
+        unique_funder_count: 3,
+      });
+
+      const fullHealth = await client.getEscrowHealth();
+
+      expect(fullHealth.status_label).toBe("Settled");
+      expect(fullHealth.unique_funder_count).toBe(3);
+    });
+
+    it("should include all investor metrics in full health check", async () => {
+      stub.setResponse("get_escrow_health", {
+        warning_type: "healthy",
+        funded_ratio_bps: "8500",
+        time_to_maturity_secs: "3888000",
+        status_label: "Funded",
+        is_maturity_locked: false,
+        is_legal_held: false,
+        unique_funder_count: 15,
+      });
+
+      const fullHealth = await client.getEscrowHealth();
+
+      // Full health includes investor count which is useful for operators
+      expect(fullHealth.unique_funder_count).toBeGreaterThan(0);
+    });
+  });
+
+  describe("health check comparison", () => {
+    it("should show that check_escrow_health is a subset of get_escrow_health", async () => {
+      const quickResponse = {
+        warning_type: "underfunded",
+        funded_ratio_bps: "6000",
+        time_to_maturity_secs: "1814400",
+      };
+
+      const fullResponse = {
+        ...quickResponse,
+        status_label: "Open",
+        is_maturity_locked: false,
+        is_legal_held: false,
+        unique_funder_count: 8,
+      };
+
+      stub.setResponse("check_escrow_health", quickResponse);
+      stub.setResponse("get_escrow_health", fullResponse);
+
+      stub.clearInvocationLog();
+
+      const quick = await client.checkEscrowHealth();
+      const full = await client.getEscrowHealth();
+
+      // Both should have the common fields
+      expect(quick.warning_type).toBe(full.warning_type);
+      expect(quick.funded_ratio_bps).toBe(full.funded_ratio_bps);
+      expect(quick.time_to_maturity_secs).toBe(full.time_to_maturity_secs);
+
+      // Full health has additional diagnostic fields
+      expect(full.status_label).toBeDefined();
+      expect(full.is_maturity_locked).toBeDefined();
+      expect(full.is_legal_held).toBeDefined();
+      expect(full.unique_funder_count).toBeDefined();
+
+      // Verify both methods were called independently
+      const log = stub.getInvocationLog();
+      expect(log).toHaveLength(2);
+      expect(log[0].functionName).toBe("check_escrow_health");
+      expect(log[1].functionName).toBe("get_escrow_health");
+    });
+  });
+});
+
+test("setLegalHold passes both active and reason arguments", async () => {
+  const mockInvoke = jest.fn().mockResolvedValue(undefined);
+  const rpc: SorobanRpcClient = {
+    invoke: mockInvoke,
+    simulate: jest.fn(),
+    getLedger: jest.fn(),
+  };
+  const client = new EscrowClient({ rpcUrl: "http://localhost", networkPassphrase: "test" }, rpc);
+  client.setContractId("CTEST123");
+
+  // Test activating legal hold with reason
+  await client.setLegalHold(true, "Compliance investigation", "source123");
+  expect(mockInvoke).toHaveBeenCalledWith(
+    "CTEST123",
+    "set_legal_hold",
+    [true, "Compliance investigation"],
+    "source123"
+  );
+
+  // Test deactivating legal hold with empty reason
+  mockInvoke.mockClear();
+  await client.setLegalHold(false, "", "source456");
+  expect(mockInvoke).toHaveBeenCalledWith(
+    "CTEST123",
+    "set_legal_hold",
+    [false, ""],
+    "source456"
+  );
+});
+
+test("setLegalHold rejects empty reason when active=true", async () => {
+  const rpc: SorobanRpcClient = {
+    invoke: jest.fn(),
+    simulate: jest.fn(),
+    getLedger: jest.fn(),
+  };
+  const client = new EscrowClient({ rpcUrl: "http://localhost", networkPassphrase: "test" }, rpc);
+
+  // Should throw when activating with empty reason
+  await expect(client.setLegalHold(true, "")).rejects.toThrow(
+    "reason must be non-empty when legal hold is activated"
+  );
+
+  // Should throw when activating with whitespace-only reason
+  await expect(client.setLegalHold(true, "   ")).rejects.toThrow(
+    "reason must be non-empty when legal hold is activated"
+  );
+
+  // Should not throw when deactivating with empty reason
+  const mockInvoke = jest.fn().mockResolvedValue(undefined);
+  rpc.invoke = mockInvoke;
+  client.setContractId("CTEST123");
+  await client.setLegalHold(false, "");
+  expect(mockInvoke).toHaveBeenCalled();
 });

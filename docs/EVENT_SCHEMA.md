@@ -33,11 +33,12 @@ short routing symbol passed with `symbol_short!(...)`, such as `funded` or
 
 ## Event Catalog
 
-The current contract defines 21 event structs.
+The event catalog below lists 25 event structs.
 
 | Rust event | `name` symbol | Entrypoint(s) |
 |---|---:|---|
 | `EscrowInitialized` | `escrow_ii` | `init` |
+| `FundingDeadlineSet` | `fund_dl` | `init` |
 | `MaxUniqueInvestorsCapLowered` | `inv_cap` | `lower_max_unique_investors` |
 | `EscrowFunded` | `funded` | `fund`, `fund_with_commitment` |
 | `EscrowSettled` | `escrow_sd` | `settle` |
@@ -47,6 +48,9 @@ The current contract defines 21 event structs.
 | `BeneficiaryRotated` | `ben_rot` | `rotate_beneficiary` |
 | `FundingTargetUpdated` | `fund_tgt` | `update_funding_target` |
 | `LegalHoldChanged` | `legalhld` | `set_legal_hold`, `clear_legal_hold` |
+| `DisputePausedEvt` | `disppause` | `pause_dispute` |
+| `DisputeResumedEvt` | `disp_res` | `resume_dispute` |
+| `LegalHoldProposed` | `lh_prop` | `propose_legal_hold` |
 | `CollateralRecordedEvt` | `coll_rec` | `record_sme_collateral_commitment` |
 | `SmeWithdrew` | `sme_wd` | `withdraw` |
 | `InvestorPayoutClaimed` | `inv_claim` | `claim_investor_payout` |
@@ -100,6 +104,29 @@ Data:
 |---|---|
 | `old_cap` | `u32` |
 | `new_cap` | `u32` |
+
+### `FundingDeadlineSet`
+
+Emitted during `init` to capture the funding deadline (or absence thereof). Indexers
+use this to track deadline changes without polling, enabling alerts on deadline updates.
+
+Topics:
+
+| Index | Field | Type | Value |
+|---:|---|---|---|
+| 0 | fixed event topic | `Symbol` | `funding_deadline_set` |
+| 1 | `name` | `Symbol` | `fund_dl` |
+| 2 | `invoice_id` | `Symbol` | Escrow invoice id |
+
+Data:
+
+| Field | Type |
+|---|---|
+| `deadline` | `Option<u64>` |
+
+**Semantics:** `deadline` is a ledger timestamp (Unix seconds). `None` indicates no funding deadline
+was configured (funding remains open indefinitely). When `Some(ts)`, `ts` is the exclusive upper bound
+for funding calls; attempting to `fund` after ledger timestamp `ts` fails with `EscrowError::FundingDeadlinePassed`.
 
 ### `EscrowFunded`
 
@@ -259,6 +286,61 @@ Data:
 |---|---|---|
 | `active` | `u32` | `1` = enabled, `0` = cleared |
 
+### `DisputePausedEvt`
+
+Emitted after successful `pause_dispute`. Resumes are reported by
+`DisputeResumedEvt` instead.
+
+Topics:
+
+| Index | Field | Type | Value |
+|---:|---|---|---|
+| 0 | fixed event topic | `Symbol` | `dispute_paused_evt` |
+| 1 | `name` | `Symbol` | `disppause` |
+| 2 | `invoice_id` | `Symbol` | Escrow invoice id |
+
+Data:
+
+| Field | Type | Values |
+|---|---|---|
+| `ticket_id` | `String` | Dispute ticket reference |
+| `action` | `u32` | `1` = paused |
+| `paused_at` | `u64` | Ledger timestamp when pause began |
+| `expires_at` | `u64` | Configured expiry timestamp |
+
+### `DisputeResumedEvt`
+
+Emitted after successful `resume_dispute`.
+
+Topics:
+
+| Index | Field | Type | Value |
+|---:|---|---|---|
+| 0 | fixed event topic | `Symbol` | `dispute_resumed_evt` |
+| 1 | `name` | `Symbol` | `disp_res` |
+| 2 | `invoice_id` | `Symbol` | Escrow invoice id |
+
+Data:
+
+| Field | Type | Values |
+|---|---|---|
+| `admin` | `Address` | Admin associated with the escrow |
+| `resumed_by` | `DisputeResumedBy` | `Manual` or `AutoExpiry` |
+| `ledger_timestamp` | `u64` | Timestamp when the resume event was emitted |
+
+The first mutating operation to observe an expired pause emits this event with
+`resumed_by = AutoExpiry`. Read-only pause checks do not emit lifecycle events.
+
+### `LegalHoldProposed`
+
+Emitted after the current admin proposes a legal hold that requires guardian
+confirmation. The pending proposal expires one hour after its ledger timestamp.
+
+| Field | Type |
+|---|---|
+| `admin` | `Address` |
+| `expires_at` | `u64` |
+
 ### `CollateralRecordedEvt`
 
 Emitted after successful `record_sme_collateral_commitment`.
@@ -298,6 +380,7 @@ Data:
 | Field | Type |
 |---|---|
 | `amount` | `i128` |
+| `recipient` | `Address` |
 
 ### `InvestorPayoutClaimed`
 
@@ -469,6 +552,13 @@ Data:
 | `allowed` | `u32` | `1` = allowed, `0` = blocked |
 
 ## Nested Types
+
+### `DisputeResumedBy`
+
+| Variant | Meaning |
+|---|---|
+| `Manual` | Resume initiated through `resume_dispute` |
+| `AutoExpiry` | Expired pause observed by a mutating operation |
 
 ### `InvoiceEscrow`
 

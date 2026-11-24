@@ -19,6 +19,8 @@ import {
   type InitParams,
   type EscrowSnapshot,
   type SorobanRpcClient,
+  type CheckEscrowHealth,
+  type EscrowHealth,
 } from "../src";
 
 // ---------------------------------------------------------------------------
@@ -73,6 +75,22 @@ class MockRpcClient implements SorobanRpcClient {
         };
       case "get_legal_hold":
         return false;
+      case "check_escrow_health":
+        return {
+          warning_type: "healthy",
+          funded_ratio_bps: "5000", // 50% funded in mock
+          time_to_maturity_secs: "2592000", // 30 days
+        };
+      case "get_escrow_health":
+        return {
+          warning_type: "healthy",
+          funded_ratio_bps: "5000",
+          time_to_maturity_secs: "2592000",
+          status_label: "Funded",
+          is_maturity_locked: false,
+          is_legal_held: false,
+          unique_funder_count: 1,
+        };
       case "export_state":
         return {
           escrow: this.state["escrow"] || {
@@ -214,7 +232,24 @@ async function main() {
     console.log(`  Code ${code} (${label}) → category: "${category}"`);
   }
 
-  console.log("\n=== Example complete ===");
+  // 9. Health check demo
+  console.log("\n→ Quick health check (lightweight monitoring)...");
+  const quickHealth = await client.checkEscrowHealth();
+  console.log(`  Warning type: ${quickHealth.warning_type}`);
+  console.log(`  Funded ratio: ${parseInt(quickHealth.funded_ratio_bps) / 100}%`);
+  console.log(`  Time to maturity: ${parseInt(quickHealth.time_to_maturity_secs)} seconds`);
+
+  // 10. Full health diagnostic demo
+  console.log("\n→ Full health diagnostic (detailed operator view)...");
+  const fullHealth = await client.getEscrowHealth();
+  console.log(`  Status: ${fullHealth.status_label}`);
+  console.log(`  Funded ratio: ${parseInt(fullHealth.funded_ratio_bps) / 100}%`);
+  console.log(`  Warning: ${fullHealth.warning_type}`);
+  console.log(`  Maturity locked: ${fullHealth.is_maturity_locked}`);
+  console.log(`  Legal hold active: ${fullHealth.is_legal_held}`);
+  console.log(`  Unique funders: ${fullHealth.unique_funder_count}\n`);
+
+  console.log("=== Example complete ===");
 }
 
 main().catch(console.error);

@@ -112,7 +112,7 @@ fn typed_error_codes_cover_allowlist_attestation_and_dust_guards() {
     client.bind_primary_attestation_hash(&digest);
     assert_contract_error(
         client.try_bind_primary_attestation_hash(&digest),
-        EscrowError::PrimaryAttestationAlreadyBound,
+        EscrowError::AttestationHashAlreadyBound,
     );
 
     assert_contract_error(
@@ -159,6 +159,7 @@ fn escrow_error_discriminants_match_canonical_table() {
         (EscrowError::SweepExceedsLiabilityFloor, 42),
         (EscrowError::PrimaryAttestationAlreadyBound, 50),
         (EscrowError::AttestationAppendLogCapacityReached, 51),
+        (EscrowError::AttestationHashAlreadyBound, 53),
         (EscrowError::CollateralAmountNotPositive, 60),
         (EscrowError::CollateralAssetEmpty, 61),
         (EscrowError::CollateralTimestampBackwards, 62),
@@ -216,8 +217,9 @@ fn escrow_error_discriminants_match_canonical_table() {
         (EscrowError::ConcentrationLimitExceeded, 166),
         (EscrowError::ConcentrationInvalidRange, 167),
         (EscrowError::LegalHoldReasonTooLong, 168),
+        (EscrowError::LegalHoldBlocksMutation, 217),
     ];
-    assert_eq!(TABLE.len(), 88);
+    assert_eq!(TABLE.len(), 89);
     for (variant, code) in TABLE {
         assert_eq!(*variant as u32, *code, "discriminant drift for code {code}");
     }
@@ -520,10 +522,7 @@ fn typed_error_codes_cover_range_boundaries() {
         migrate_client.try_migrate(&(SCHEMA_VERSION - 1)),
         EscrowError::MigrationVersionMismatch,
     );
-    assert_contract_error(
-        migrate_client.try_migrate(&SCHEMA_VERSION),
-        EscrowError::AlreadyCurrentSchemaVersion,
-    );
+    assert_eq!(migrate_client.migrate(&SCHEMA_VERSION), SCHEMA_VERSION);
     env.as_contract(&migrate_client.address, || {
         env.storage().instance().set(&DataKey::Version, &0u32);
     });
@@ -810,10 +809,8 @@ fn test_migrate_already_current() {
         &None,
     );
 
-    assert_contract_error(
-        client.try_migrate(&SCHEMA_VERSION),
-        EscrowError::AlreadyCurrentSchemaVersion,
-    );
+    assert_eq!(client.migrate(&SCHEMA_VERSION), SCHEMA_VERSION);
+    assert_eq!(client.get_version_history().len(), 2);
 }
 
 #[test]
@@ -1121,7 +1118,7 @@ fn test_all_getters() {
     assert_eq!(client.get_funding_token(), funding_token);
     assert_eq!(client.get_treasury(), treasury);
     assert_eq!(client.get_registry_ref(), Some(registry));
-    assert_eq!(client.get_version(), 7);
+    assert_eq!(client.get_version(), SCHEMA_VERSION);
     assert!(!client.get_legal_hold());
     assert_eq!(client.get_min_contribution_floor(), 10);
     assert_eq!(client.get_max_unique_investors_cap(), Some(5));
@@ -2440,7 +2437,7 @@ fn test_get_escrow_summary_happy_path() {
     assert_eq!(summary.funding_close_snapshot, EscrowCloseSnapshot::None);
     assert_eq!(summary.unique_funder_count, 0);
     assert!(!summary.is_allowlist_active);
-    assert_eq!(summary.schema_version, 7);
+    assert_eq!(summary.schema_version, SCHEMA_VERSION);
     assert_eq!(
         summary.sme_collateral_commitment,
         CollateralCommitmentSnapshot::None
@@ -3063,5 +3060,273 @@ fn test_is_settleable_after_partial_settle_with_maturity() {
     assert!(
         !client.is_settleable(),
         "settled escrow must not be settleable"
+    );
+}
+
+// ============================================================================
+// Version History Audit Trail Tests (Issue #1 — getter coverage)
+// ============================================================================
+
+/// Test: Fresh instance returns exactly one version history entry
+///
+/// Verifies that after initialization, `get_version_history()` returns
+/// a single (version, timestamp) tuple with the schema version and a valid
+/// ledger timestamp. This validates the audit trail of schema versions.
+#[test]
+fn test_get_version_history_fresh_instance_has_single_entry() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, sme) = setup(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    // Initialize escrow
+    let ledger_ts_before = env.ledger().timestamp();
+    
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "FRESH_INSTANCE"),
+        &sme,
+        &100_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let ledger_ts_after = env.ledger().timestamp();
+
+    // Query version history
+    let history = client.get_version_history();
+
+    // Assert: exactly one entry (init writes one entry)
+    assert_eq!(
+        history.len(),
+        1,
+        "Fresh instance should have exactly 1 version history entry"
+    );
+
+    // Assert: entry contains SCHEMA_VERSION
+    let (version, timestamp) = history[0];
+    assert_eq!(
+        version, SCHEMA_VERSION,
+        "First history entry version should match SCHEMA_VERSION ({})",
+        SCHEMA_VERSION
+    );
+
+    // Assert: timestamp is from ledger during init window
+    assert!(
+        timestamp >= ledger_ts_before && timestamp <= ledger_ts_after,
+        "History timestamp {} should be between init window [{}, {}]",
+        timestamp,
+        ledger_ts_before,
+        ledger_ts_after
+    );
+}
+
+/// Test: Uninitialized escrow returns empty version history
+///
+/// Verifies that calling `get_version_history()` on an uninitialized
+/// escrow returns an empty vector (default behavior).
+#[test]
+fn test_get_version_history_not_yet_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _sme) = setup(&env);
+    // Note: setup() creates the client but does NOT call init()
+
+    // Query version history without initializing
+    let history = client.get_version_history();
+
+    // Assert: empty vector (no versions recorded yet)
+    assert_eq!(
+        history.len(),
+        0,
+        "Uninitialized escrow should have empty version history"
+    );
+}
+
+/// Test: Multiple reads of version history are consistent
+///
+/// Verifies that calling `get_version_history()` multiple times
+/// on the same instance returns identical data (immutable reads).
+#[test]
+fn test_get_version_history_multiple_reads_consistent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, sme) = setup(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    // Initialize escrow
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "CONSISTENT_READS"),
+        &sme,
+        &100_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Read version history three times
+    let history_1 = client.get_version_history();
+    let history_2 = client.get_version_history();
+    let history_3 = client.get_version_history();
+
+    // Assert: all three reads are identical
+    assert_eq!(
+        history_1.len(),
+        history_2.len(),
+        "Multiple reads should return same length"
+    );
+    assert_eq!(
+        history_1.len(),
+        history_3.len(),
+        "Multiple reads should return same length"
+    );
+
+    if history_1.len() > 0 {
+        assert_eq!(
+            history_1[0], history_2[0],
+            "First entry should be identical across reads"
+        );
+        assert_eq!(
+            history_1[0], history_3[0],
+            "First entry should be identical across reads"
+        );
+    }
+}
+
+/// Test: Version history is included in exported snapshot
+///
+/// Verifies that when exporting an escrow snapshot via
+/// `export_escrow_snapshot()`, the `version_history` field matches
+/// what `get_version_history()` returns.
+#[test]
+fn test_get_version_history_export_snapshot_includes_history() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, sme) = setup(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    // Initialize escrow
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "SNAPSHOT_WITH_HISTORY"),
+        &sme,
+        &100_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Get version history directly
+    let direct_history = client.get_version_history();
+
+    // Export snapshot and check version_history field
+    let snapshot = client.export_escrow_snapshot();
+    let snapshot_history = snapshot.version_history;
+
+    // Assert: snapshot history matches direct query
+    assert_eq!(
+        direct_history.len(),
+        snapshot_history.len(),
+        "Snapshot history length should match direct query"
+    );
+
+    if direct_history.len() > 0 {
+        for i in 0..direct_history.len() {
+            assert_eq!(
+                direct_history[i], snapshot_history[i],
+                "History entry {} should match between snapshot and direct query",
+                i
+            );
+        }
+    }
+}
+
+/// Test: Version history timestamp is valid
+///
+/// Verifies that the timestamp in the version history entry is
+/// a valid positive ledger timestamp (not zero or garbage).
+#[test]
+fn test_get_version_history_timestamp_is_valid() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, sme) = setup(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    // Initialize with a known non-zero ledger time
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000_000);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "VALID_TIMESTAMP"),
+        &sme,
+        &100_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Query version history
+    let history = client.get_version_history();
+
+    // Assert: at least one entry and timestamp is non-zero
+    assert!(history.len() > 0, "Should have at least one history entry");
+    
+    let (_version, timestamp) = history[0];
+    assert!(
+        timestamp > 0,
+        "Timestamp should be positive; got {}",
+        timestamp
+    );
+    assert!(
+        timestamp >= 1_000_000_000,
+        "Timestamp should reflect ledger time; got {} vs expected ~1_000_000_000",
+        timestamp
     );
 }
