@@ -18,6 +18,15 @@
 //! it, or redeploy when stored struct layout changes. See `docs/OPERATOR_RUNBOOK.md` for the full
 //! decision tree.
 //!
+//! ## Documentation link policy
+//!
+//! CI builds docs for the **entire workspace** with
+//! `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links"` (see `.github/workflows/ci.yml`), so any
+//! broken intra-doc link — here or in `repl-cli` — fails the build. When renaming or removing a
+//! public item, update every `[`Item`]` reference in the same change. Prefer linking to real
+//! items (e.g. [`LiquifactEscrow::set_admin_roles`]) over free-form prose, and use plain code
+//! spans for anything that is not a Rust item (e.g. `docs/OPERATOR_RUNBOOK.md`).
+//!
 //! ## SME collateral commitment metadata
 //!
 //! [`LiquifactEscrow::record_sme_collateral_commitment`] is an SME-authenticated metadata write for
@@ -309,7 +318,7 @@ include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 /// | 5 | Added `YieldTierTable`, `RegistryRef`, `Treasury`; `fund_with_commitment` | **Redeploy required** if `InvoiceEscrow` XDR changed |
 /// | 6 | Per-investor keys moved to **persistent** storage (see ADR-007) | **Redeploy required** — no `migrate` path (addresses not enumerable) |
 /// | 7 | Added `updated_at` to `SmeCollateralCommitment`; `bind_primary_attestation_hash` now accepts `Bytes` with explicit length validation (#207, #208) | **Redeploy required** — `SmeCollateralCommitment` XDR shape changed |
-/// | 8 | Added optional `InvoiceEscrow::guardian` for two-step legal-hold activation | **Redeploy required** — `InvoiceEscrow` XDR shape changed |
+/// | 8 | Added optional [`InvoiceEscrow::guardian`] for two-step legal-hold activation | **Redeploy required** — [`InvoiceEscrow`] XDR shape changed |
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
 pub const SCHEMA_VERSION: u32 = 8;
@@ -401,8 +410,9 @@ pub const PERSISTENT_TTL_MIN_EXTENSION_LEDGERS: u32 = 60 * 60; // Approx. 1h at 
 
 /// Upper bound on [`LiquifactEscrow::bump_ttl`]'s `allowlisted` entries per call.
 ///
-/// Each entry costs 5 `extend_ttl` host calls (`InvestorAllowlisted`, `InvestorContribution`,
-/// `InvestorEffectiveYield`, `InvestorClaimNotBefore`, `InvestorClaimed`); an unbounded vector
+/// Each entry costs 5 `extend_ttl` host calls ([`DataKey::InvestorAllowlisted`],
+/// [`DataKey::InvestorContribution`], [`DataKey::InvestorEffectiveYield`],
+/// [`DataKey::InvestorClaimNotBefore`], [`DataKey::InvestorClaimed`]); an unbounded vector
 /// risks exceeding the transaction's CPU/resource budget with no partial progress. Mirrors
 /// [`MAX_INVESTOR_ALLOWLIST_BATCH`] to limit per-call work.
 pub const MAX_TTL_BUMP_BATCH: u32 = 32;
@@ -816,6 +826,12 @@ pub enum DataKey {
     /// and updated by [`LiquifactEscrow::migrate`] when a migration path is implemented.
     /// Read with [`LiquifactEscrow::get_version`]. Never delete or rename this variant.
     Version,
+    /// Append-only version history audit trail: `Vec<(version, ledger_timestamp)>`.
+    /// Records when schema versions were written to this instance on init and migrate.
+    /// One entry per version change. Absent ⇒ empty vector (not initialized).
+    /// Helps operators track deployment lineage and audit upgrade events.
+    /// Read via [`LiquifactEscrow::get_version_history`].
+    VersionHistory,
     /// Per-investor contributed principal recorded during [`LiquifactEscrow::fund`].
     /// **Persistent** storage. Absent ⇒ `0`. One entry per investor address.
     InvestorContribution(Address),
@@ -827,7 +843,7 @@ pub enum DataKey {
     /// Absent ⇒ no clear request is pending.
     LegalHoldClearableAt,
     /// Configured minimum delay between [`LiquifactEscrow::request_clear_legal_hold`] and
-    /// [`LiquifactEscrow::set_legal_hold(env, false)`]. Absent ⇒ `0`.
+    /// [`LiquifactEscrow::set_legal_hold`]. Absent ⇒ `0`.
     LegalHoldClearDelay,
     /// Optional SME collateral commitment metadata (record-only — not an on-chain asset lock).
     /// Absent when no commitment has been recorded. Replaceable by the SME.
@@ -948,6 +964,69 @@ pub enum DataKey {
     /// Useful for operator debugging and compliance audits.
     /// Absent ⇒ no migration record. Companion to [`DataKey::MigrationExecutionLog`].
     MigrationCompletedAt(u32, u32),
+    
+    /// Current trace mode verbosity level (when trace-mode feature is enabled).
+    /// Stored as u32: 0=OFF, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=TRACE.
+    /// Absent ⇒ tracing disabled (OFF). Read via trace helpers; set by `enable_tracing()`.
+    #[cfg(feature = "trace-mode")]
+    TraceLevel,
+}
+
+// ============================================================================
+// Trace Mode Infrastructure (opt-in diagnostic feature)
+// ============================================================================
+
+/// Trace verbosity levels (higher = more detailed).
+#[cfg(feature = "trace-mode")]
+pub const TRACE_LEVEL_OFF: u32 = 0;
+#[cfg(feature = "trace-mode")]
+pub const TRACE_LEVEL_ERROR: u32 = 1;
+#[cfg(feature = "trace-mode")]
+pub const TRACE_LEVEL_WARN: u32 = 2;
+#[cfg(feature = "trace-mode")]
+pub const TRACE_LEVEL_INFO: u32 = 3;
+#[cfg(feature = "trace-mode")]
+pub const TRACE_LEVEL_DEBUG: u32 = 4;
+#[cfg(feature = "trace-mode")]
+pub const TRACE_LEVEL_TRACE: u32 = 5;
+
+/// Maximum trace buffer entries to keep storage bounded and prevent abuse.
+#[cfg(feature = "trace-mode")]
+pub const MAX_TRACE_BUFFER_ENTRIES: u32 = 256;
+
+/// Trace entry emitted when trace mode is enabled at WARN level or higher.
+///
+/// Records state transitions and admin operations for forensic analysis.
+/// Payloads contain hashes and metadata, never raw stored values.
+#[cfg(feature = "trace-mode")]
+#[contractevent]
+pub struct TraceEvent {
+    #[topic]
+    pub level: u32,
+    #[topic]
+    pub operation: Symbol,
+    pub key_name: Symbol,
+    pub timestamp: u64,
+    pub message: String,
+}
+
+/// Trace event for configuration changes (enable/disable).
+#[cfg(feature = "trace-mode")]
+#[contractevent]
+pub struct TraceConfigured {
+    #[topic]
+    pub name: Symbol,
+    pub level: u32,
+    pub timestamp: u64,
+}
+
+/// Trace event for buffer clear operations.
+#[cfg(feature = "trace-mode")]
+#[contractevent]
+pub struct TraceBufferCleared {
+    #[topic]
+    pub name: Symbol,
+    pub timestamp: u64,
 }
 
 // --- Data types ---
@@ -1462,6 +1541,30 @@ pub struct SettlementNftMinted {
     pub yield_paid_bps: i64,
     /// ID of the minted NFT token, queryable by third-party contracts.
     pub nft_token_id: Symbol,
+}
+
+/// Result of a pre-upgrade compatibility check.
+///
+/// Operators call [`LiquifactEscrow::check_upgrade_compatibility`] with a new WASM hash
+/// to determine whether it is safe to upgrade. This struct returns detailed compatibility info:
+///
+/// - `compatible`: true if the hash corresponds to an installed contract and likely has no breaking changes
+/// - `reason`: human-readable explanation (e.g. "Hash not found", "Schema version mismatch", "Compatible")
+/// - `current_schema`: current on-chain schema version for reference
+///
+/// **Important:** this check is advisory. It validates that the hash is installed and compares
+/// schema/interface versions, but it **cannot** detect all breaking changes (e.g., removed or
+/// renamed data keys). Operators must always perform thorough testing on testnet before upgrading production.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeCompatibilityReport {
+    /// Whether the upgrade appears safe to proceed (hash found + schema compatible).
+    pub compatible: bool,
+    /// Explanation of compatibility status (e.g. "Hash not found on this network",
+    /// "Schema version unchanged (additive upgrade safe)", "Schema version mismatch").
+    pub reason: String,
+    /// Current on-chain schema version (for reference).
+    pub current_schema: u32,
 }
 
 /// Diagnostic information for contract errors, emitted alongside error returns.
@@ -7076,7 +7179,7 @@ impl LiquifactEscrow {
         }
     }
 
-    /// Propose a new admin (`PendingAdmin`) — step 1 of a two-step handover.
+    /// Propose a new admin ([`DataKey::PendingAdmin`]) — step 1 of a two-step handover.
     ///
     /// Requires current admin authorization. The destination must differ from the current admin.
     ///
@@ -7306,8 +7409,10 @@ impl LiquifactEscrow {
 
     /// Pause the escrow due to a dispute (e.g., invoice validity challenge).
     ///
-    /// Freezes the escrow independently of legal hold: blocks `fund`, `settle`, and `withdraw`
-    /// until either auto-expiration (after `duration_secs`) or manual resumption.
+    /// Freezes the escrow independently of legal hold: blocks [`LiquifactEscrow::fund`],
+    /// [`LiquifactEscrow::settle`], and [`LiquifactEscrow::withdraw`] until either
+    /// auto-expiration (after `duration_secs`) or manual resumption via
+    /// [`LiquifactEscrow::resume_dispute`].
     ///
     /// # Parameters
     /// - `ticket_id`: Support/dispute ticket reference (non-empty String for audit trail).
@@ -7410,7 +7515,7 @@ impl LiquifactEscrow {
     /// Includes auto-expiration logic: if the pause was configured to expire and
     /// current ledger time has reached/exceeded the expiration, the pause is
     /// considered inactive. A mutating operation later removes the stored entry
-    /// and emits `DisputeResumedEvt` once; this check remains read-only.
+    /// and emits [`DisputeResumedEvt`] once; this check remains read-only.
     ///
     /// # Returns
     /// `true` if a dispute pause exists and has not auto-expired; `false` otherwise.

@@ -245,6 +245,59 @@ This guide meets all requested criteria:
 
 ---
 
+## ✅ Release preflight
+
+Before every release, run the release preflight script from the repository root:
+
+```bash
+./scripts/release_preflight.sh
+```
+
+The script runs all three release validators together and reports a single
+go/no-go:
+
+1. **Build metadata validator** — `validate_build_metadata.py` checks the
+   build metadata is complete and consistent.
+2. **Spec validation** — validates `spec.json` against the expected contract
+   interface.
+3. **Schema version matrix validator** — checks the schema version matrix is
+   consistent with the current `SCHEMA_VERSION`.
+
+The script exits **non-zero if any validator fails**, so it can be wired into
+CI or run manually as a release gate. Do not cut a release unless the preflight
+passes cleanly.
+
+---
+
+## 🤖 Dependency update grouping (Dependabot)
+
+`.github/dependabot.yml` groups dependency updates to keep PR noise down:
+
+- **Cargo ecosystem:** minor and patch updates are batched into a single group.
+- **npm ecosystem:** minor and patch updates are batched into a single group.
+
+Major-version bumps are **not** auto-grouped and are **not** auto-merged; they
+arrive as individual PRs for explicit review. Auto-merge is intentionally out of
+scope — every grouped PR still requires human approval.
+
+---
+
+## 📈 Coverage target and CI summary
+
+The project targets **≥95% line coverage** (see `START_HERE.txt`). CI generates
+a job summary on every run using `cargo-llvm-cov` that includes:
+
+- Total test counts
+- Coverage percentage
+- Coverage delta versus `main`
+
+The summary is appended to `$GITHUB_STEP_SUMMARY` and renders directly on pull
+requests so reviewers can see the coverage impact at a glance. A coverage drop
+does **not** currently fail CI (that is a separate policy decision), but
+reviewers should treat any drop below the ≥95% target as a blocker.
+
+---
+
 ## 🔄 Version compatibility
 
 This guide is valid for:

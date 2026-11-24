@@ -858,6 +858,84 @@ describe("EscrowClient Integration Tests", () => {
     });
   });
 
+  describe("migration helpers", () => {
+    it("migrates from the supplied version and returns the resulting version", async () => {
+      stub.clearInvocationLog();
+      stub.setResponse("migrate", SCHEMA_VERSION);
+
+      await expect(client.migrate(SCHEMA_VERSION, ADMIN)).resolves.toBe(SCHEMA_VERSION);
+      expect(stub.getInvocationLog()).toEqual([
+        {
+          method: "invoke",
+          functionName: "migrate",
+          args: [SCHEMA_VERSION],
+          source: ADMIN,
+        },
+      ]);
+    });
+
+    it("dry-runs migration through a read-only simulation", async () => {
+      stub.clearInvocationLog();
+      stub.setResponse("dry_run_migrate", SCHEMA_VERSION);
+
+      await expect(client.dryRunMigrate(SCHEMA_VERSION)).resolves.toBe(SCHEMA_VERSION);
+      expect(stub.getInvocationLog()).toEqual([
+        {
+          method: "simulate",
+          functionName: "dry_run_migrate",
+          args: [SCHEMA_VERSION],
+        },
+      ]);
+    });
+
+    it.each([
+      [SCHEMA_VERSION - 1, SCHEMA_VERSION, "migration_recommended"],
+      [SCHEMA_VERSION, SCHEMA_VERSION, "already_at_target"],
+      [SCHEMA_VERSION + 1, SCHEMA_VERSION, "sdk_behind_contract"],
+    ] as const)(
+      "for current version %s and target %s returns %s",
+      async (currentVersion, targetVersion, recommendation) => {
+        stub.clearInvocationLog();
+        stub.setResponse("get_version", currentVersion);
+
+        await expect(client.preflightMigration(targetVersion)).resolves.toEqual({
+          currentVersion,
+          targetVersion,
+          recommendation,
+        });
+        expect(stub.getInvocationLog()).toEqual([
+          { method: "simulate", functionName: "get_version", args: [] },
+        ]);
+      },
+    );
+
+    it("uses the SDK schema version as the default pre-flight target", async () => {
+      stub.setResponse("get_version", SCHEMA_VERSION);
+
+      await expect(client.preflightMigration()).resolves.toEqual({
+        currentVersion: SCHEMA_VERSION,
+        targetVersion: SCHEMA_VERSION,
+        recommendation: "already_at_target",
+      });
+    });
+
+    it.each([
+      EscrowErrorCode.MigrationVersionMismatch,
+      EscrowErrorCode.AlreadyCurrentSchemaVersion,
+      EscrowErrorCode.NoMigrationPath,
+      EscrowErrorCode.MigrationAlreadyApplied,
+    ])("preserves typed migration error %i from migrate and dry-run", async (code) => {
+      const contractError = Object.assign(new Error(`Contract error ${code}`), { code });
+      jest.spyOn(stub, "invoke").mockRejectedValueOnce(contractError);
+      jest.spyOn(stub, "simulate").mockRejectedValueOnce(contractError);
+
+      await expect(client.migrate(SCHEMA_VERSION)).rejects.toBe(contractError);
+      await expect(client.dryRunMigrate(SCHEMA_VERSION)).rejects.toBe(contractError);
+      expect(classifyError(code)).toBe("migration");
+      expect(ESCROW_ERROR_LABELS[code]).toBeDefined();
+    });
+  });
+
   // =========================================================================
   // Test: Investor-Specific Queries
   // =========================================================================

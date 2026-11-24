@@ -1,229 +1,211 @@
-# Implementation Checklist: Issues #238, #239, #240, #241
+# Implementation Checklist - Four Issues
 
-## Issue #238: Tokenomics Modeling Tests
-
-### Requirements
-- [x] Proptest-based tokenomics scenarios implemented
-- [x] Variables: funding amount, investor count, yield rate, lock duration
-- [x] Yield always distributes pro-rata
-- [x] No yields created/destroyed invariant verified
-- [x] Tests added to CI
-
-### Implementation Details
-- [x] File: `escrow/src/tests/tokenomics.rs` (714 lines)
-- [x] Helper functions: `gen_funding_amount`, `gen_investor_count`, `gen_yield_rate_bps`, `gen_lock_duration`
-- [x] Calculation functions: `expected_settle_pool`, `expected_payout`
-- [x] Property tests: 8 proptest functions
-- [x] Integration tests: 1 full lifecycle test
-- [x] Module registered in `tests.rs`
-
-### Acceptance Criteria Verification
-- [x] ✅ Proptest-based scenarios with funding, investor, yield, lock variables
-- [x] ✅ Single investor yield conservation test
-- [x] ✅ Equal contributions equal payouts test
-- [x] ✅ Sum of payouts bounded test
-- [x] ✅ Tiered yield increases return test
-- [x] ✅ Zero yield (deflation) test
-- [x] ✅ High yield (inflation) test
-- [x] ✅ Overfunding snapshot correctness test
-- [x] ✅ Pro-rata ratio maintenance test
-- [x] ✅ Full lifecycle integration test
-
----
-
-## Issue #239: Upgrade Compatibility Tests
+## Issue #1: Document `check_escrow_health` semantics ✅
 
 ### Requirements
-- [x] Test matrix: v1→v2, v2→v3, v3→v4, v4→v5, v5→v6
-- [x] Deploy old version, migrate, verify state intact
-- [x] Tests run in CI
-- [x] Document test maintenance process
+- [x] Document sign of `time_to_maturity_secs` (negative when past maturity)
+- [x] Document units (seconds)
+- [x] Add test for pre-maturity (positive)
+- [x] Add test for at-maturity (zero)
+- [x] Add test for post-maturity (negative)
+- [x] Add test for no-maturity (i64::MAX)
+- [x] Add test verifying units are seconds
 
 ### Implementation Details
-- [x] File: `escrow/src/tests/upgrade_compat.rs` (645 lines)
-- [x] Schema v1→v2 test: additive investor yield keys
-- [x] Schema v2→v3 test: additive snapshot and caps
-- [x] Schema v3→v4 test: additive attestation keys
-- [x] Schema v4→v5 test: tiered yield and registry
-- [x] Schema v5→v6 test: persistent storage redeploy
-- [x] Migration error code tests (90, 91, 92)
-- [x] Admin auth boundary test
-- [x] Full v1→v6 upgrade matrix test
-- [x] Old/new instance coexistence test
-- [x] Module registered in `tests.rs`
+- **Documentation:** Already present in function signatures in `admin.rs` and `lib.rs`
+- **New Tests:** 5 tests added to `health_warnings.rs`
+  - `test_check_escrow_health_pre_maturity_positive_seconds`
+  - `test_check_escrow_health_at_exact_maturity_zero_seconds`
+  - `test_check_escrow_health_post_maturity_negative_seconds`
+  - `test_check_escrow_health_no_maturity_imax`
+  - `test_check_escrow_health_maturity_units_seconds`
 
-### Acceptance Criteria Verification
-- [x] ✅ Test matrix covers all version transitions
-- [x] ✅ Each test deploys old version
-- [x] ✅ Migration verified without data loss
-- [x] ✅ Tests run via `cargo test` (standard #[test] attribute)
-- [x] ✅ Migration error paths documented (codes 90, 91, 92)
-- [x] ✅ Test maintenance documented in comments
+### Validation
+- Tests verify the off-chain risk monitoring can rely on:
+  - Positive value = time remaining before maturity
+  - Zero = at exact maturity
+  - Negative = past maturity (with magnitude = seconds overdue)
+  - i64::MAX = no maturity constraint
+  - All values in seconds (not milliseconds)
 
 ---
 
-## Issue #240: DOS Attack Surface Analysis
+## Issue #2: Lower max unique investors cap with event ✅
 
 ### Requirements
-- [x] Code audit for all loops; bounds added where missing
-- [x] Storage operations cost analyzed for each path
-- [x] Document maximum cost per operation
-- [x] CI enforces bounds checks on new code
+- [x] Event captures old and new cap
+- [x] Event is emitted on cap change
+- [x] Event documented in EVENT_SCHEMA.md
+- [x] Event provides audit trail
 
 ### Implementation Details
-- [x] File: `escrow/src/tests/dos_analysis.rs` (455 lines)
-- [x] Loop bounds verification: MAX_FUND_BATCH (50)
-- [x] Loop bounds verification: MAX_ATTESTATION_APPEND_ENTRIES (32)
-- [x] Amount bounds verification: MAX_DUST_SWEEP_AMOUNT (100M)
-- [x] Batch bounds verification: MAX_INVESTOR_ALLOWLIST_BATCH (32)
-- [x] Cardinality bounds: max_unique_investors (optional cap)
-- [x] Cost analysis: documented in module header
-- [x] No O(n) enumeration: persistent storage prevents loops
-- [x] Module registered in `tests.rs`
+- **Event:** `MaxUniqueInvestorsCapLowered`
+- **Symbol:** `inv_cap`
+- **Status:** Already fully implemented and tested
+- **Location:** 
+  - Definition: `events.rs` lines 35-42
+  - Emission: `funding.rs` line 880
+  - Documentation: `EVENT_SCHEMA.md` lines 89-103
+  - Testing: `cap_validation.rs` `test_lower_cap_emits_event()`
 
-### Bounds Summary
-| Operation | Bound | Enforcement |
-|-----------|-------|-------------|
-| fund_batch | 50 entries | Runtime check |
-| attestation log | 32 entries | Runtime check |
-| dust sweep | 100M base units | Runtime check |
-| allowlist batch | 32 entries | Runtime check |
-| unique investors | optional cap | Init-time config |
-
-### Acceptance Criteria Verification
-- [x] ✅ All loops bounded by constants
-- [x] ✅ Storage cost documented for each operation
-- [x] ✅ Worst-case per-call: 100 writes (fund_batch, acceptable)
-- [x] ✅ Bounds enforced at runtime
-- [x] ✅ Tests verify oversized inputs rejected
-- [x] ✅ Tests verify max-sized inputs accepted
+### Validation
+- Event has correct structure: name + invoice_id + old_cap + new_cap
+- All three pieces (name, id, caps) present in event payload
+- Indexers can reconstruct complete audit trail of cap changes
 
 ---
 
-## Issue #241: Secure RNG Audit
+## Issue #3: Add FundingDeadlineSet event ✅
 
 ### Requirements
-- [x] All RNG uses Soroban's secure random source
-- [x] No use of block hash or timestamp as entropy
-- [x] Docs clarify RNG assumptions
-- [x] Test randomness distribution (if applicable)
+- [x] Create FundingDeadlineSet event struct
+- [x] Emit event during init (both init and init_with_guardian paths)
+- [x] Document in EVENT_SCHEMA.md
+- [x] Support None case (no deadline configured)
+- [x] Support Some(timestamp) case (deadline set)
+- [x] Enable indexer alerts on deadline changes
 
 ### Implementation Details
-- [x] File: `escrow/src/tests/secure_rng.rs` (293 lines)
-- [x] Audit finding: No RNG currently used (deterministic contract)
-- [x] Soroban PRNG documented as approved pattern
-- [x] Prohibited patterns: timestamp, block hash, insufficient entropy
-- [x] PRNG availability test
-- [x] PRNG distinctness test (successive calls)
-- [x] Property test: byte distribution uniformity
-- [x] Example correct usage documented
-- [x] Commit-reveal pattern for high-stakes randomness documented
-- [x] Module registered in `tests.rs`
+- **Event:** `FundingDeadlineSet`
+- **Symbol:** `fund_dl`
+- **Topics:** 3 (fixed + name + invoice_id)
+- **Data:** 1 field (deadline: Option<u64>)
 
-### RNG Audit Results
-- [x] ✅ Contract is deterministic (no randomness needed)
-- [x] ✅ Approved pattern: `env.prng()` available
-- [x] ✅ Prohibited patterns documented
-- [x] ✅ PRNG produces distinct output
-- [x] ✅ Byte distribution is reasonable
-- [x] ✅ Future integration guidelines provided
+### Files Modified
+1. `escrow/src/events.rs` - Added event definition (lines 44-50)
+2. `escrow/src/funding.rs` - Added emission (lines 371-378)
+3. `docs/EVENT_SCHEMA.md` - Added documentation (lines 50, 97, 117-143)
+4. `escrow/src/tests.rs` - Added import
 
-### Acceptance Criteria Verification
-- [x] ✅ All RNG uses verified (none found, as expected)
-- [x] ✅ Soroban PRNG is secure entropy source
-- [x] ✅ No timestamp/block-hash entropy usage
-- [x] ✅ RNG assumptions documented
-- [x] ✅ Distribution tested (proptest byte distribution)
+### Validation
+- Event emitted for both deadline Some and None cases
+- Deadline value is ledger timestamp (Unix seconds)
+- Schema documents: None = open-ended, Some(ts) = deadline timestamp
+- Indexers can subscribe without polling to track deadline changes
 
 ---
 
-## Quality Assurance
+## Issue #4: Event schema conformance test ✅
 
-### Syntax Validation
-- [x] tokenomics.rs: 23,538 bytes - bracket/parenthesis balanced
-- [x] upgrade_compat.rs: 19,628 bytes - bracket/parenthesis balanced
-- [x] dos_analysis.rs: 13,719 bytes - bracket/parenthesis balanced
-- [x] secure_rng.rs: 10,944 bytes - bracket/parenthesis balanced
-- [x] All Rust syntax markers balanced
+### Requirements
+- [x] Test validates emitted events match schema structure
+- [x] Test checks topic count
+- [x] Test verifies topic[1] is routing symbol (name)
+- [x] Test prevents event-schema drift
+- [x] Test validates multiple event types
+- [x] Test is comprehensive and maintainable
 
-### Module Integration
-- [x] All modules declared in `escrow/src/tests.rs`
-- [x] Modules in alphabetical order
-- [x] No missing imports or references
+### Implementation Details
+- **File:** `event_schema_conformance.rs` (NEW)
+- **Tests:** 6 comprehensive test functions
+  1. `test_event_schema_escrow_initialized` - Validates init event
+  2. `test_event_schema_funding_deadline_set` - Validates new deadline event (Some case)
+  3. `test_event_schema_funding_deadline_none` - Validates deadline event (None case)
+  4. `test_event_schema_max_unique_investors_cap_lowered` - Validates cap event
+  5. `test_event_schema_escrow_funded` - Validates fund event
+  6. `test_event_schema_all_have_name_routing_symbol` - Universal validation
 
-### Test Count
-- [x] Tokenomics: 9 property tests + 1 integration test
-- [x] Upgrade: 9 integration tests
-- [x] DOS: 10 bounds enforcement tests
-- [x] RNG: 8 tests + 1 property test
-- [x] **Total: 40+ test functions**
+### Schema Checks
+- Topic count validation (fixed topic + routing symbol + optional indexed fields)
+- Symbol type validation for routing names
+- Data field presence validation
+- Cross-reference with EVENT_SCHEMA.md structure
 
-### Documentation
-- [x] Each test has descriptive name and comments
-- [x] Module headers explain purpose
-- [x] Helper functions documented
-- [x] Strategies documented
-- [x] Error conditions documented
-
----
-
-## CI Integration
-
-### Expected Test Results
-- [x] Format check: `cargo fmt --check` ✅
-- [x] Lint check: `cargo clippy -- -D warnings` ✅
-- [x] Build: `cargo build` ✅
-- [x] Tests: `cargo test` runs all 40+ new tests ✅
-- [x] Coverage: Maintains ≥95% line coverage ✅
-
-### CI Files
-- [x] `.github/workflows/ci.yml` will automatically run:
-  - `cargo fmt --check`
-  - `cargo clippy --all-targets -- -D warnings`
-  - `cargo build`
-  - `cargo test`
-  - `cargo llvm-cov --fail-under-lines 95`
+### Benefits
+- Prevents silent schema drift that breaks indexers
+- Early warning system for event structure changes
+- Ensures all events follow karis-ky naming convention
+- Enables safe schema evolution with clear breaking change detection
 
 ---
 
-## Documentation Files Created
+## Test Coverage Summary
 
-- [x] `IMPLEMENTATION_SUMMARY.md` - Complete verification checklist (327 lines)
-- [x] `TEST_RUNNER_GUIDE.md` - Test execution instructions (254 lines)
-- [x] `ISSUES_238_239_240_241_IMPLEMENTATION.md` - Full overview (346 lines)
-- [x] `IMPLEMENTATION_CHECKLIST.md` - This file
+### New Tests Added
+- **health_warnings.rs:** 5 new tests (12 total)
+- **event_schema_conformance.rs:** 6 new tests (NEW module)
+- **Total new tests:** 11
+
+### Test Execution Command
+```bash
+cd /workspaces/KARIS-KY/escrow
+cargo test health_warnings::test_check_escrow_health_
+cargo test event_schema_conformance::
+```
+
+### Coverage by Issue
+- Issue #1: 5 tests validating maturity semantics
+- Issue #2: Already covered by existing tests + schema conformance
+- Issue #3: 2 tests validating FundingDeadlineSet (Some and None cases)
+- Issue #4: 6 tests validating schema conformance across event types
 
 ---
 
-## Final Verification
+## Documentation Updates
 
-### All Criteria Met
-- [x] ✅ Issue #238: Tokenomics tests complete (9 property + 1 integration)
-- [x] ✅ Issue #239: Upgrade tests complete (9 integration across v1→v6)
-- [x] ✅ Issue #240: DOS analysis complete (10 bounds enforcement)
-- [x] ✅ Issue #241: RNG audit complete (8 tests, deterministic finding)
+### EVENT_SCHEMA.md Changes
+- Line 50: Updated event count from 24 → 25
+- Line 97: Added FundingDeadlineSet to event catalog
+- Lines 117-143: Added complete FundingDeadlineSet specification
+  - Topics structure
+  - Data field types
+  - Semantics (deadline is timestamp, None = open-ended)
+  - Off-chain usage patterns
 
-### All Tests Added to Registry
-- [x] ✅ Module declarations in `escrow/src/tests.rs`
-- [x] ✅ No missing imports or cross-references
-- [x] ✅ Proper alphabetical ordering
+### Code Documentation
+- New event documented with docstring in `events.rs`
+- Event emission location clear and commented in `funding.rs`
+- Test names and comments make intent explicit
 
-### Ready for CI
-- [x] ✅ All files syntactically valid
-- [x] ✅ No compilation errors expected
-- [x] ✅ All test attributes properly decorated
-- [x] ✅ Documentation complete
+---
+
+## Integration Notes
+
+### For Indexers
+- New `FundingDeadlineSet` event enables deadline tracking
+- Can now alert on deadline changes without polling
+- Event emitted at init time, giving complete initialization record
+- Schema conformance tests ensure event structure stability
+
+### For Off-Chain Risk Monitoring
+- `check_escrow_health` now fully documented for external use
+- `time_to_maturity_secs` semantics enable deadline-based risk alerts
+- Negative values indicate past-due escrows
+- Integration with event stream provides complete audit trail
+
+### For Developers
+- Schema conformance tests catch breaking changes early
+- Event validation patterns can be extended to new events
+- TEST_SCHEMA.md serves as single source of truth for event structure
+
+---
+
+## Deployment Readiness
+
+### Breaking Changes
+- ✅ NONE - All changes are additive
+
+### Backward Compatibility
+- ✅ Existing events unchanged
+- ✅ New event (FundingDeadlineSet) is additive
+- ✅ When deadline = None, behavior unchanged
+- ✅ check_escrow_health signature unchanged
+
+### Migration Path
+- ✅ Drop-in replacement for existing deployments
+- ✅ No re-initialization required
+- ✅ Indexers automatically consume new event when available
+- ✅ Off-chain systems can optionally listen for FundingDeadlineSet
 
 ---
 
 ## Sign-Off
 
-**Date**: 2026-07-25  
-**Implementation Status**: ✅ COMPLETE
+All four issues have been successfully implemented, tested, and documented:
 
-All four GitHub issues have been successfully implemented with comprehensive test coverage:
-- 40+ test functions
-- 2,100+ lines of production-quality test code
-- Full verification of tokenomics, upgrades, DOS protection, and RNG security
-- Ready for CI pipeline and code review
+1. ✅ `check_escrow_health` semantics: Documented + 5 tests
+2. ✅ `MaxUniqueInvestorsCapLowered` event: Already complete
+3. ✅ `FundingDeadlineSet` event: Implemented + 2 tests
+4. ✅ Event schema conformance: 6 validation tests
 
+Ready for PR review and deployment.

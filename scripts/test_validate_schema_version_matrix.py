@@ -6,6 +6,8 @@ Tests the mismatch detection case and parsing logic.
 Can be run standalone or via pytest.
 """
 
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -18,6 +20,11 @@ from validate_schema_version_matrix import (
     validate_schema_version,
     validate_env_schema_versions,
 )
+
+# Repository root (this test file lives in scripts/)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PREFLIGHT_SCRIPT = REPO_ROOT / "scripts" / "release_preflight.sh"
+=======
 
 
 def test_extract_schema_version_valid():
@@ -312,9 +319,66 @@ def test_validate_env_schema_versions_no_files():
         print("✓ test_validate_env_schema_versions_no_files passed")
 
 
+def _run_preflight(repo_root):
+    """Run the release preflight script against the given repo root."""
+    return subprocess.run(
+        ["bash", str(PREFLIGHT_SCRIPT)],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_release_preflight_clean_repo_passes():
+    """Test that the preflight script exits 0 on the clean repository."""
+    assert PREFLIGHT_SCRIPT.exists(), f"Missing preflight script: {PREFLIGHT_SCRIPT}"
+    result = _run_preflight(REPO_ROOT)
+    assert result.returncode == 0, (
+        "Preflight should pass on clean repo but exited "
+        f"{result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    print("✓ test_release_preflight_clean_repo_passes passed")
+
+
+def test_release_preflight_drifted_repo_fails():
+    """Test that the preflight script exits non-zero on a drifted repo copy."""
+    assert PREFLIGHT_SCRIPT.exists(), f"Missing preflight script: {PREFLIGHT_SCRIPT}"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_copy = Path(tmpdir) / "repo"
+        shutil.copytree(
+            REPO_ROOT,
+            repo_copy,
+            ignore=shutil.ignore_patterns(".git", "target", "__pycache__", "node_modules"),
+        )
+
+        # Introduce drift: bump SCHEMA_VERSION in lib.rs so it no longer
+        # matches the schema version matrix / spec metadata.
+        lib_rs = repo_copy / "contracts" / "schema" / "src" / "lib.rs"
+        assert lib_rs.exists(), f"Expected lib.rs at {lib_rs}"
+        content = lib_rs.read_text()
+        import re
+
+        drifted, count = re.subn(
+            r"(pub\s+const\s+SCHEMA_VERSION\s*:\s*u32\s*=\s*)(\d+)",
+            lambda m: f"{m.group(1)}{int(m.group(2)) + 1}",
+            content,
+        )
+        assert count == 1, "Expected exactly one SCHEMA_VERSION declaration"
+        lib_rs.write_text(drifted)
+
+        result = _run_preflight(repo_copy)
+        assert result.returncode != 0, (
+            "Preflight should fail on drifted repo but exited 0\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        print("✓ test_release_preflight_drifted_repo_fails passed")
+
+
 def run_all_tests():
     """Run all tests and report results."""
     tests = [
+=======
         test_extract_schema_version_valid,
         test_extract_schema_version_with_whitespace,
         test_extract_schema_version_not_found,
@@ -335,7 +399,11 @@ def run_all_tests():
         test_validate_env_schema_versions_multiple_files,
         test_validate_env_schema_versions_mixed_present_absent,
         test_validate_env_schema_versions_no_files,
+        # Release preflight tests
+        test_release_preflight_clean_repo_passes,
+        test_release_preflight_drifted_repo_fails,
     ]
+=======
 
     passed = 0
     failed = 0

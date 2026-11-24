@@ -977,6 +977,37 @@ impl LiquifactEscrow {
         Self::migrate_impl(env, from_version)
     }
 
+    /// Preview the effect of a schema migration without mutating escrow state.
+    ///
+    /// Operators can call this read-only endpoint before committing a schema upgrade
+    /// to see which migration path would be applied and verify the target version.
+    /// No storage writes occur.
+    ///
+    /// # Authorization
+    ///
+    /// Only the **admin** (from the stored escrow) may call this method.
+    ///
+    /// # Parameters
+    ///
+    /// - `from_version` — the version tag currently stored in the escrow's persistent storage.
+    ///
+    /// # Returns
+    ///
+    /// A pair `(target_version, changelog)`:
+    /// - `target_version` — the schema version the migration would reach.
+    /// - `changelog` — human-readable summary of applied transformations (or reason no migration exists).
+    ///
+    /// # Errors
+    ///
+    /// | Condition | Error |
+    /// | --- | --- |
+    /// | `from_version` not found in escrow | [`EscrowError::MigrationVersionMismatch`] |
+    /// | `from_version >= SCHEMA_VERSION` | [`EscrowError::AlreadyCurrentSchemaVersion`] |
+    /// | No migration path from version to [`SCHEMA_VERSION`] | [`EscrowError::NoMigrationPath`] |
+    pub fn dry_run_migrate(env: Env, from_version: u32) -> (u32, String) {
+        Self::dry_run_migrate_impl(env, from_version)
+    }
+
     /// Query the attestation append log with optional filters and pagination.
     ///
     /// Returns a paginated page of [`AttestationLogEntry`] entries matching the given
@@ -1053,6 +1084,55 @@ impl LiquifactEscrow {
     /// testnet before upgrading production contracts.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         Self::upgrade_impl(env, new_wasm_hash)
+    }
+
+    /// Check whether a new WASM hash is upgrade-compatible with the current instance.
+    ///
+    /// This is a **read-only advisory check** for operators planning an upgrade. It does not
+    /// perform the upgrade; it only inspects the hash and returns a compatibility report.
+    ///
+    /// # Checks performed
+    /// 1. **Hash installation:** verifies the hash corresponds to an uploaded contract on this network.
+    /// 2. **Schema version compatibility:** returns the current on-chain schema version for comparison.
+    /// 3. **Reason:** provides human-readable guidance (e.g. "hash not found", "schema compatible", etc).
+    ///
+    /// # Return value
+    ///
+    /// [`UpgradeCompatibilityReport`] with fields:
+    /// - `compatible`: `true` if the hash is installed and likely safe (schema unchanged or additive)
+    /// - `reason`: explanation (e.g. "Hash not found", "Schema version unchanged (additive upgrade safe)")
+    /// - `current_schema`: current on-chain schema version for reference
+    ///
+    /// # Important limitations
+    ///
+    /// This check is **advisory only** and **cannot detect all breaking changes**:
+    /// - It verifies the hash is installed, but cannot inspect the WASM bytecode on-chain.
+    /// - It cannot detect removed, renamed, or reordered `DataKey` variants.
+    /// - It compares schema versions but does not validate struct layout compatibility.
+    ///
+    /// **Operators must always:**
+    /// 1. Test thoroughly on testnet before upgrading production.
+    /// 2. Review the WASM diff to ensure only additive changes (new `DataKey` variants).
+    /// 3. Use `migrate()` if the schema version changed.
+    /// 4. Have a rollback plan in case of incompatibilities.
+    ///
+    /// # Authorization
+    /// None — pure read; no auth required. Safe to call before `init`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let report = client.check_upgrade_compatibility(&new_wasm_hash);
+    /// if report.compatible {
+    ///     println!("✓ Upgrade appears safe: {}", report.reason);
+    ///     // Proceed with upgrade() on testnet first
+    /// } else {
+    ///     println!("✗ Upgrade may be unsafe: {}", report.reason);
+    ///     // Investigate further or choose a different hash
+    /// }
+    /// ```
+    pub fn check_upgrade_compatibility(env: Env, new_wasm_hash: BytesN<32>) -> UpgradeCompatibilityReport {
+        Self::check_upgrade_compatibility_impl(env, new_wasm_hash)
     }
 
     /// Record investor principal while the invoice is **open**. First deposit sets base
@@ -1609,5 +1689,51 @@ impl LiquifactEscrow {
     /// Returns `None` if no pause is active or if the pause has auto-expired.
     pub fn get_dispute_pause(env: Env) -> Option<DisputePauseState> {
         Self::get_dispute_pause_impl(env)
+    }
+
+    /// Enable trace mode at specified verbosity level. Admin-only.
+    ///
+    /// # Verbosity Levels
+    /// - `0` (OFF): Tracing disabled
+    /// - `1` (ERROR): Only errors
+    /// - `2` (WARN): Errors + state transitions
+    /// - `3` (INFO): Warn + significant operations
+    /// - `4` (DEBUG): Info + storage writes
+    /// - `5` (TRACE): Debug + storage reads
+    ///
+    /// # Authorization
+    /// Only the current escrow admin may call this function.
+    ///
+    /// # Performance
+    /// - OFF (default): ~0% overhead
+    /// - WARN: <1% overhead
+    /// - DEBUG: ~5% overhead
+    /// - TRACE: ~15% overhead
+    pub fn enable_tracing(env: Env, level: u32) {
+        Self::enable_tracing_impl(env, level)
+    }
+
+    /// Disable trace mode. Admin-only.
+    ///
+    /// Clears the trace level, returning tracing to OFF. No-op if tracing is
+    /// already disabled or if the trace-mode feature is not compiled in.
+    pub fn disable_tracing(env: Env) {
+        Self::disable_tracing_impl(env)
+    }
+
+    /// Get current trace level. Permissionless query.
+    ///
+    /// Returns the current trace verbosity (0–5), or `0` (OFF) if tracing
+    /// is not enabled or the trace-mode feature is not compiled in.
+    pub fn get_trace_level(env: Env) -> u32 {
+        Self::get_trace_level_impl(env)
+    }
+
+    /// Clear trace buffer. Admin-only.
+    ///
+    /// Clears any buffered trace entries (if the trace-mode feature is enabled).
+    /// Useful for clearing old diagnostic data between operations.
+    pub fn clear_trace_buffer(env: Env) {
+        Self::clear_trace_buffer_impl(env)
     }
 }

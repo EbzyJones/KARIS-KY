@@ -210,3 +210,32 @@ budget.
 roughly 50% of budget with adequate headroom. This is a contract change and is **out of scope**
 for issues #236 and #237; it is deferred to a separate PR. No contract changes were made here.
 
+---
+
+## WASM size budget and regression policy (issue #116)
+
+The compiled contract WASM is checked in CI by `scripts/check_wasm_size.py`. The script enforces
+two independent limits, and **both are hard failures** — a violation exits non-zero and fails the
+CI job rather than only printing a report:
+
+1. **Absolute hard cap: 1 MB.** Any WASM artifact larger than 1 MB fails CI unconditionally.
+   This cap is fixed and is not changed by this policy.
+2. **Regression vs. baseline: >10% growth.** The artifact size is compared against a recorded
+   baseline. Growth of more than 10% over the baseline fails CI. Growth of exactly 10% or less
+   passes.
+
+### Baseline file
+
+The baseline size is recorded in a baseline file checked into the repository (see
+`scripts/check_wasm_size.py` for the exact path and format). The baseline is updated on `main`
+when an intentional size change lands: the new size is recorded in the baseline file in the same
+PR that introduces the change, so the growth is reviewed as part of that PR. Feature branches are
+compared against the baseline from `main`; they must not update the baseline to mask a regression.
+
+### Why a hard failure
+
+A >10% growth in WASM size is treated as a regression that must be justified, not merely
+observed. Failing CI forces the author either to reduce the size or to update the baseline
+deliberately (with review), keeping the contract within its deployment budget. Auto-optimizing
+the WASM is out of scope; the check only gates the build.
+

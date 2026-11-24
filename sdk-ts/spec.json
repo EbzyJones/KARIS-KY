@@ -123,6 +123,35 @@
       "returns": { "type": "null", "description": "No return value" }
     },
     {
+      "name": "claim_payout_as_delegate",
+      "description": "Active delegate records an investor payout claim after settlement.",
+      "auth": "delegate",
+      "params": [
+        { "name": "investor", "type": "Address", "description": "Investor whose payout is being claimed" },
+        { "name": "delegate", "type": "Address", "description": "Active delegate authorizing the claim" }
+      ],
+      "returns": { "type": "null", "description": "No return value" }
+    },
+    {
+      "name": "set_yield_claim_delegate",
+      "description": "Investor sets or replaces their yield claim delegate.",
+      "auth": "investor",
+      "params": [
+        { "name": "investor", "type": "Address", "description": "Investor authorizing the delegation" },
+        { "name": "delegate", "type": "Address", "description": "Address to authorize for claims" }
+      ],
+      "returns": { "type": "null", "description": "No return value" }
+    },
+    {
+      "name": "revoke_yield_claim_delegate",
+      "description": "Investor revokes their active yield claim delegation.",
+      "auth": "investor",
+      "params": [
+        { "name": "investor", "type": "Address", "description": "Investor authorizing revocation" }
+      ],
+      "returns": { "type": "null", "description": "No return value" }
+    },
+    {
       "name": "cancel_funding",
       "description": "Admin cancels the escrow before it was funded. Investors may then refund.",
       "auth": "admin",
@@ -238,7 +267,7 @@
       "params": [
         { "name": "from_version", "type": "u32", "description": "Version to migrate from" }
       ],
-      "returns": { "type": "null", "description": "No return value (panics on all paths)" }
+      "returns": { "type": "u32", "description": "Resulting schema version" }
     },
     {
       "name": "set_investors_allowlisted",
@@ -503,7 +532,7 @@
       "attestation": { "range": "50-51", "description": "Primary hash binding and append-only digest log" },
       "sme_collateral": { "range": "60-62", "description": "Off-chain collateral metadata record" },
       "admin_validation": { "range": "70-83", "description": "Allowlist batch, funding target, investor cap, maturity, admin handover, batch funding" },
-      "migration": { "range": "90-92", "description": "migrate version checks" },
+      "migration": { "range": "90-93", "description": "migrate version checks and replay protection" },
       "funding": { "range": "100-111", "description": "Investor deposits, batch funding, and contribution limits" },
       "settlement_payout": { "range": "120-129", "description": "Settle, withdraw, investor claims, payout math" },
       "cancel_refund": { "range": "140-143", "description": "Cancel funding and investor refunds" },
@@ -563,6 +592,7 @@
       "90": "MigrationVersionMismatch",
       "91": "AlreadyCurrentSchemaVersion",
       "92": "NoMigrationPath",
+      "93": "MigrationAlreadyApplied",
       "100": "FundingAmountNotPositive",
       "101": "FundingBelowMinContribution",
       "102": "LegalHoldBlocksFunding",

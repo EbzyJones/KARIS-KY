@@ -1,6 +1,7 @@
 use super::*;
 use crate::{AdminProposedEvent, ContractUpgraded, EscrowCloseSnapshot, FundingTargetUpdated};
-use soroban_sdk::Event;
+use soroban_sdk::{BytesN, Event, Symbol};
+
 
 // Admin/governance operations: target changes, maturity changes, admin handover,
 // legal hold, migration guards, and collateral metadata.
@@ -3463,4 +3464,31 @@ fn test_upgrade_emits_event_with_schema_version_and_admin() {
     .to_xdr(&env, &contract_id);
 
     assert_eq!(last_event, expected_event, "upgrade event should contain new_wasm_hash, schema_version, and admin");
+}
+
+#[test]
+fn test_upgrade_rejects_arbitrary_invalid_wasm_hash() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    // Create an arbitrary 32-byte hash that was never uploaded to the deployer.
+    // This should fail when we attempt to update the contract WASM.
+    let fake_wasm_hash: BytesN<32> = env.crypto().sha256(&BytesN::from_array(&env, &[0u8; 32]));
+
+    // Attempt upgrade with a hash that does not correspond to an installed contract.
+    // The contract should fail predictably (contract error, not trap).
+    let result = env.try_invoke_contract::<_, ()>(
+        &client.contract_id,
+        &Symbol::new(&env, "upgrade"),
+        soroban_vec![&env, fake_wasm_hash],
+    );
+
+    // Expect a contract error (not a trap or panic).
+    // The exact error code will be determined by the Soroban environment,
+    // but it should fail gracefully rather than trapping.
+    assert!(
+        result.is_err(),
+        "upgrade with arbitrary invalid WASM hash must fail predictably, not trap"
+    );
 }

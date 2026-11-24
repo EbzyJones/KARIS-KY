@@ -1,3 +1,27 @@
+//! KARIS-KY REPL command-line interface.
+//!
+//! This binary provides a minimal REPL entry point for the KARIS-KY
+//! workspace. It reads a single command from the process arguments and
+//! reports it back to the user.
+//!
+//! # Documentation policy
+//!
+//! The workspace documentation build is run with
+//! `RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links'` so that any stale or
+//! broken intra-doc links fail CI. When adding doc comments, only reference
+//! items that actually exist (for example [`parse_input`]) and verify with
+//! `cargo doc --workspace --no-deps`.
+
+mod repl;
+
+/// Validates and normalizes a raw command-line input string.
+///
+/// The input is trimmed of surrounding whitespace. Empty (or
+/// whitespace-only) input is rejected.
+///
+/// # Errors
+///
+/// Returns an error message when the trimmed input is empty.
 fn parse_input(input: &str) -> Result<&str, &'static str> {
     let trimmed = input.trim();
 
@@ -8,15 +32,61 @@ fn parse_input(input: &str) -> Result<&str, &'static str> {
     Ok(trimmed)
 }
 
+/// Entry point for the REPL CLI.
+///
+/// Reads the first positional argument as the command (defaulting to
+/// `"status"`), validates it via [`parse_input`], and prints the result.
+/// Exits with a non-zero status code when the input is invalid.
 fn main() {
-    let command = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "status".to_string());
+    let mut args: Vec<String> = std::env::args().collect();
+    let json_mode = args.iter().any(|a| a == "--json");
+    args.retain(|a| a != "--json");
+    let command = args.get(1).cloned().unwrap_or_else(|| "status".to_string());
 
     match parse_input(&command) {
         Ok(command) => {
+            if json_mode {
+                println!(
+                    "{}",
+                    repl::command_json(command, &args[2.min(args.len())..])
+                );
+                return;
+            }
             println!("KARIS-KY REPL CLI");
-            println!("Command received: {command}");
+            if command == "help" {
+                match args.get(2) {
+                    Some(name) => match repl::help_text(name) {
+                        Some(help) => print!("{help}"),
+                        None => {
+                            eprintln!("unknown entrypoint: {name}");
+                            std::process::exit(1);
+                        }
+                    },
+                    None => {
+                        for name in repl::entrypoint_names() {
+                            println!("{name}");
+                        }
+                    }
+                }
+            } else if command == "complete" {
+                for name in repl::complete(args.get(2).map_or("", String::as_str)) {
+                    println!("{name}");
+                }
+            } else if command == "fund-batch" {
+                let csv_path = match args.get(2) {
+                    Some(path) => path,
+                    None => {
+                        eprintln!("usage: fund-batch <csv-path>");
+                        std::process::exit(1);
+                    }
+                };
+                if let Err(message) = run_fund_batch(csv_path) {
+                    eprintln!("{message}");
+                    std::process::exit(1);
+                }
+            } else {
+                println!("Command received: {command}");
+            }
         }
         Err(message) => {
             eprintln!("{message}");
@@ -27,7 +97,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_input;
+    use super::{fund_batch, parse_fund_batch_csv, parse_input, Address};
 
     #[test]
     fn parse_input_accepts_non_empty_commands() {
