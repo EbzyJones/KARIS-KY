@@ -1,6 +1,6 @@
 // karis-ky Escrow SDK — Public API
 //
-// Re-exports all types, constants, and the client class.
+// Re-exports all types, constants, the client class, and the event parser.
 
 export {
   EscrowClient,
@@ -51,26 +51,34 @@ export {
   type EscrowEventSubscriptionOptions,
   type CheckEscrowHealth,
   type EscrowHealth,
-  type ContractLimits,
-  type EscrowHealthMetrics,
-  type StateInconsistencyReport,
 } from "./types";
 
 export {
-  MAX_FUND_BATCH,
-  MAX_BATCH_CLAIM,
-  MAX_ATTESTATION_APPEND_ENTRIES,
-  MAX_INVESTOR_ALLOWLIST_BATCH,
-  MAX_INVESTOR_HISTORY_ENTRIES,
-  MAX_HISTORY_PAGE_SIZE,
-  MAX_DUST_SWEEP_AMOUNT,
-  MAX_REINVESTMENT_AUDIT_ENTRIES,
-  MAX_ADMIN_ROLES,
-  MAX_MULTISIG_SIGNERS,
-  MAX_MULTISIG_OPERATIONS,
-  MAX_INVOICE_ID_STRING_LEN,
-  MIN_INVOICE_ID_STRING_LEN,
-  INVOICE_ID_PATTERN,
-  SCHEMA_VERSION,
-  CONTRACT_INTERFACE_VERSION,
-} from "./constants";
+  parseEvent,
+  type ParsedEscrowEvent,
+  type EscrowInitializedEvent,
+  type MaxUniqueInvestorsCapLoweredEvent,
+  type EscrowFundedEvent,
+  type EscrowSettledEvent,
+  type MaturityUpdatedEvent,
+  type AdminTransferredEvent,
+  type AdminProposedEvent,
+  type BeneficiaryRotatedEvent,
+  type FundingTargetUpdatedEvent,
+  type LegalHoldChangedEvent,
+  type DisputePausedEvent,
+  type DisputeResumedEvent,
+  type LegalHoldProposedEvent,
+  type CollateralRecordedEvent,
+  type SmeWithdrewEvent,
+  type InvestorPayoutClaimedEvent,
+  type FundingCancelledEvent,
+  type InvestorRefundedEvent,
+  type TreasuryDustSweptEvent,
+  type PrimaryAttestationBoundEvent,
+  type AttestationBoundEvent,
+  type AttestationDigestAppendedEvent,
+  type AllowlistEnabledChangedEvent,
+  type InvestorAllowlistChangedEvent,
+  type UnknownEvent,
+} from "./events";
