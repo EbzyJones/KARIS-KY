@@ -1,6 +1,5 @@
 const http = require('http');
-const { StrKey } = require('@stellar/stellar-sdk');
-const contractSpec = require('../sdk-ts/spec.json');
+const { createEscrowHealthAlert } = require('./health-alerts');
 
 const HOST = '127.0.0.1';
 const PORT = 8000;
@@ -8,147 +7,104 @@ const ENTRYPOINTS = contractSpec.entrypoints.map((entrypoint) => entrypoint.name
 const DEFAULT_ALLOWED_ORIGINS = ['http://127.0.0.1:5500', 'http://localhost:5500'];
 const CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
 
-function writeStructuredLog(record) {
-  console.info(JSON.stringify(record));
+function sendJson(res, status, payload) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*'
+  });
+  res.end(JSON.stringify(payload));
 }
 
-function logEscrowSummary(logger, contractId, status) {
-  const level = status >= 500 ? 'error' : status >= 400 ? 'warn' : 'info';
-  logger({
-    timestamp: new Date().toISOString(),
-    level,
-    event: 'escrow.summary',
-    escrow_id: contractId,
-    status
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.setEncoding('utf8');
+
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > 1024 * 1024) {
+        reject(new Error('Request body exceeds 1 MiB'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(body));
+      } catch {
+        reject(new Error('Request body must be valid JSON'));
+      }
+    });
+    req.on('error', reject);
   });
 }
 
-function parseAllowedOrigins(value = process.env.ALLOWED_ORIGINS) {
-  if (value === undefined) return DEFAULT_ALLOWED_ORIGINS;
-  return value.split(',').map((origin) => origin.trim()).filter(Boolean);
-}
-
-async function fetchEscrowSummary(contractId) {
-  const {
-    Account,
-    Contract,
-    Keypair,
-    rpc,
-    TransactionBuilder,
-    scValToNative
-  } = require('@stellar/stellar-sdk');
-  const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
-  const networkPassphrase = process.env.SOROBAN_NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015';
-  const rpcServer = new rpc.Server(rpcUrl);
-  const source = Keypair.random().publicKey();
-  const transaction = new TransactionBuilder(new Account(source, '0'), {
-    fee: '100',
-    networkPassphrase
-  })
-    .addOperation(new Contract(contractId).call('get_escrow_summary'))
-    .setTimeout(30)
-    .build();
-  const simulation = await rpcServer.simulateTransaction(transaction);
-
-  if (simulation.error) throw new Error(simulation.error);
-  if (!simulation.result?.retval) throw new Error('Soroban RPC returned no contract summary');
-  return toJsonSafe(scValToNative(simulation.result.retval));
-}
-
-function toJsonSafe(value) {
-  if (typeof value === 'bigint') return value.toString();
-  if (value instanceof Map) {
-    return Object.fromEntries([...value].map(([key, item]) => [String(key), toJsonSafe(item)]));
-  }
-  if (Array.isArray(value)) return value.map(toJsonSafe);
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, toJsonSafe(item)]));
-  }
-  return value;
-}
-
-function isUnknownContractError(error) {
-  return /contract.*(?:not found|does not exist|missing)|(?:not found|does not exist).*contract|missingvalue/i
-    .test(error.message || String(error));
-}
-
-function createBackendServer({
-  summaryReader = fetchEscrowSummary,
-  allowedOrigins = parseAllowedOrigins(),
-  logger = writeStructuredLog
-} = {}) {
+function createServer({ alertHealthWarning = createEscrowHealthAlert() } = {}) {
   return http.createServer(async (req, res) => {
-    const origin = req.headers.origin;
-    const headers = { 'Content-Type': 'application/json', Vary: 'Origin' };
-    if (origin && allowedOrigins.includes(origin)) {
-      headers['Access-Control-Allow-Origin'] = origin;
-    }
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        ...headers,
-        'Access-Control-Allow-Methods': 'GET, OPTIONS'
-      });
-      res.end();
-      return;
-    }
+    const url = new URL(req.url, `http://${req.headers.host}`);
 
-    const url = new URL(req.url, 'http://127.0.0.1');
     if (req.method === 'GET' && url.pathname === '/api/health') {
-      res.writeHead(200, headers);
-      res.end(JSON.stringify({
+      sendJson(res, 200, {
         status: 'ok',
         service: 'karis-ky-backend',
         contracts: ['escrow']
-      }));
+      });
       return;
     }
 
     if (req.method === 'GET' && url.pathname === '/api/contract-summary') {
-      res.writeHead(200, headers);
-      res.end(JSON.stringify({
+      sendJson(res, 200, {
         name: 'karis-ky Escrow Contracts',
         description: 'Soroban smart contracts for invoice liquidity on Stellar.',
-        entrypoints: ENTRYPOINTS
-      }));
+        entrypoints: ['init', 'fund', 'settle', 'withdraw']
+      });
       return;
     }
 
-    const summaryMatch = req.method === 'GET'
-      ? url.pathname.match(/^\/api\/contracts\/([^/]+)\/summary$/)
-      : null;
-    if (summaryMatch) {
-      const contractId = summaryMatch[1];
-      if (!CONTRACT_ID_PATTERN.test(contractId) || !StrKey.isValidContract(contractId)) {
-        logEscrowSummary(logger, contractId, 400);
-        res.writeHead(400, headers);
-        res.end(JSON.stringify({ error: 'invalid contract ID' }));
+    if (req.method === 'POST' && url.pathname === '/api/events/escrow-health-warning') {
+      let event;
+      try {
+        event = await readJson(req);
+      } catch (error) {
+        sendJson(res, 400, { error: error.message });
         return;
       }
-      try {
-        const summary = await summaryReader(contractId);
-        logEscrowSummary(logger, contractId, 200);
-        res.writeHead(200, headers);
-        res.end(JSON.stringify({ contractId, summary }));
-      } catch (error) {
-        const status = isUnknownContractError(error) ? 404 : 502;
-        logEscrowSummary(logger, contractId, status);
-        res.writeHead(status, headers);
-        res.end(JSON.stringify({ error: status === 404 ? 'contract not found' : 'Soroban RPC request failed' }));
+
+      if (
+        !event ||
+        !Number.isInteger(event.warning_type) ||
+        event.warning_type < 0 ||
+        event.warning_type > 0xffffffff
+      ) {
+        sendJson(res, 400, { error: 'warning_type must be a uint32' });
+        return;
       }
+
+      if (event.warning_type === 0) {
+        sendJson(res, 202, { accepted: true, alerted: false });
+        return;
+      }
+
+      try {
+        await alertHealthWarning(event);
+      } catch (error) {
+        console.error('Failed to deliver escrow health warning alert:', error);
+        sendJson(res, 502, { error: 'failed to deliver health warning alert' });
+        return;
+      }
+
+      sendJson(res, 202, { accepted: true, alerted: true });
       return;
     }
 
-    res.writeHead(404, headers);
-    res.end(JSON.stringify({ error: 'not found' }));
+    sendJson(res, 404, { error: 'not found' });
   });
 }
 
-const server = createBackendServer();
-
 if (require.main === module) {
+  const server = createServer();
   server.listen(PORT, HOST, () => {
     console.log(`Backend listening on http://${HOST}:${PORT}`);
   });
 }
 
-module.exports = { ENTRYPOINTS, createBackendServer, parseAllowedOrigins, server };
+module.exports = { createServer };
