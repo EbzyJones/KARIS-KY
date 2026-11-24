@@ -34,6 +34,8 @@ Dependencies:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -236,6 +238,47 @@ def check_snapshot_consistency(snap: dict[str, Any]) -> list[str]:
 # File output
 # ---------------------------------------------------------------------------
 
+def _canonical_snapshot_json(snap: dict[str, Any]) -> str:
+    """Return a deterministic JSON representation used for integrity checks."""
+    return json.dumps(
+        snap,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _snapshot_checksum(snap: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_snapshot_json(snap).encode("utf-8")).hexdigest()
+
+
+def export_snapshot(
+    snap: dict[str, Any],
+    contract_id: str,
+    ledger_sequence: int,
+    captured_at_utc: str | None = None,
+) -> dict[str, Any]:
+    """Build a snapshot envelope with a checksum for integrity validation."""
+    captured_at_utc = captured_at_utc or datetime.now(timezone.utc).strftime(
+        "%Y%m%dT%H%M%SZ"
+    )
+    return {
+        "_meta": {
+            "tool": "backup_escrow_state.py",
+            "contract_id": contract_id,
+            "ledger_sequence": ledger_sequence,
+            "captured_at_utc": captured_at_utc,
+            "checksum_sha256": _snapshot_checksum(snap),
+            "note": (
+                "Read-only snapshot. Not a rollback artefact. "
+                "See docs/adr/ADR-008-backup-restore-rejection.md."
+            ),
+        },
+        "state": snap,
+    }
+
+
 def write_snapshot(
     snap: dict[str, Any],
     contract_id: str,
@@ -251,24 +294,73 @@ def write_snapshot(
     )
     filepath = os.path.join(output_dir, filename)
 
-    output = {
-        "_meta": {
-            "tool": "backup_escrow_state.py",
-            "contract_id": contract_id,
-            "ledger_sequence": ledger_sequence,
-            "captured_at_utc": now_utc,
-            "note": (
-                "Read-only snapshot. Not a rollback artefact. "
-                "See docs/adr/ADR-008-backup-restore-rejection.md."
-            ),
-        },
-        "state": snap,
-    }
+    output = export_snapshot(snap, contract_id, ledger_sequence, now_utc)
 
     with open(filepath, "w", encoding="utf-8") as fh:
         json.dump(output, fh, indent=2, default=str)
 
     return filepath
+
+
+def validate_snapshot_integrity(document: dict[str, Any] | str) -> dict[str, Any]:
+    """
+    Validate a snapshot envelope and return its state.
+
+    Raises ValueError for malformed or corrupted backups.
+    """
+    if isinstance(document, str):
+        try:
+            with open(document, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"corrupted backup: invalid JSON: {exc}") from exc
+        except OSError as exc:
+            raise ValueError(f"unable to read backup: {exc}") from exc
+
+    if not isinstance(document, dict):
+        raise ValueError("corrupted backup: snapshot root must be a JSON object")
+
+    meta = document.get("_meta")
+    state = document.get("state")
+    if not isinstance(meta, dict):
+        raise ValueError("corrupted backup: missing or invalid _meta")
+    if not isinstance(state, dict):
+        raise ValueError("corrupted backup: missing or invalid state")
+    if meta.get("tool") != "backup_escrow_state.py":
+        raise ValueError("corrupted backup: unexpected or missing tool identifier")
+
+    checksum = meta.get("checksum_sha256")
+    if not isinstance(checksum, str) or len(checksum) != 64:
+        raise ValueError("corrupted backup: missing or invalid checksum")
+
+    actual = _snapshot_checksum(state)
+    if not hmac.compare_digest(actual, checksum.lower()):
+        raise ValueError("corrupted backup: snapshot checksum mismatch")
+
+    return state
+
+
+def import_snapshot(source: str | dict[str, Any]) -> dict[str, Any]:
+    """Load and validate a snapshot from a JSON file or envelope."""
+    if isinstance(source, dict):
+        document = source
+    elif isinstance(source, str):
+        try:
+            with open(source, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"corrupted backup: invalid JSON: {exc}") from exc
+        except OSError as exc:
+            raise ValueError(f"unable to read backup: {exc}") from exc
+    else:
+        raise ValueError("corrupted backup: unsupported snapshot source")
+
+    return validate_snapshot_integrity(document)
+
+
+# Common read/load names make the integrity API convenient for tooling and tests.
+read_snapshot = import_snapshot
+load_snapshot = import_snapshot
 
 
 # ---------------------------------------------------------------------------
