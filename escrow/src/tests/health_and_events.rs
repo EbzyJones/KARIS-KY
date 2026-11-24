@@ -245,7 +245,272 @@ fn test_health_metrics_zero_maturity() {
     assert_eq!(metrics.days_to_maturity, 0, "zero maturity means no lock");
 }
 
-// ─── Task 2: Bucketing Benchmark ──────────────────────────────────────────
+// ─── Task 2: Enhanced Health Metrics Coverage ─────────────────────────────
+
+#[test]
+fn test_health_metrics_low_funding_scenario() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    let target = 1_000_000i128;
+    client.init(
+        &admin,
+        &String::from_str(&env, "HLTH_LOW_1"),
+        &sme,
+        &target,
+        &800i64,
+        &86_400u64 * 7, // 7 days
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor = Address::generate(&env);
+    // Fund at 30% of target
+    client.fund(&investor, &(target * 3 / 10));
+
+    let metrics = client.get_escrow_health_metrics();
+
+    assert_eq!(metrics.funding_progress_percent, 30, "Progress should be 30%");
+    assert_eq!(metrics.unique_investor_count, 1);
+    assert_eq!(metrics.average_contribution_size, target * 3 / 10);
+    // estimated_yield = (300_000 * 800) / 10000 = 24_000
+    assert_eq!(metrics.estimated_yield_payout, 24_000);
+    assert!(metrics.days_to_maturity > 0 && metrics.days_to_maturity <= 7);
+}
+
+#[test]
+fn test_health_metrics_close_to_maturity_scenario() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    let target = 1_000_000i128;
+    let now = env.ledger().timestamp();
+    let maturity_time = now + 3600u64; // 1 hour from now
+
+    client.init(
+        &admin,
+        &String::from_str(&env, "HLTH_CLOSE_1"),
+        &sme,
+        &target,
+        &800i64,
+        &maturity_time,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor = Address::generate(&env);
+    // Fund to 100%
+    client.fund(&investor, &target);
+
+    // Advance time to 30 minutes before maturity
+    env.ledger().set_timestamp(now + 1800u64);
+
+    let metrics = client.get_escrow_health_metrics();
+
+    assert_eq!(metrics.funding_progress_percent, 100);
+    assert_eq!(metrics.unique_investor_count, 1);
+    // days_to_maturity should be close to 0 (since maturity is ~30 min away)
+    assert!(metrics.days_to_maturity < 1, "Should be less than 1 day");
+    assert!(metrics.days_to_maturity > 0, "Should still be positive");
+}
+
+#[test]
+fn test_health_metrics_over_maturity_scenario() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    let target = 1_000_000i128;
+    let now = env.ledger().timestamp();
+    let maturity_time = now + 3600u64; // 1 hour from now
+
+    client.init(
+        &admin,
+        &String::from_str(&env, "HLTH_OVER_1"),
+        &sme,
+        &target,
+        &800i64,
+        &maturity_time,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor = Address::generate(&env);
+    // Fund to 100%
+    client.fund(&investor, &target);
+
+    // Advance time PAST maturity by 2 hours
+    env.ledger().set_timestamp(now + 7200u64);
+
+    let metrics = client.get_escrow_health_metrics();
+
+    assert_eq!(metrics.funding_progress_percent, 100);
+    assert_eq!(metrics.unique_investor_count, 1);
+    // days_to_maturity should be negative (we're past maturity)
+    assert!(metrics.days_to_maturity < 0, "Should be negative when past maturity");
+}
+
+#[test]
+fn test_health_metrics_multiple_investors_various_contributions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    let target = 1_000_000i128;
+    client.init(
+        &admin,
+        &String::from_str(&env, "HLTH_MULTI_1"),
+        &sme,
+        &target,
+        &1000i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Varied contributions
+    let inv_a = Address::generate(&env);
+    let inv_b = Address::generate(&env);
+    let inv_c = Address::generate(&env);
+    let inv_d = Address::generate(&env);
+
+    client.fund(&inv_a, &100_000i128);
+    client.fund(&inv_b, &250_000i128);
+    client.fund(&inv_c, &150_000i128);
+    client.fund(&inv_d, &500_000i128);
+
+    let metrics = client.get_escrow_health_metrics();
+
+    assert_eq!(metrics.unique_investor_count, 4);
+    assert_eq!(metrics.funding_progress_percent, 100);
+    assert_eq!(metrics.average_contribution_size, 1_000_000i128 / 4);
+    // estimated_yield = (1_000_000 * 1000) / 10000 = 100_000
+    assert_eq!(metrics.estimated_yield_payout, 100_000);
+}
+
+#[test]
+fn test_health_metrics_single_large_investor() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    let target = 1_000_000i128;
+    client.init(
+        &admin,
+        &String::from_str(&env, "HLTH_LARGE_1"),
+        &sme,
+        &target,
+        &500i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let big_investor = Address::generate(&env);
+    // Fund the entire target with one investor
+    client.fund(&big_investor, &target);
+
+    let metrics = client.get_escrow_health_metrics();
+
+    assert_eq!(metrics.unique_investor_count, 1);
+    assert_eq!(metrics.funding_progress_percent, 100);
+    assert_eq!(metrics.average_contribution_size, target);
+    // estimated_yield = (1_000_000 * 500) / 10000 = 50_000
+    assert_eq!(metrics.estimated_yield_payout, 50_000);
+}
+
+#[test]
+fn test_health_metrics_many_small_investors_partial_funding() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    let target = 10_000_000i128;
+    client.init(
+        &admin,
+        &String::from_str(&env, "HLTH_MANY_SMALL"),
+        &sme,
+        &target,
+        &750i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor_count = 20u32;
+    let per_investor = 250_000i128;
+
+    for _i in 0..investor_count {
+        let investor = Address::generate(&env);
+        client.fund(&investor, &per_investor);
+    }
+
+    let metrics = client.get_escrow_health_metrics();
+
+    assert_eq!(metrics.unique_investor_count, investor_count);
+    assert_eq!(metrics.funding_progress_percent, 50); // 5M funded of 10M target
+    assert_eq!(metrics.average_contribution_size, per_investor);
+    // estimated_yield = (5_000_000 * 750) / 10000 = 375_000
+    assert_eq!(metrics.estimated_yield_payout, 375_000);
+}
+
+// ─── Task 2b: Bucketing Benchmark ─────────────────────────────────────────
 
 #[test]
 fn test_bucketing_aggregate_matches_funded_amount() {

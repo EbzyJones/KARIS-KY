@@ -826,6 +826,12 @@ pub enum DataKey {
     /// and updated by [`LiquifactEscrow::migrate`] when a migration path is implemented.
     /// Read with [`LiquifactEscrow::get_version`]. Never delete or rename this variant.
     Version,
+    /// Append-only version history audit trail: `Vec<(version, ledger_timestamp)>`.
+    /// Records when schema versions were written to this instance on init and migrate.
+    /// One entry per version change. Absent ⇒ empty vector (not initialized).
+    /// Helps operators track deployment lineage and audit upgrade events.
+    /// Read via [`LiquifactEscrow::get_version_history`].
+    VersionHistory,
     /// Per-investor contributed principal recorded during [`LiquifactEscrow::fund`].
     /// **Persistent** storage. Absent ⇒ `0`. One entry per investor address.
     InvestorContribution(Address),
@@ -958,6 +964,69 @@ pub enum DataKey {
     /// Useful for operator debugging and compliance audits.
     /// Absent ⇒ no migration record. Companion to [`DataKey::MigrationExecutionLog`].
     MigrationCompletedAt(u32, u32),
+    
+    /// Current trace mode verbosity level (when trace-mode feature is enabled).
+    /// Stored as u32: 0=OFF, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=TRACE.
+    /// Absent ⇒ tracing disabled (OFF). Read via trace helpers; set by `enable_tracing()`.
+    #[cfg(feature = "trace-mode")]
+    TraceLevel,
+}
+
+// ============================================================================
+// Trace Mode Infrastructure (opt-in diagnostic feature)
+// ============================================================================
+
+/// Trace verbosity levels (higher = more detailed).
+#[cfg(feature = "trace-mode")]
+pub const TRACE_LEVEL_OFF: u32 = 0;
+#[cfg(feature = "trace-mode")]
+pub const TRACE_LEVEL_ERROR: u32 = 1;
+#[cfg(feature = "trace-mode")]
+pub const TRACE_LEVEL_WARN: u32 = 2;
+#[cfg(feature = "trace-mode")]
+pub const TRACE_LEVEL_INFO: u32 = 3;
+#[cfg(feature = "trace-mode")]
+pub const TRACE_LEVEL_DEBUG: u32 = 4;
+#[cfg(feature = "trace-mode")]
+pub const TRACE_LEVEL_TRACE: u32 = 5;
+
+/// Maximum trace buffer entries to keep storage bounded and prevent abuse.
+#[cfg(feature = "trace-mode")]
+pub const MAX_TRACE_BUFFER_ENTRIES: u32 = 256;
+
+/// Trace entry emitted when trace mode is enabled at WARN level or higher.
+///
+/// Records state transitions and admin operations for forensic analysis.
+/// Payloads contain hashes and metadata, never raw stored values.
+#[cfg(feature = "trace-mode")]
+#[contractevent]
+pub struct TraceEvent {
+    #[topic]
+    pub level: u32,
+    #[topic]
+    pub operation: Symbol,
+    pub key_name: Symbol,
+    pub timestamp: u64,
+    pub message: String,
+}
+
+/// Trace event for configuration changes (enable/disable).
+#[cfg(feature = "trace-mode")]
+#[contractevent]
+pub struct TraceConfigured {
+    #[topic]
+    pub name: Symbol,
+    pub level: u32,
+    pub timestamp: u64,
+}
+
+/// Trace event for buffer clear operations.
+#[cfg(feature = "trace-mode")]
+#[contractevent]
+pub struct TraceBufferCleared {
+    #[topic]
+    pub name: Symbol,
+    pub timestamp: u64,
 }
 
 // --- Data types ---

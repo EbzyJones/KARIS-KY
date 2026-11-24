@@ -52,6 +52,15 @@ impl LiquifactEscrow {
             ledger_timestamp: env.ledger().timestamp(),
         }
         .publish(&env);
+
+        // Emit trace span when primary attestation is bound (INFO level)
+        Self::emit_trace_event(
+            &env,
+            crate::TRACE_LEVEL_INFO,
+            symbol_short!("att_bind"),
+            symbol_short!("primary_attestation"),
+            soroban_sdk::String::from_str(&env, "Primary attestation hash bound"),
+        );
     }
 
     pub(crate) fn get_primary_attestation_hash_impl(env: Env) -> Option<BytesN<32>> {
@@ -147,6 +156,15 @@ impl LiquifactEscrow {
             digest,
         }
         .publish(&env);
+
+        // Emit trace span when attestation is appended (INFO level)
+        Self::emit_trace_event(
+            &env,
+            crate::TRACE_LEVEL_INFO,
+            symbol_short!("att_app"),
+            symbol_short!("attestation_log"),
+            soroban_sdk::String::from_str(&env, &format!("Attestation digest appended at index {}", idx)),
+        );
     }
 
     pub(crate) fn get_attestation_append_log_impl(env: Env) -> Vec<BytesN<32>> {

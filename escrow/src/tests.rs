@@ -9,10 +9,11 @@
 #[allow(unused_imports)]
 use super::{
     AttestationBoundEvt, AttestationDigestRevoked, CollateralRecordedEvt, ContractLimits, DataKey,
-    EscrowError, EscrowFunded, EscrowInitialized, FundingTargetUpdated, LiquifactEscrow,
-    LiquifactEscrowClient, MaxUniqueInvestorsCapLowered, YieldClaimDelegationRevoked,
-    YieldClaimDelegationSet, YieldTier, LEGAL_HOLD_PROPOSAL_TTL_SECS,
-    MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT, MAX_FUND_BATCH, SCHEMA_VERSION,
+    EscrowError, EscrowFunded, EscrowInitialized, FundingDeadlineSet, FundingTargetUpdated,
+    LiquifactEscrow, LiquifactEscrowClient, MaxUniqueInvestorsCapLowered,
+    YieldClaimDelegationRevoked, YieldClaimDelegationSet, YieldTier,
+    LEGAL_HOLD_PROPOSAL_TTL_SECS, MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT,
+    MAX_FUND_BATCH, SCHEMA_VERSION,
 };
 use soroban_sdk::{
     symbol_short,
@@ -44,28 +45,34 @@ pub(crate) fn assert_contract_error<T, E>(
 // Focused test tree for escrow behavior. Shared helpers live here so feature
 // modules stay assertion-focused and each test still owns a fresh Env.
 mod admin;
+mod allowlist_ttl_extension;
 mod attestations;
 mod batch_claim;
 mod cap_validation;
 mod clone;
 mod coverage;
 mod dos_analysis;
+mod event_schema_conformance;
 mod external_calls;
 mod external_calls_mocked;
 mod funding;
 mod get_limits;
 mod health_and_events;
+mod health_warning_priority;
 mod history_pagination;
 mod init;
 mod integration;
 mod legal_hold;
 mod properties;
 mod properties_funding;
+mod read_only_invariant;
 mod secure_rng;
 mod settlement;
+mod sharding_aggregate_benchmark;
 mod tier_base_yield;
 mod tokenomics;
 mod upgrade_compat;
+mod trace_mode;
 mod validation;
 mod yield_distribution;
 mod yield_tier_table_read;

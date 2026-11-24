@@ -252,15 +252,21 @@ The SDK is versioned in lockstep with the Soroban contract schema. Each release 
 Before deploying, verify your contract schema matches the SDK target:
 
 ```typescript
-const schemaVersion = await client.getVersion();
-const sdkTarget = SCHEMA_VERSION;
+const preflight = await client.preflightMigration();
+console.log(preflight.recommendation);
 
-if (schemaVersion !== sdkTarget) {
-  throw new Error(
-    `Schema mismatch: contract v${schemaVersion}, SDK targets v${sdkTarget}`,
-  );
+if (preflight.recommendation === "migration_recommended") {
+  const fromVersion = 7; // Set this explicitly for the planned migration.
+  await client.dryRunMigrate(fromVersion);
+  await client.migrate(fromVersion);
 }
 ```
+
+`preflightMigration(targetVersion?)` compares `getVersion()` with the supplied target
+(defaulting to `SCHEMA_VERSION`) and returns `migration_recommended`,
+`already_at_target`, or `sdk_behind_contract`. `dryRunMigrate(fromVersion)` simulates
+the migration without submitting it. Both migration methods preserve contract errors
+90–93 for callers to handle; see the [error handling guide](docs/error-handling.md).
 
 ## Building from Source
 
