@@ -58,3 +58,37 @@ test('summary endpoint returns 404 for unknown contracts', async () => {
     assert.equal(response.status, 404);
   });
 });
+
+test('summary request logs are structured and include escrow_id for every outcome', async () => {
+  const contractId = StrKey.encodeContract(Buffer.alloc(32));
+  const logs = [];
+  await withServer({
+    logger: (record) => logs.push(record),
+    summaryReader: async (id) => {
+      if (id === contractId) throw new Error('RPC unavailable');
+      return {};
+    }
+  }, async (baseUrl) => {
+    const successId = StrKey.encodeContract(Buffer.alloc(32, 1));
+    const success = await fetch(`${baseUrl}/api/contracts/${successId}/summary`);
+    assert.equal(success.status, 200);
+
+    const invalid = await fetch(`${baseUrl}/api/contracts/not-a-contract/summary`);
+    assert.equal(invalid.status, 400);
+
+    const failed = await fetch(`${baseUrl}/api/contracts/${contractId}/summary`);
+    assert.equal(failed.status, 502);
+  });
+
+  assert.deepEqual(logs.map(({ event, escrow_id, status }) => ({
+    event,
+    escrow_id,
+    status
+  })), [
+    { event: 'escrow.summary', escrow_id: StrKey.encodeContract(Buffer.alloc(32, 1)), status: 200 },
+    { event: 'escrow.summary', escrow_id: 'not-a-contract', status: 400 },
+    { event: 'escrow.summary', escrow_id: contractId, status: 502 }
+  ]);
+  assert.deepEqual(logs.map(({ level }) => level), ['info', 'warn', 'error']);
+  assert.ok(logs.every(({ timestamp }) => !Number.isNaN(Date.parse(timestamp))));
+});
