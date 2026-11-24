@@ -22,8 +22,8 @@ import {
   type InvestorFundingRecord,
   type EscrowSnapshot,
   type ErrorDiagnostic,
+  type MigrationPreflight,
   type EscrowTemplate,
-  type InvestorCapStatus,
   type InitParams,
   type SorobanResult,
   type EscrowEvent,
@@ -666,9 +666,30 @@ export class EscrowClient {
     return this.invoke("accept_admin", [], source);
   }
 
-  /** Migrate schema. Typed errors on all paths in current release. */
-  async migrate(fromVersion: number, source?: string): Promise<void> {
+  /**
+   * Compare the stored schema version with the target before deciding whether to migrate.
+   * A target defaults to this SDK's supported schema version.
+   */
+  async preflightMigration(targetVersion: number = SCHEMA_VERSION): Promise<MigrationPreflight> {
+    const currentVersion = await this.getVersion();
+    const recommendation =
+      currentVersion < targetVersion
+        ? "migration_recommended"
+        : currentVersion === targetVersion
+          ? "already_at_target"
+          : "sdk_behind_contract";
+
+    return { currentVersion, targetVersion, recommendation };
+  }
+
+  /** Migrate schema from the supplied version. Returns the resulting schema version. */
+  async migrate(fromVersion: number, source?: string): Promise<number> {
     return this.invoke("migrate", [fromVersion], source);
+  }
+
+  /** Simulate a schema migration without submitting a transaction. */
+  async dryRunMigrate(fromVersion: number): Promise<number> {
+    return this.simulate("dry_run_migrate", [fromVersion]);
   }
 
   /** Batch set investor allowlist. Auth: admin. Max 32 per call. */

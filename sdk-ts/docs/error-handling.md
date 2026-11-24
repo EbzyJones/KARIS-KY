@@ -107,7 +107,7 @@ Error codes are grouped by domain so SDKs can map categories without parsing var
 | `attestation` | 50–51 | Attestation binding and logging |
 | `collateral` | 60–62 | SME collateral metadata |
 | `adminValidation` | 70–83 | Administrative validation and batch bounds |
-| `migration` | 90–92 | Schema migration version checks |
+| `migration` | 90–93 | Schema migration version checks and replay protection |
 | `funding` | 100–111 | Investor deposits and contribution limits |
 | `settlement` | 120–129 | Settlement, withdrawal, and payout math |
 | `cancelRefund` | 140–143 | Funding cancellation and refunds |
@@ -117,6 +117,15 @@ Error codes are grouped by domain so SDKs can map categories without parsing var
 ---
 
 ## Error Code Reference
+
+### Migration Errors (90–93)
+
+| Code | Name | Trigger | Recommended Action |
+| ---: | --- | --- | --- |
+| 90 | `MigrationVersionMismatch` | `fromVersion` differs from the stored version | Read `getVersion()` and pass the explicitly selected source version |
+| 91 | `AlreadyCurrentSchemaVersion` | The requested source version is newer than the contract schema | Check the target schema and update the SDK/contract plan |
+| 92 | `NoMigrationPath` | No storage migration is implemented for the requested version | Implement or deploy the required migration before retrying |
+| 93 | `MigrationAlreadyApplied` | This version transition was already applied | Do not replay the same migration |
 
 ### Initialization Errors (1–13)
 
