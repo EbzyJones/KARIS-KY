@@ -146,6 +146,19 @@ pub enum DataKey {
     /// Expiration timestamp for an admin-proposed legal hold awaiting guardian confirmation.
     /// Absent ⇒ no legal-hold proposal is pending. Appended to preserve existing key discriminants.
     LegalHoldProposalExpiresAt,
+    /// Baseline full snapshot for delta chain reconstruction.
+    /// Immutable after set. Absent ⇒ no delta encoding in use.
+    /// See ADR-009 for context: when deltas are enabled, this stores the initial `InvoiceEscrow`
+    /// state from which the delta chain is applied.
+    FullSnapshot,
+    /// Head of the delta chain: delta_id of the latest applied delta.
+    /// Absent ⇒ no deltas (only full snapshot or no snapshots at all).
+    /// See ADR-009: points to the most recently recorded delta ID.
+    SnapshotDeltaChain,
+    /// Per-delta storage: SnapshotDelta(delta_id) → SnapshotDelta struct.
+    /// Immutable once written; deltas are append-only. Used by delta chain reconstruction.
+    /// See ADR-009 for the reconstruction algorithm.
+    SnapshotDelta(u32),
 }
 
 pub(crate) struct PerInvestorStorage<'a> {

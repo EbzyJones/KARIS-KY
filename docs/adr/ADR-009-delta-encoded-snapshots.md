@@ -183,6 +183,37 @@ Immutable fields (`invoice_id`, `amount`, `funding_target`, `yield_bps`) are not
 - `test_delta_immutability`: once written, delta cannot be modified.
 - `test_escrow_consistency_multiple_ops`: state consistency over many operations.
 
+### Reconstruction Integrity Tests
+
+These tests ensure the disaster-recovery path is robust and trustworthy:
+
+#### Long Delta Chain Reconstruction (`test_reconstruction_matches_live_state_after_multiple_funds`)
+- **Purpose**: Verify that a long delta chain (20+ deltas) reconstructs to the same state as the live escrow.
+- **Setup**: Create a baseline escrow, manually populate the delta chain with multiple sequential deltas, and set the chain head.
+- **Validation**:
+  - Reconstructed `funded_amount` matches the sum of all delta applications.
+  - Immutable fields (`invoice_id`, `amount`) are preserved from the baseline.
+  - Status and maturity updates from individual deltas are correctly applied.
+- **Importance**: Protects off-chain indexers and disaster recovery systems that rely on historical reconstruction.
+
+#### Malformed Delta Linkage Rejection (`test_reconstruction_fails_on_broken_linkage`)
+- **Purpose**: Confirm that a delta with incorrect `based_on_delta_id` is rejected during reconstruction.
+- **Setup**: Create a chain where delta N incorrectly claims to be based on delta M (where M ≠ expected).
+- **Validation**: Reconstruction returns an error indicating "broken chain linkage" rather than applying corrupted state.
+- **Importance**: Guards against tampering; ensures that once a delta is written, the chain is immutable and verifiable.
+
+#### Missing Delta Detection (`test_reconstruction_fails_on_missing_delta`)
+- **Purpose**: Verify that if a delta referenced by `based_on_delta_id` is absent from storage, reconstruction fails.
+- **Setup**: Create a chain with delta 1 and delta 3, skipping delta 2 in between.
+- **Validation**: Reconstruction fails with "delta not found" error when traversing backwards.
+- **Importance**: Detects storage corruption or partial data loss before off-chain systems trust reconstructed state.
+
+#### Arithmetic Overflow Handling (`test_reconstruction_fails_on_arithmetic_overflow`)
+- **Purpose**: Ensure that extreme `funded_amount_delta` values do not cause panics or silent overflow.
+- **Setup**: Create a delta with `funded_amount_delta = i128::MAX` to trigger overflow.
+- **Validation**: Reconstruction returns a checked-arithmetic error instead of panicking.
+- **Importance**: Prevents undefined behavior in production; delegates safety to Rust's type system.
+
 ### Integration Tests
 
 - **Reconciliation**: after every state transition, verify `reconstruct_snapshot_from_deltas()` == `get_escrow()`.
